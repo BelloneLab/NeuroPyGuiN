@@ -1,0 +1,24 @@
+PySide6
+pyqtgraph>=0.14.0,<0.15
+numpy
+pandas
+scipy
+matplotlib
+tqdm
+numba
+scikit-learn
+imbalanced-learn
+statsmodels
+networkx
+psutil
+joblib
+h5py
+seaborn
+cachecache
+upsetplot
+pyarrow
+ipython
+cmcrameri
+pillow
+# Optional on NVIDIA CUDA 12 systems for whitening/filtering:
+# cupy-cuda12x

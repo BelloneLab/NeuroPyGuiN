@@ -1,0 +1,1 @@
+"""NeuroPyGuiN package."""

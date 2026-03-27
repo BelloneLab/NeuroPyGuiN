@@ -1,0 +1,420 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"  version="1.2" baseProfile="tiny" viewBox ="0 0 286 289">
+<title>pyqtgraph SVG export</title>
+<desc>Generated with Qt and pyqtgraph</desc>
+<style>
+    image {
+        image-rendering: crisp-edges;
+        image-rendering: -moz-crisp-edges;
+        image-rendering: pixelated;
+    }
+</style>
+<rect width="100%" height="100%" fill="#ffffff" fill-opacity="1.0" />
+<defs>
+</defs>
+<g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="PlotItem_1">
+    <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="ViewBox_1">
+        <g fill="none" stroke="none" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <path vector-effect="non-scaling-stroke" fill-rule="evenodd" d="M47.0,31.0 L285.5,31.0 L285.5,248.5 L47.0,248.5 L47.0,31.0 "/>
+        </g>
+        <clipPath id="ViewBox_1_clip">
+            <path vector-effect="none" fill-rule="evenodd" d="M47.0,31.0 L285.5,31.0 L285.5,248.5 L47.0,248.5 L47.0,31.0 " stroke-width="1.0"/>
+        </clipPath>
+        <g clip-path="url(#ViewBox_1_clip)">
+            <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="ChildGroup_1">
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_1">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-9.975" y="0" width="0.45" height="40"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_2">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-9.475" y="0" width="0.45" height="56"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_3">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-8.975" y="0" width="0.45" height="51"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_4">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-8.475" y="0" width="0.45" height="53"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_5">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-7.975" y="0" width="0.45" height="43"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_6">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-7.475" y="0" width="0.45" height="44"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_7">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-6.975" y="0" width="0.45" height="41"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_8">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-6.475" y="0" width="0.45" height="64"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_9">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-5.975" y="0" width="0.45" height="65"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_10">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-5.475" y="0" width="0.45" height="74"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_11">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-4.975" y="0" width="0.45" height="51"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_12">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-4.475" y="0" width="0.45" height="49"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_13">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-3.975" y="0" width="0.45" height="56"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_14">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-3.475" y="0" width="0.45" height="64"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_15">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-2.975" y="0" width="0.45" height="92"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_16">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-2.475" y="0" width="0.45" height="152"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_17">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-1.975" y="0" width="0.45" height="125"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_18">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-1.475" y="0" width="0.45" height="0"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_19">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-0.975" y="0" width="0.45" height="0"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_20">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-0.475" y="0" width="0.45" height="0"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_21">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="0.025" y="0" width="0.45" height="0"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_22">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="0.525" y="0" width="0.45" height="0"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_23">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="1.025" y="0" width="0.45" height="0"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_24">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="1.525" y="0" width="0.45" height="125"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_25">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="2.025" y="0" width="0.45" height="152"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_26">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="2.525" y="0" width="0.45" height="92"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_27">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="3.025" y="0" width="0.45" height="64"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_28">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="3.525" y="0" width="0.45" height="56"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_29">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="4.025" y="0" width="0.45" height="49"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_30">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="4.525" y="0" width="0.45" height="51"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_31">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="5.025" y="0" width="0.45" height="74"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_32">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="5.525" y="0" width="0.45" height="65"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_33">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="6.025" y="0" width="0.45" height="64"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_34">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="6.525" y="0" width="0.45" height="41"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_35">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="7.025" y="0" width="0.45" height="44"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_36">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="7.525" y="0" width="0.45" height="43"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_37">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="8.025" y="0" width="0.45" height="53"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_38">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="8.525" y="0" width="0.45" height="51"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_39">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="9.025" y="0" width="0.45" height="56"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="BarGraphItem_40">
+                    <g fill="#4a90e2" fill-opacity="0.72549" stroke="#4a90e2" stroke-opacity="0.803922" stroke-width="0.7" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="9.525" y="0" width="0.45" height="40"/>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="LinearRegionItem_1">
+                    <g fill="#5c9aff" fill-opacity="0.0862745" stroke="none" transform="matrix(11.6098,0,0,-1.20986,166,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <rect vector-effect="non-scaling-stroke" x="-1" y="0" width="2" height="179.36"/>
+                    </g>
+                    <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="InfiniteLine_1">
+                        <g fill="none" stroke="#5c9aff" stroke-opacity="0" stroke-width="1" stroke-linecap="square" stroke-linejoin="miter" stroke-miterlimit="2" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                            <polyline fill="none" vector-effect="non-scaling-stroke" points="154.39,248.0 154.39,30.99951039999999"/>
+                        </g>
+                    </g>
+                    <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="InfiniteLine_2">
+                        <g fill="none" stroke="#5c9aff" stroke-opacity="0" stroke-width="1" stroke-linecap="square" stroke-linejoin="miter" stroke-miterlimit="2" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                            <polyline fill="none" vector-effect="non-scaling-stroke" points="177.61,248.0 177.61,30.99951039999999"/>
+                        </g>
+                    </g>
+                </g>
+                <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="InfiniteLine_3">
+                    <g fill="none" stroke="#969696" stroke-opacity="1" stroke-dasharray="4,2" stroke-dashoffset="0" stroke-width="1" stroke-linecap="square" stroke-linejoin="miter" stroke-miterlimit="2" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                        <polyline fill="none" vector-effect="non-scaling-stroke" points="166.0,248.0 166.0,30.99951039999999"/>
+                    </g>
+                </g>
+            </g>
+            <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="QGraphicsRectItem_1">
+                <g fill="none" stroke="none" transform="matrix(1,0,0,1,47,31)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                    <rect vector-effect="non-scaling-stroke" x="0" y="0" width="238" height="217"/>
+                </g>
+            </g>
+        </g>
+    </g>
+    <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="LabelItem_1">
+        <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="QGraphicsTextItem_1">
+            
+
+
+            
+
+
+            
+
+
+            <g fill="none" stroke="#969696" stroke-opacity="1" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(1,0,0,1,102,2)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                <text fill="#969696" fill-opacity="1" stroke="none" xml:space="preserve" x="4" y="20" font-family="&quot;Segoe UI&quot;" font-size="14.6667" font-weight="400" font-style="normal">Auto-correlogram</text>
+            </g>
+            
+
+
+            
+
+        </g>
+    </g>
+    <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="AxisItem_1">
+        <g fill="none" stroke="#1a1f29" stroke-opacity="1" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="46.0,249.0 286.0,249.0"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="49.90244,248.0 49.90244,243.0"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="107.9512,248.0 107.9512,243.0"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="166.0,248.0 166.0,243.0"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="224.049,248.0 224.049,243.0"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="282.098,248.0 282.098,243.0"/>
+        </g>
+        <g fill="none" stroke="#1a1f29" stroke-opacity="0.498039" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="61.5122,248.0 61.5122,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="73.122,248.0 73.122,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="84.73169999999999,248.0 84.73169999999999,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="96.3415,248.0 96.3415,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="119.561,248.0 119.561,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="131.1707,248.0 131.1707,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="142.78050000000002,248.0 142.78050000000002,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="154.39,248.0 154.39,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="177.61,248.0 177.61,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="189.22,248.0 189.22,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="200.829,248.0 200.829,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="212.439,248.0 212.439,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="235.659,248.0 235.659,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="247.268,248.0 247.268,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="258.878,248.0 258.878,244.66667"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="270.488,248.0 270.488,244.66667"/>
+        </g>
+        <g fill="none" stroke="#1a1f29" stroke-opacity="0.333333" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="55.707319999999996,248.0 55.707319999999996,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="67.3171,248.0 67.3171,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="78.9268,248.0 78.9268,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="90.53659999999999,248.0 90.53659999999999,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="102.1463,248.0 102.1463,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="113.7561,248.0 113.7561,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="125.3659,248.0 125.3659,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="136.9756,248.0 136.9756,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="148.58499999999998,248.0 148.58499999999998,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="160.195,248.0 160.195,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="171.805,248.0 171.805,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="183.415,248.0 183.415,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="195.024,248.0 195.024,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="206.634,248.0 206.634,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="218.244,248.0 218.244,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="229.854,248.0 229.854,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="241.463,248.0 241.463,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="253.073,248.0 253.073,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="264.683,248.0 264.683,245.5"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="276.293,248.0 276.293,245.5"/>
+        </g>
+        <g fill="none" stroke="#1a1f29" stroke-opacity="1" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(1,0,0,1,47,248)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="54.9375" y="16" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">-5</text>
+            <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="115.484" y="16" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">0</text>
+            <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="173.547" y="16" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">5</text>
+        </g>
+        <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="QGraphicsTextItem_2">
+            
+
+
+            
+
+
+            
+
+
+            <g fill="none" stroke="#1a1f29" stroke-opacity="1" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(1,0,0,1,135,268)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="4" y="18" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">Lag (ms) </text>
+            </g>
+            
+
+
+            
+
+        </g>
+    </g>
+    <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="AxisItem_2">
+        <g fill="none" stroke="#1a1f29" stroke-opacity="1" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="46.0,30.0 46.0,249.0"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,248.0 52.0,248.0"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,187.507 52.0,187.507"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,127.0143 52.0,127.0143"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,66.5214 52.0,66.5214"/>
+        </g>
+        <g fill="none" stroke="#1a1f29" stroke-opacity="0.498039" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,235.901 50.3333,235.901"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,223.803 50.3333,223.803"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,211.704 50.3333,211.704"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,199.606 50.3333,199.606"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,175.409 50.3333,175.409"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,163.31 50.3333,163.31"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,151.211 50.3333,151.211"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,139.113 50.3333,139.113"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,114.9157 50.3333,114.9157"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,102.8171 50.3333,102.8171"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,90.71860000000001 50.3333,90.71860000000001"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,78.62 50.3333,78.62"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,54.422799999999995 50.3333,54.422799999999995"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,42.3243 50.3333,42.3243"/>
+        </g>
+        <g fill="none" stroke="#1a1f29" stroke-opacity="0.333333" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,241.951 49.5,241.951"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,229.852 49.5,229.852"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,217.754 49.5,217.754"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,205.655 49.5,205.655"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,193.556 49.5,193.556"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,181.458 49.5,181.458"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,169.359 49.5,169.359"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,157.261 49.5,157.261"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,145.162 49.5,145.162"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,133.064 49.5,133.064"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,120.965 49.5,120.965"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,108.8664 49.5,108.8664"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,96.7678 49.5,96.7678"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,84.66929999999999 49.5,84.66929999999999"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,72.5707 49.5,72.5707"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,60.4721 49.5,60.4721"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,48.373599999999996 49.5,48.373599999999996"/>
+            <polyline fill="none" vector-effect="non-scaling-stroke" points="47.0,36.27498 49.5,36.27498"/>
+        </g>
+        <g fill="none" stroke="#1a1f29" stroke-opacity="1" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(1,0,0,1,1,31)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+            <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="34" y="222.5" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">0</text>
+            <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="27" y="162" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">50</text>
+            <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="20" y="101.5" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">100</text>
+            <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="20" y="41.0156" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">150</text>
+        </g>
+        <g fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" stroke-linecap="square" stroke-linejoin="bevel" id="QGraphicsTextItem_3">
+            
+
+
+            
+
+
+            
+
+
+            <g fill="none" stroke="#1a1f29" stroke-opacity="1" stroke-width="1" stroke-linecap="square" stroke-linejoin="bevel" transform="matrix(0,-1,1,0,-4,161)" font-family="Segoe UI" font-size="13.3333" font-weight="400" font-style="normal">
+                <text fill="#1a1f29" fill-opacity="1" stroke="none" xml:space="preserve" x="4" y="18" font-family="&quot;Segoe UI&quot;" font-size="13.3333" font-weight="400" font-style="normal">count </text>
+            </g>
+            
+
+
+            
+
+        </g>
+    </g>
+</g>
+
+</svg>

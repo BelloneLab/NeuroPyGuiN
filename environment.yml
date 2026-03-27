@@ -1,0 +1,32 @@
+name: neuropygui
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - tqdm
+  - numba
+  - scikit-learn
+  - imbalanced-learn
+  - statsmodels
+  - networkx
+  - psutil
+  - joblib
+  - h5py
+  - seaborn
+  - cachecache
+  - pyarrow
+  - ipython
+  - cmcrameri
+  - pillow
+  - cupy
+  - cuda-version=12
+  - pip:
+      - PySide6
+      - pyqtgraph>=0.14.0,<0.15
+      - upsetplot
