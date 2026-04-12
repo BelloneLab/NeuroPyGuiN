@@ -62,7 +62,8 @@ def _split_catgt_flags(raw: str) -> List[str]:
 
 
 def _is_catgt_extractor_flag(token: str) -> bool:
-    return bool(re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", str(token).strip(), flags=re.IGNORECASE))
+    clean = re.sub(r"\[[^\]]*\]$", "", str(token).strip())
+    return bool(re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", clean, flags=re.IGNORECASE))
 
 
 def strip_catgt_extractor_flags(catgt_command: str) -> str:
@@ -71,12 +72,14 @@ def strip_catgt_extractor_flags(catgt_command: str) -> str:
 
 def merge_extractors_into_catgt_command(catgt_command: str, extractor_string: str) -> str:
     base = strip_catgt_extractor_flags(catgt_command)
-    parts = [part for part in [base.strip(), str(extractor_string).strip()] if part]
+    clean_extractors = re.sub(r"\[[^\]]*\]", "", str(extractor_string).strip())
+    parts = [part for part in [base.strip(), clean_extractors] if part]
     return " ".join(parts)
 
 
 def _is_ni_catgt_extractor_flag(token: str) -> bool:
-    match = re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", str(token).strip(), flags=re.IGNORECASE)
+    clean = re.sub(r"\[[^\]]*\]$", "", str(token).strip())
+    match = re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", clean, flags=re.IGNORECASE)
     if not match:
         return False
     values = [value.strip() for value in match.group(2).split(",")]
@@ -87,7 +90,8 @@ def _catgt_extractor_streams(catgt_command: str) -> List[str]:
     streams: List[str] = []
     stream_map = {"0": "ni", "1": "obx", "2": "ap"}
     for token in _split_catgt_flags(catgt_command):
-        match = re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", str(token).strip(), flags=re.IGNORECASE)
+        clean = re.sub(r"\[[^\]]*\]$", "", str(token).strip())
+        match = re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", clean, flags=re.IGNORECASE)
         if not match:
             continue
         values = [value.strip() for value in match.group(2).split(",")]
@@ -114,7 +118,8 @@ def expected_ni_catgt_output_patterns(catgt_command: str, run_name: str, gate_st
     base = f"{str(run_name).strip()}_g{str(gate_string).strip()}_tcat.nidq."
     patterns: List[str] = []
     for token in _split_catgt_flags(catgt_command):
-        match = re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", str(token).strip(), flags=re.IGNORECASE)
+        clean = re.sub(r"\[[^\]]*\]$", "", str(token).strip())
+        match = re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", clean, flags=re.IGNORECASE)
         if not match:
             continue
         mode = match.group(1).lower()
@@ -138,6 +143,45 @@ def expected_ni_catgt_output_patterns(catgt_command: str, run_name: str, gate_st
         if pattern not in out:
             out.append(pattern)
     return out
+
+
+def extractor_label_rename_map(
+    ni_extract_string: str, run_name: str, gate_string: str,
+) -> Dict[str, str]:
+    """Return {original_pattern: label_prefixed_name} for extractors that carry a ``[label]``."""
+    base = f"{str(run_name).strip()}_g{str(gate_string).strip()}_tcat.nidq."
+    mapping: Dict[str, str] = {}
+    for token in _split_catgt_flags(ni_extract_string):
+        label = ""
+        label_match = re.search(r"\[([^\]]*)\]$", token)
+        if label_match:
+            label = label_match.group(1).strip()
+            token = token[: label_match.start()]
+        if not label:
+            continue
+        match = re.fullmatch(r"-(xd|xid|xa|xia)=(.+)", token, flags=re.IGNORECASE)
+        if not match:
+            continue
+        mode = match.group(1).lower()
+        values = [v.strip() for v in match.group(2).split(",")]
+        if not values or values[0] != "0":
+            continue
+        if mode in {"xd", "xid"} and len(values) >= 5:
+            word = values[2]
+            suffix = f"{mode}_{word}_{values[3]}_{_fmt_catgt_output_token(values[4])}.txt"
+        elif mode in {"xa", "xia"} and len(values) >= 6:
+            word = values[2]
+            suffix = f"{mode}_{word}_{_fmt_catgt_output_token(values[5])}.txt"
+        else:
+            continue
+        original = base + suffix
+        safe_label = re.sub(r"[^\w\-.]", "_", label)
+        mapping[original] = f"{safe_label}_{base}{suffix}"
+        # TPrime adjusted file: stem.adj.txt
+        adj_suffix = suffix.replace(".txt", ".adj.txt")
+        adj_original = base + adj_suffix
+        mapping[adj_original] = f"{safe_label}_{base}{adj_suffix}"
+    return mapping
 
 
 def catgt_stream_string(catgt_command: str, ni_extract_string: str = "", include_ap: bool = True) -> str:
@@ -194,10 +238,50 @@ def is_catgt_processed_bin(bin_file: str) -> bool:
     return "catgt" in name or "tcat" in name
 
 
-def default_local_ks_output_dir(bin_file: str, ks_tag: str, probe_string: str) -> Path:
+def default_kilosort_output_name(ks_tag: str, probe_string: str) -> str:
     probe = str(probe_string).strip()
-    folder_name = f"imec{probe}_{ks_tag}" if probe else str(ks_tag).strip()
-    return Path(bin_file).resolve().parent / folder_name
+    tag = str(ks_tag).strip()
+    return f"imec{probe}_{tag}" if probe else tag
+
+
+def default_local_ks_output_dir(bin_file: str, ks_tag: str, probe_string: str) -> Path:
+    return Path(bin_file).resolve().parent / default_kilosort_output_name(ks_tag, probe_string)
+
+
+def _session_root_for_spikeglx_bin(bin_file: str) -> Path:
+    path = Path(bin_file).resolve()
+    parents = list(path.parents)
+    if len(parents) >= 3:
+        return parents[2]
+    if parents:
+        return parents[-1]
+    return path.parent
+
+
+def _relative_session_parts_from_raw_hierarchy(bin_file: str) -> Tuple[str, ...]:
+    session_root = _session_root_for_spikeglx_bin(bin_file)
+    lowered = [part.lower() for part in session_root.parts]
+    try:
+        raw_idx = lowered.index("rawdata")
+    except ValueError:
+        return ()
+    return tuple(session_root.parts[raw_idx + 1 :])
+
+
+def default_pipeline_output_dir(
+    bin_file: str,
+    output_root: str | Path,
+    *,
+    run_name: str,
+    mirror_raw_hierarchy: bool = False,
+) -> Path:
+    root = Path(output_root).expanduser()
+    if not mirror_raw_hierarchy:
+        return root / str(run_name).strip()
+    relative_session = _relative_session_parts_from_raw_hierarchy(bin_file)
+    if not relative_session:
+        return root / str(run_name).strip()
+    return root.joinpath(*relative_session, "spike_sorting")
 
 
 def parse_catgt_processed_bin_context(bin_file: str) -> Dict[str, str]:
@@ -226,6 +310,13 @@ def parse_catgt_processed_bin_context(bin_file: str) -> Dict[str, str]:
     }
 
 
+def resolve_labelled_output_context(processing_bin: str, fallback_context: Dict[str, str] | None = None) -> Dict[str, str]:
+    resolved = parse_catgt_processed_bin_context(processing_bin)
+    if resolved:
+        return resolved
+    return dict(fallback_context or {})
+
+
 def default_pipeline_ks_output_dir(
     bin_file: str,
     ks_tag: str,
@@ -237,7 +328,7 @@ def default_pipeline_ks_output_dir(
 ) -> Path:
     if store_next_to_bin or is_catgt_processed_bin(bin_file):
         return default_local_ks_output_dir(bin_file, ks_tag, probe_string)
-    return Path(output_root).expanduser() / str(run_name).strip() / str(ks_tag).strip()
+    return Path(output_root).expanduser() / str(run_name).strip() / default_kilosort_output_name(ks_tag, probe_string)
 
 
 def write_step_json(path: Path, payload: Dict) -> None:

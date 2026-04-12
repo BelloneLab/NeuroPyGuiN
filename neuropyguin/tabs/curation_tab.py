@@ -23,6 +23,7 @@ from ..bombcell_core import (
 from ..ecephys_runtime import ecephys_subprocess_env
 from ..ks_output_resolver import find_kilosort_output_dir, find_metrics_file
 from ..pybombcell_integration import run_pybombcell_on_folder
+from ..side_nav import SideNavStack
 from ..workers import FunctionWorker
 
 
@@ -173,8 +174,8 @@ class CurationTab(QtWidgets.QWidget):
         self._plots_detached = False
         self._psd_metrics_cache: Dict[str, pd.DataFrame] = {}
         self._plots_dialog: Optional[QtWidgets.QDialog] = None
-        self._settings_dialog: Optional[QtWidgets.QDialog] = None
         self._body_split: Optional[QtWidgets.QSplitter] = None
+        self._unit_split: Optional[QtWidgets.QSplitter] = None
         self._right_metrics: Optional[QtWidgets.QWidget] = None
         self._right_metrics_l: Optional[QtWidgets.QVBoxLayout] = None
         self._body_sizes_before_detach: List[int] = []
@@ -200,9 +201,27 @@ class CurationTab(QtWidgets.QWidget):
         main.setContentsMargins(18, 16, 18, 18)
         main.setSpacing(14)
 
+        def _wrap_page(widget: QtWidgets.QWidget, *, stretch: bool = True) -> QtWidgets.QWidget:
+            page = QtWidgets.QWidget()
+            page_l = QtWidgets.QVBoxLayout(page)
+            page_l.setContentsMargins(0, 0, 0, 0)
+            page_l.setSpacing(12)
+            page_l.addWidget(widget, 1 if stretch else 0)
+            if not stretch:
+                page_l.addStretch(1)
+            return page
+
         grp_phy = QtWidgets.QGroupBox("Phy")
         grp_phy.setProperty("settingsSection", True)
-        phy_row = QtWidgets.QHBoxLayout(grp_phy)
+        phy_layout = QtWidgets.QVBoxLayout(grp_phy)
+        phy_layout.setSpacing(10)
+        phy_hint = QtWidgets.QLabel(
+            "Launch Phy for manual template review. This section stays minimal because it does not need the metric visualisation panel."
+        )
+        phy_hint.setObjectName("SectionHint")
+        phy_hint.setWordWrap(True)
+        phy_layout.addWidget(phy_hint)
+        phy_row = QtWidgets.QHBoxLayout()
         phy_row.setSpacing(10)
 
         self.ed_phy_folder = QtWidgets.QLineEdit()
@@ -216,8 +235,10 @@ class CurationTab(QtWidgets.QWidget):
         phy_row.addWidget(btn_phy_folder)
         phy_row.addWidget(self.btn_launch_phy)
         phy_row.addWidget(self.btn_stop_phy)
+        phy_layout.addLayout(phy_row)
 
         grp_bomb = QtWidgets.QGroupBox("Bombcell: live QC")
+        grp_bomb.setProperty("settingsSection", True)
         bomb_layout = QtWidgets.QVBoxLayout(grp_bomb)
         bomb_layout.setSpacing(10)
 
@@ -226,15 +247,12 @@ class CurationTab(QtWidgets.QWidget):
         btn_bomb_folder = QtWidgets.QPushButton("Browse")
         self.btn_load_metrics = QtWidgets.QPushButton("Load metrics.csv")
         self.btn_run_pybomb = QtWidgets.QPushButton("Run py_bombcell")
-        self.btn_open_settings = QtWidgets.QPushButton("Threshold settings")
         self.btn_load_metrics.setProperty("role", "secondary")
         self.btn_run_pybomb.setProperty("role", "primary")
-        self.btn_open_settings.setProperty("role", "secondary")
         bomb_top.addWidget(self.ed_bomb_folder, 1)
         bomb_top.addWidget(btn_bomb_folder)
         bomb_top.addWidget(self.btn_load_metrics)
         bomb_top.addWidget(self.btn_run_pybomb)
-        bomb_top.addWidget(self.btn_open_settings)
 
         self.tbl_thresh = QtWidgets.QTableWidget(0, 5)
         self.tbl_thresh.setAlternatingRowColors(True)
@@ -267,10 +285,6 @@ class CurationTab(QtWidgets.QWidget):
         list_col_l.addWidget(self.list_metrics, 1)
         list_col_l.addLayout(metric_row)
 
-        settings_panel = QtWidgets.QWidget()
-        settings_panel_l = QtWidgets.QVBoxLayout(settings_panel)
-        settings_panel_l.setContentsMargins(0, 0, 0, 0)
-        settings_panel_l.setSpacing(10)
         threshold_box = QtWidgets.QGroupBox("Threshold settings")
         threshold_box.setProperty("settingsSection", True)
         threshold_l = QtWidgets.QVBoxLayout(threshold_box)
@@ -279,25 +293,6 @@ class CurationTab(QtWidgets.QWidget):
         metric_box.setProperty("settingsSection", True)
         metric_box_l = QtWidgets.QVBoxLayout(metric_box)
         metric_box_l.addWidget(list_col, 1)
-        settings_panel_l.addWidget(threshold_box, 2)
-        settings_panel_l.addWidget(metric_box, 1)
-
-        self._settings_dialog = QtWidgets.QDialog(self)
-        self._settings_dialog.setWindowTitle("Bombcell settings")
-        self._settings_dialog.setModal(False)
-        self._settings_dialog.resize(1040, 760)
-        self._settings_dialog.setMinimumSize(860, 620)
-        settings_dialog_l = QtWidgets.QVBoxLayout(self._settings_dialog)
-        settings_hint = QtWidgets.QLabel(
-            "Threshold editing and metric selection live here so the curation tab can dedicate more space to plots and unit review."
-        )
-        settings_hint.setObjectName("SectionHint")
-        settings_hint.setWordWrap(True)
-        settings_dialog_l.addWidget(settings_hint)
-        settings_dialog_l.addWidget(settings_panel, 1)
-        settings_btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-        settings_btns.rejected.connect(self._settings_dialog.close)
-        settings_dialog_l.addWidget(settings_btns, 0)
 
         self.metrics_grid = pg.GraphicsLayoutWidget()
         self.metrics_grid.setMinimumHeight(420)
@@ -306,10 +301,7 @@ class CurationTab(QtWidgets.QWidget):
         plots_panel_l.setContentsMargins(0, 0, 0, 0)
         plots_panel_l.setSpacing(0)
         plots_panel_l.addWidget(self.metrics_grid, 1)
-        self._right_metrics = plots_panel
-        self._right_metrics_l = plots_panel_l
 
-        action_row = QtWidgets.QHBoxLayout()
         self.btn_save_labels = QtWidgets.QPushButton("Save bombcell_labels.csv")
         self.btn_export = QtWidgets.QPushButton("Export plotted data")
         self.btn_detach_plots = QtWidgets.QPushButton("Detach plots")
@@ -321,8 +313,12 @@ class CurationTab(QtWidgets.QWidget):
         self.lbl_noise = QtWidgets.QLabel("noise: 0")
         self.lbl_mua = QtWidgets.QLabel("mua: 0")
         self.lbl_non_soma = QtWidgets.QLabel("non_soma: 0")
+        status_row = QtWidgets.QHBoxLayout()
         for w in [self.lbl_good, self.lbl_noise, self.lbl_mua, self.lbl_non_soma]:
-            action_row.addWidget(w)
+            status_row.addWidget(w)
+        status_row.addStretch(1)
+
+        action_row = QtWidgets.QHBoxLayout()
         action_row.addStretch(1)
         action_row.addWidget(self.btn_detach_plots)
         action_row.addWidget(self.btn_export)
@@ -358,33 +354,113 @@ class CurationTab(QtWidgets.QWidget):
         unit_inspector_l.addWidget(self.tbl_unit_metrics, 1)
 
         unit_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self._unit_split = unit_split
+        unit_split.setChildrenCollapsible(False)
         unit_split.addWidget(self.tabs_units)
         unit_split.addWidget(unit_inspector)
         unit_split.setStretchFactor(0, 2)
         unit_split.setStretchFactor(1, 3)
-        unit_split.setSizes([300, 700])
+        unit_split.setSizes([430, 320])
 
-        body_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        review_box = QtWidgets.QGroupBox("Review controls")
+        review_box.setProperty("settingsSection", True)
+        review_box_l = QtWidgets.QVBoxLayout(review_box)
+        review_box_l.setSpacing(10)
+        review_hint = QtWidgets.QLabel(
+            "Load metrics, run py_bombcell, then use the Thresholds and Metrics subsections to refine the review."
+        )
+        review_hint.setObjectName("SectionHint")
+        review_hint.setWordWrap(True)
+        review_box_l.addWidget(review_hint)
+        review_box_l.addLayout(bomb_top)
+        review_box_l.addLayout(status_row)
+        review_box_l.addLayout(action_row)
+
+        units_box = QtWidgets.QGroupBox("Units")
+        units_box.setProperty("settingsSection", True)
+        units_box_l = QtWidgets.QVBoxLayout(units_box)
+        units_box_l.setSpacing(10)
+        units_hint = QtWidgets.QLabel("Inspect labelled units on the left while the metric distributions stay visible on the right.")
+        units_hint.setObjectName("SectionHint")
+        units_hint.setWordWrap(True)
+        units_box_l.addWidget(units_hint)
+        units_box_l.addWidget(unit_split, 1)
+
+        bomb_subsections = SideNavStack(
+            vertical_labels=True,
+            compact_rail=True,
+        )
+        self._bomb_subsections = bomb_subsections
+        bomb_subsections.add_page("Review", _wrap_page(review_box, stretch=False))
+        bomb_subsections.add_page("Units", _wrap_page(units_box, stretch=True))
+        bomb_subsections.add_page("Thresholds", _wrap_page(threshold_box, stretch=True))
+        bomb_subsections.add_page("Metrics", _wrap_page(metric_box, stretch=True))
+        bomb_subsections.setCurrentIndex(0)
+
+        left_panel = QtWidgets.QWidget()
+        left_panel.setMinimumWidth(380)
+        left_panel_l = QtWidgets.QVBoxLayout(left_panel)
+        left_panel_l.setContentsMargins(0, 0, 0, 0)
+        left_panel_l.setSpacing(0)
+        left_panel_l.addWidget(bomb_subsections, 1)
+
+        plots_box = QtWidgets.QGroupBox("Visualisation")
+        plots_box.setProperty("heroCard", True)
+        plots_box_l = QtWidgets.QVBoxLayout(plots_box)
+        plots_box_l.setSpacing(10)
+        plots_hint = QtWidgets.QLabel("Selected metric distributions and unit overlays. This panel keeps the largest share of the tab width.")
+        plots_hint.setObjectName("SectionHint")
+        plots_hint.setWordWrap(True)
+        plots_box_l.addWidget(plots_hint)
+        plots_panel.setMinimumWidth(720)
+        plots_box_l.addWidget(plots_panel, 1)
+
+        self._right_metrics = plots_box
+        self._right_metrics_l = plots_panel_l
+
+        body_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self._body_split = body_split
-        body_split.addWidget(plots_panel)
-        body_split.addWidget(unit_split)
-        body_split.setStretchFactor(0, 5)
-        body_split.setStretchFactor(1, 2)
-        body_split.setSizes([680, 240])
-
-        bomb_layout.addLayout(bomb_top)
-        bomb_layout.addLayout(action_row)
+        body_split.setChildrenCollapsible(False)
+        body_split.addWidget(left_panel)
+        body_split.addWidget(plots_box)
+        body_split.setStretchFactor(0, 1)
+        body_split.setStretchFactor(1, 1)
+        body_split.setSizes([860, 980])
         bomb_layout.addWidget(body_split, 1)
 
+        self.btn_copy_log = QtWidgets.QPushButton("Copy log")
+        self.btn_copy_log.setProperty("role", "secondary")
+        log_box = QtWidgets.QGroupBox("Curation log")
+        log_box.setProperty("settingsSection", True)
+        log_layout = QtWidgets.QVBoxLayout(log_box)
+        log_layout.setSpacing(8)
+        log_header = QtWidgets.QHBoxLayout()
+        log_hint = QtWidgets.QLabel("Live output from Phy, py_bombcell, and metrics refresh actions.")
+        log_hint.setObjectName("SectionHint")
+        log_hint.setWordWrap(True)
+        log_header.addWidget(log_hint, 1)
+        log_header.addWidget(self.btn_copy_log, 0)
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setProperty("logView", True)
         self.log.setPlaceholderText("Curation and Phy output will appear here.")
-        self.log.setMaximumHeight(120)
+        self.log.setMinimumHeight(260)
+        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        log_layout.addLayout(log_header)
+        log_layout.addWidget(self.log, 1)
 
-        main.addWidget(grp_phy, 0)
-        main.addWidget(grp_bomb, 1)
-        main.addWidget(self.log, 0)
+        main_sections = SideNavStack(
+            "Sections",
+            "Switch between Phy launch, Bombcell review, and the curation log.",
+            vertical_labels=True,
+            compact_rail=True,
+        )
+        main_sections.add_page("Phy", _wrap_page(grp_phy, stretch=False))
+        main_sections.add_page("Bombcell", _wrap_page(grp_bomb, stretch=True))
+        main_sections.add_page("Log", _wrap_page(log_box, stretch=True))
+        main_sections.setCurrentIndex(1)
+        self._main_sections = main_sections
+        main.addWidget(main_sections, 1)
 
         btn_phy_folder.clicked.connect(lambda: self._pick_folder(self.ed_phy_folder))
         btn_bomb_folder.clicked.connect(lambda: self._pick_folder(self.ed_bomb_folder))
@@ -393,7 +469,7 @@ class CurationTab(QtWidgets.QWidget):
 
         self.btn_load_metrics.clicked.connect(self._load_metrics)
         self.btn_run_pybomb.clicked.connect(self._run_pybombcell)
-        self.btn_open_settings.clicked.connect(self._open_settings_window)
+        self.btn_copy_log.clicked.connect(self._copy_log)
         self.btn_reset.clicked.connect(self._reset_thresholds)
         self.btn_apply.clicked.connect(self._apply_settings)
         self.btn_save_labels.clicked.connect(self._save_labels)
@@ -408,16 +484,9 @@ class CurationTab(QtWidgets.QWidget):
         self.list_noise.itemSelectionChanged.connect(lambda: self._on_unit_selection_changed(self.list_noise))
         self.list_mua.itemSelectionChanged.connect(lambda: self._on_unit_selection_changed(self.list_mua))
         self.list_non_soma.itemSelectionChanged.connect(lambda: self._on_unit_selection_changed(self.list_non_soma))
-
-    def _open_settings_window(self) -> None:
-        if self._settings_dialog is None:
-            return
-        state = self._settings_dialog.windowState()
-        if state & QtCore.Qt.WindowMinimized:
-            self._settings_dialog.setWindowState(state & ~QtCore.Qt.WindowMinimized)
-        self._settings_dialog.show()
-        self._settings_dialog.raise_()
-        self._settings_dialog.activateWindow()
+        body_split.splitterMoved.connect(lambda _pos, _idx: self._persist_splitter_sizes())
+        unit_split.splitterMoved.connect(lambda _pos, _idx: self._persist_splitter_sizes())
+        bomb_subsections.currentChanged.connect(lambda _idx: self._persist_splitter_sizes())
 
     def _pick_folder(self, target: QtWidgets.QLineEdit) -> None:
         start = self.settings.value("paths/last_folder", str(Path.cwd()))
@@ -470,9 +539,13 @@ class CurationTab(QtWidgets.QWidget):
     def set_ks_folder(self, folder: str) -> None:
         self.ed_phy_folder.setText(folder)
         self.ed_bomb_folder.setText(folder)
+        if hasattr(self, "_main_sections"):
+            self._main_sections.setCurrentIndex(1)
 
     def open_ks_folder(self, folder: str) -> None:
         self.set_ks_folder(folder)
+        if hasattr(self, "_main_sections"):
+            self._main_sections.setCurrentIndex(0)
         self._launch_phy()
 
     def _stop_phy(self) -> None:
@@ -518,6 +591,46 @@ class CurationTab(QtWidgets.QWidget):
             self.ed_phy_folder.setText(str(phy_folder))
         if bomb_folder:
             self.ed_bomb_folder.setText(str(bomb_folder))
+        bomb_index = int(self.settings.value("curation/bomb_subsection_index", 0))
+        if hasattr(self, "_bomb_subsections"):
+            self._bomb_subsections.setCurrentIndex(bomb_index)
+
+        body_sizes = self.settings.value("curation/body_split_sizes", [])
+        parsed_body = self._parse_splitter_sizes(body_sizes)
+        if parsed_body and self._body_split is not None:
+            self._body_split.setSizes(parsed_body)
+
+        unit_sizes = self.settings.value("curation/unit_split_sizes", [])
+        parsed_unit = self._parse_splitter_sizes(unit_sizes)
+        if parsed_unit and self._unit_split is not None:
+            self._unit_split.setSizes(parsed_unit)
+
+    def _parse_splitter_sizes(self, raw_value) -> List[int]:
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, str):
+            values = [part for part in raw_value.split(",") if part.strip()]
+        elif isinstance(raw_value, (list, tuple)):
+            values = list(raw_value)
+        else:
+            return []
+        out: List[int] = []
+        for value in values:
+            try:
+                size = int(value)
+            except Exception:
+                continue
+            if size > 0:
+                out.append(size)
+        return out if len(out) >= 2 else []
+
+    def _persist_splitter_sizes(self) -> None:
+        if self._body_split is not None:
+            self.settings.setValue("curation/body_split_sizes", self._body_split.sizes())
+        if self._unit_split is not None:
+            self.settings.setValue("curation/unit_split_sizes", self._unit_split.sizes())
+        if hasattr(self, "_bomb_subsections"):
+            self.settings.setValue("curation/bomb_subsection_index", self._bomb_subsections.currentIndex())
 
     def _parse_optional_float(self, text: str):
         t = (text or "").strip()
@@ -549,6 +662,8 @@ class CurationTab(QtWidgets.QWidget):
         return out
 
     def _load_metrics(self, allow_compute: bool = True) -> None:
+        if hasattr(self, "_main_sections"):
+            self._main_sections.setCurrentIndex(1)
         folder = Path(self.ed_bomb_folder.text().strip())
         if not folder.exists():
             self._log(f"Invalid folder: {folder}")
@@ -711,6 +826,8 @@ class CurationTab(QtWidgets.QWidget):
         return psd_df
 
     def _run_pybombcell(self) -> None:
+        if hasattr(self, "_main_sections"):
+            self._main_sections.setCurrentIndex(1)
         folder = Path(self.ed_bomb_folder.text().strip())
         if not folder.exists():
             self._log(f"Invalid folder: {folder}")
@@ -1100,6 +1217,10 @@ class CurationTab(QtWidgets.QWidget):
     def _log(self, line: str) -> None:
         self.log.appendPlainText(line)
 
+    def _copy_log(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(self.log.toPlainText())
+        self._log("Curation log copied to clipboard.")
+
     def set_plot_preferences(self, theme: str, show_grid: bool) -> None:
         self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
         self._show_grid = bool(show_grid)
@@ -1176,7 +1297,7 @@ class CurationTab(QtWidgets.QWidget):
         if self._right_metrics is not None:
             self._right_metrics.hide()
         if self._body_split is not None:
-            self._body_split.setSizes([0, 1])
+            self._body_split.setSizes([1, 0])
         self.btn_detach_plots.setText("Attach plots")
 
     def _attach_plots(self) -> None:
@@ -1195,7 +1316,7 @@ class CurationTab(QtWidgets.QWidget):
             if self._body_sizes_before_detach:
                 self._body_split.setSizes(self._body_sizes_before_detach)
             else:
-                self._body_split.setSizes([5, 2])
+                self._body_split.setSizes([2, 5])
         if self._plots_dialog is not None and self._plots_dialog.isVisible():
             self._plots_dialog.blockSignals(True)
             self._plots_dialog.close()
@@ -1206,5 +1327,3 @@ class CurationTab(QtWidgets.QWidget):
         self.btn_detach_plots.setChecked(False)
         self.btn_detach_plots.blockSignals(False)
         self.btn_detach_plots.setText("Detach plots")
-
-

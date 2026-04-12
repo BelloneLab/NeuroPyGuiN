@@ -6,13 +6,17 @@ from neuropyguin.preprocessing import (
     catgt_extract_only_flags,
     catgt_extract_only_stream_string,
     catgt_stream_string,
+    default_kilosort_output_name,
     default_local_ks_output_dir,
+    default_pipeline_output_dir,
     default_pipeline_ks_output_dir,
     expected_ni_catgt_output_patterns,
+    extractor_label_rename_map,
     has_ni_catgt_extractors,
     is_catgt_processed_bin,
     merge_extractors_into_catgt_command,
     parse_catgt_processed_bin_context,
+    resolve_labelled_output_context,
     parse_spikeglx_bin_name,
 )
 
@@ -29,9 +33,46 @@ def test_default_local_ks_output_dir_uses_bin_parent_and_probe() -> None:
     assert default_local_ks_output_dir(str(bin_file), "ks4", "0") == expected
 
 
+def test_default_kilosort_output_name_uses_probe_when_available() -> None:
+    assert default_kilosort_output_name("ks4", "0") == "imec0_ks4"
+    assert default_kilosort_output_name("ks4", "") == "ks4"
+
+
+def test_default_pipeline_output_dir_can_mirror_raw_hierarchy_into_spike_sorting() -> None:
+    bin_file = Path(
+        r"B:\NPX\rawData\VTA_NPX\31096\test\31096_test_sync_test_1_g0\31096_test_sync_test_1_g0_imec0\31096_test_sync_test_1_g0_t0.imec0.ap.bin"
+    )
+    expected = Path(r"B:\NPX\processedData\VTA_NPX\31096\test\spike_sorting")
+    assert (
+        default_pipeline_output_dir(
+            str(bin_file),
+            r"B:\NPX\processedData",
+            run_name="31096_test_sync_test_1",
+            mirror_raw_hierarchy=True,
+        )
+        == expected
+    )
+
+
+def test_default_pipeline_output_dir_can_mirror_numeric_session_hierarchy_into_spike_sorting() -> None:
+    bin_file = Path(
+        r"B:\NPX\rawData\VTA_NPX\31098\1\31098_1_NPX_basal_g0\31098_1_NPX_basal_g0_imec0\31098_1_NPX_basal_g0_t0.imec0.ap.bin"
+    )
+    expected = Path(r"B:\NPX\processedData\VTA_NPX\31098\1\spike_sorting")
+    assert (
+        default_pipeline_output_dir(
+            str(bin_file),
+            r"B:\NPX\processedData",
+            run_name="31098_1_NPX_basal",
+            mirror_raw_hierarchy=True,
+        )
+        == expected
+    )
+
+
 def test_default_pipeline_ks_output_dir_uses_root_for_raw_inputs() -> None:
     bin_file = Path(r"B:\NPX\rawData\pups_NAc_NPX\vocal01\vocal01_g0_t0.imec0.ap.bin")
-    expected = Path(r"D:\sorting\vocal01\ks4")
+    expected = Path(r"D:\sorting\vocal01\imec0_ks4")
     assert (
         default_pipeline_ks_output_dir(
             str(bin_file),
@@ -104,6 +145,20 @@ def test_expected_ni_catgt_output_patterns_cover_rise_fall_and_bitfield() -> Non
     ]
 
 
+def test_extractor_label_rename_map_preserves_labelled_outputs() -> None:
+    mapping = extractor_label_rename_map(
+        "-xd=0,0,8,3,0[laser_on] -xa=0,0,1,1.1,0,0[reward]",
+        "vocal01",
+        "0",
+    )
+    assert mapping == {
+        "vocal01_g0_tcat.nidq.xd_8_3_0.txt": "laser_on_vocal01_g0_tcat.nidq.xd_8_3_0.txt",
+        "vocal01_g0_tcat.nidq.xd_8_3_0.adj.txt": "laser_on_vocal01_g0_tcat.nidq.xd_8_3_0.adj.txt",
+        "vocal01_g0_tcat.nidq.xa_1_0.txt": "reward_vocal01_g0_tcat.nidq.xa_1_0.txt",
+        "vocal01_g0_tcat.nidq.xa_1_0.adj.txt": "reward_vocal01_g0_tcat.nidq.xa_1_0.adj.txt",
+    }
+
+
 def test_catgt_extract_only_flags_keep_extractors_but_strip_filtering() -> None:
     cmd = "-prb_fld -out_prb_fld -apfilter=butter,12,300,10000 -gfix=0.4,0.1,0.02 -xa=0,0,0,2,0,0 -xd=0,0,8,3,0"
     assert catgt_extract_only_flags(cmd) == "-prb_fld -out_prb_fld -xa=0,0,0,2,0,0 -xd=0,0,8,3,0 -no_tshift"
@@ -127,6 +182,47 @@ def test_parse_catgt_processed_bin_context_returns_run_root_details() -> None:
         "catgt_run_dir": r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0",
         "catgt_run_name": "catgt_vocal01",
         "source_run_name": "vocal01",
+        "gate_string": "0",
+        "trigger_string": "cat",
+        "probe_string": "0",
+    }
+
+
+def test_resolve_labelled_output_context_falls_back_to_existing_catgt_context_for_raw_input() -> None:
+    fallback = {
+        "catgt_dest": r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting",
+        "catgt_run_dir": r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0",
+        "catgt_run_name": "catgt_31096_1_NPX_basal",
+        "source_run_name": "31096_1_NPX_basal",
+        "gate_string": "0",
+        "trigger_string": "cat",
+        "probe_string": "0",
+    }
+    raw_bin = (
+        r"B:\NPX\rawData\VTA_NPX\31096\1\31096_1_NPX_basal_g0"
+        r"\31096_1_NPX_basal_g0_imec0\31096_1_NPX_basal_g0_t0.imec0.ap.bin"
+    )
+
+    assert resolve_labelled_output_context(raw_bin, fallback) == fallback
+
+
+def test_resolve_labelled_output_context_prefers_parsed_catgt_bin_context() -> None:
+    fallback = {
+        "catgt_dest": "fallback_dest",
+        "catgt_run_dir": "fallback_run_dir",
+        "catgt_run_name": "fallback_run_name",
+        "source_run_name": "fallback_run",
+        "gate_string": "9",
+        "trigger_string": "cat",
+        "probe_string": "9",
+    }
+    catgt_bin = r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0\31096_1_NPX_basal_g0_imec0\31096_1_NPX_basal_g0_tcat.imec0.ap.bin"
+
+    assert resolve_labelled_output_context(catgt_bin, fallback) == {
+        "catgt_dest": r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting",
+        "catgt_run_dir": r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0",
+        "catgt_run_name": "catgt_31096_1_NPX_basal",
+        "source_run_name": "31096_1_NPX_basal",
         "gate_string": "0",
         "trigger_string": "cat",
         "probe_string": "0",

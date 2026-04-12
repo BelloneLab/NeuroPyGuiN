@@ -44,20 +44,20 @@ import pyqtgraph as pg
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from neuropyguin.side_nav import SideNavStack
     from neuropyguin.tabs.curation_tab import CurationTab
     from neuropyguin.tabs.postprocessing_tab import PostProcessingTab
     from neuropyguin.tabs.preprocessing_tab import PreprocessingTab
-    from neuropyguin.tabs.quality_metrics_tab import QualityMetricsTab
     from neuropyguin.styles import build_app_palette, build_app_qss
 else:
+    from .side_nav import SideNavStack
     from .tabs.curation_tab import CurationTab
     from .tabs.postprocessing_tab import PostProcessingTab
     from .tabs.preprocessing_tab import PreprocessingTab
-    from .tabs.quality_metrics_tab import QualityMetricsTab
     from .styles import build_app_palette, build_app_qss
 
 
-TAB_TITLES = ["Preprocessing", "Curation", "Quality Metrics", "Post Processing"]
+TAB_TITLES = ["Preprocessing", "Curation", "Post Processing"]
 STARTUP_TAB_OPTIONS = ["Last Used", *TAB_TITLES]
 PLOT_THEME_OPTIONS = ["Light", "Dark"]
 
@@ -72,17 +72,16 @@ class PreferencesDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.setProperty("compactDialog", True)
         self.setWindowTitle("Settings")
-        self.resize(460, 260)
+        self.resize(720, 420)
 
         main = QtWidgets.QVBoxLayout(self)
-        form = QtWidgets.QFormLayout()
-        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
-
         self.cb_theme = QtWidgets.QComboBox()
         self.cb_theme.addItems(["Light", "Dark"])
         idx = self.cb_theme.findText(str(theme))
         self.cb_theme.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cb_theme.setMaximumWidth(140)
 
         self.ck_grid = QtWidgets.QCheckBox("Show plot grid by default")
         self.ck_grid.setChecked(bool(show_grid))
@@ -91,33 +90,74 @@ class PreferencesDialog(QtWidgets.QDialog):
         self.cb_startup_tab.addItems(STARTUP_TAB_OPTIONS)
         startup_value = str(startup_tab) if str(startup_tab) in STARTUP_TAB_OPTIONS else STARTUP_TAB_OPTIONS[0]
         self.cb_startup_tab.setCurrentText(startup_value)
+        self.cb_startup_tab.setMaximumWidth(180)
 
         self.ck_remember_geometry = QtWidgets.QCheckBox("Remember window size and position")
         self.ck_remember_geometry.setChecked(bool(remember_geometry))
 
-        form.addRow("Theme", self.cb_theme)
-        form.addRow("Plot grid", self.ck_grid)
-        form.addRow("Startup page", self.cb_startup_tab)
-        form.addRow("Window layout", self.ck_remember_geometry)
-        main.addLayout(form)
-
         note = QtWidgets.QLabel(
             "These settings apply globally. Folder history and recents can be cleared from File."
         )
+        note.setObjectName("SectionHint")
         note.setWordWrap(True)
         main.addWidget(note)
 
-        row = QtWidgets.QHBoxLayout()
-        row.addStretch(1)
-        btn_defaults = QtWidgets.QPushButton("Restore Defaults")
-        btn_defaults.clicked.connect(self._restore_defaults)
-        row.addWidget(btn_defaults)
-        main.addLayout(row)
+        sections = SideNavStack(
+            "Settings",
+            "Switch sections from the left instead of scrolling through one long page.",
+        )
+        main.addWidget(sections, 1)
+
+        def _new_page() -> tuple[QtWidgets.QWidget, QtWidgets.QVBoxLayout]:
+            page = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(page)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(12)
+            return page, layout
+
+        appearance_page, appearance_layout = _new_page()
+        appearance_box = QtWidgets.QGroupBox("Appearance")
+        appearance_box.setProperty("settingsSection", True)
+        appearance_form = QtWidgets.QFormLayout(appearance_box)
+        appearance_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+        appearance_form.setFormAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        appearance_form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        appearance_form.setHorizontalSpacing(14)
+        appearance_form.setVerticalSpacing(10)
+        appearance_form.addRow("Theme", self.cb_theme)
+        appearance_form.addRow("Plot grid", self.ck_grid)
+        appearance_layout.addWidget(appearance_box)
+        appearance_layout.addStretch(1)
+        sections.add_page("Appearance", appearance_page)
+
+        startup_page, startup_layout = _new_page()
+        startup_box = QtWidgets.QGroupBox("Startup and layout")
+        startup_box.setProperty("settingsSection", True)
+        startup_form = QtWidgets.QFormLayout(startup_box)
+        startup_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+        startup_form.setFormAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        startup_form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        startup_form.setHorizontalSpacing(14)
+        startup_form.setVerticalSpacing(10)
+        startup_form.addRow("Startup page", self.cb_startup_tab)
+        startup_form.addRow("Window layout", self.ck_remember_geometry)
+        startup_layout.addWidget(startup_box)
+        startup_layout.addStretch(1)
+        sections.add_page("Startup", startup_page)
+
+        sections.setCurrentIndex(0)
+        self.sections = sections
 
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        main.addWidget(btns)
+        footer = QtWidgets.QHBoxLayout()
+        btn_defaults = QtWidgets.QPushButton("Restore Defaults")
+        btn_defaults.clicked.connect(self._restore_defaults)
+        footer.addWidget(btn_defaults)
+        footer.addStretch(1)
+        footer.addWidget(btns)
+        main.addLayout(footer)
 
     def _restore_defaults(self) -> None:
         self.cb_theme.setCurrentText("Light")
@@ -151,14 +191,13 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         tabs.setDocumentMode(True)
         self.pre_tab = PreprocessingTab(thread_pool)
         self.cur_tab = CurationTab(thread_pool)
-        self.qm_tab = QualityMetricsTab(thread_pool)
         self.post_tab = PostProcessingTab(thread_pool)
-        for t in [self.pre_tab, self.cur_tab, self.qm_tab, self.post_tab]:
+        for t in [self.pre_tab, self.cur_tab, self.post_tab]:
             t.setMinimumSize(0, 0)
             t.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         tabs.setMinimumSize(0, 0)
         tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        for title, widget in zip(TAB_TITLES, [self.pre_tab, self.cur_tab, self.qm_tab, self.post_tab]):
+        for title, widget in zip(TAB_TITLES, [self.pre_tab, self.cur_tab, self.post_tab]):
             tabs.addTab(widget, title)
         self.tabs = tabs
 
@@ -166,7 +205,8 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self._build_menu_bar()
 
         self.pre_tab.openCurationRequested.connect(self._open_curation)
-        self.pre_tab.openQualityRequested.connect(self._open_quality)
+        self.pre_tab.saveSettingsFileRequested.connect(self._export_settings_file)
+        self.pre_tab.loadSettingsFileRequested.connect(self._load_settings_file)
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.setCentralWidget(tabs)
@@ -204,10 +244,6 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_set_curation_folder.setShortcut("Ctrl+Shift+C")
         self.act_set_curation_folder.triggered.connect(self._pick_curation_folder)
 
-        self.act_open_quality_folder = QtGui.QAction("Open Quality Metrics Folder...", self)
-        self.act_open_quality_folder.setShortcut("Ctrl+Shift+Q")
-        self.act_open_quality_folder.triggered.connect(self._pick_quality_folder)
-
         self.act_open_post_folder = QtGui.QAction("Open Post Processing Folder...", self)
         self.act_open_post_folder.setShortcut("Ctrl+Shift+P")
         self.act_open_post_folder.triggered.connect(self._pick_postprocessing_folder)
@@ -225,6 +261,12 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_save_settings = QtGui.QAction("Save Settings", self)
         self.act_save_settings.setShortcut(QtGui.QKeySequence.Save)
         self.act_save_settings.triggered.connect(self._save_settings)
+
+        self.act_export_settings_file = QtGui.QAction("Save Settings to File...", self)
+        self.act_export_settings_file.triggered.connect(self._export_settings_file)
+
+        self.act_load_settings_file = QtGui.QAction("Load Settings from File...", self)
+        self.act_load_settings_file.triggered.connect(self._load_settings_file)
 
         self.act_settings = QtGui.QAction("Settings...", self)
         self.act_settings.setShortcut("Ctrl+,")
@@ -245,12 +287,8 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_tab_cur.setShortcut("Ctrl+2")
         self.act_tab_cur.triggered.connect(lambda: self.tabs.setCurrentWidget(self.cur_tab))
 
-        self.act_tab_qm = QtGui.QAction("Quality Metrics", self)
-        self.act_tab_qm.setShortcut("Ctrl+3")
-        self.act_tab_qm.triggered.connect(lambda: self.tabs.setCurrentWidget(self.qm_tab))
-
         self.act_tab_post = QtGui.QAction("Post Processing", self)
-        self.act_tab_post.setShortcut("Ctrl+4")
+        self.act_tab_post.setShortcut("Ctrl+3")
         self.act_tab_post.triggered.connect(lambda: self.tabs.setCurrentWidget(self.post_tab))
 
         self.theme_group = QtGui.QActionGroup(self)
@@ -283,13 +321,14 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         file_menu.addAction(self.act_add_folder)
         file_menu.addSeparator()
         file_menu.addAction(self.act_set_curation_folder)
-        file_menu.addAction(self.act_open_quality_folder)
         file_menu.addAction(self.act_open_post_folder)
         file_menu.addSeparator()
         file_menu.addAction(self.act_export_current)
         file_menu.addAction(self.act_save_bombcell)
         file_menu.addAction(self.act_export_units)
         file_menu.addAction(self.act_save_settings)
+        file_menu.addAction(self.act_export_settings_file)
+        file_menu.addAction(self.act_load_settings_file)
         file_menu.addSeparator()
         file_menu.addAction(self.act_settings)
         file_menu.addAction(self.act_clear_history)
@@ -299,7 +338,6 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         view_menu = self.menuBar().addMenu("&View")
         view_menu.addAction(self.act_tab_pre)
         view_menu.addAction(self.act_tab_cur)
-        view_menu.addAction(self.act_tab_qm)
         view_menu.addAction(self.act_tab_post)
         view_menu.addSeparator()
         theme_menu = view_menu.addMenu("Theme")
@@ -354,10 +392,6 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.cur_tab.open_ks_folder(folder)
         self.tabs.setCurrentWidget(self.cur_tab)
 
-    def _open_quality(self, folder: str) -> None:
-        self.qm_tab.open_ks_folder(folder)
-        self.tabs.setCurrentWidget(self.qm_tab)
-
     def _restore_plot_preferences(self) -> None:
         theme = str(self.settings.value("plot/theme", "Light"))
         grid = bool(self.settings.value("plot/grid", True, type=bool))
@@ -410,7 +444,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         dark = theme.lower().startswith("dark")
         pg.setConfigOption("background", "#0b0f14" if dark else "w")
         pg.setConfigOption("foreground", "#e8eef7" if dark else "k")
-        for tab in [self.cur_tab, self.qm_tab, self.post_tab]:
+        for tab in [self.cur_tab, self.post_tab]:
             if hasattr(tab, "set_plot_preferences"):
                 tab.set_plot_preferences(theme, grid)
         self._sync_menu_controls()
@@ -438,13 +472,6 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("curation/bomb_folder", folder)
         self.cur_tab.set_ks_folder(folder)
         self.tabs.setCurrentWidget(self.cur_tab)
-
-    def _pick_quality_folder(self) -> None:
-        folder = self._choose_folder("Select Kilosort folder for quality metrics")
-        if not folder:
-            return
-        self.qm_tab.open_ks_folder(folder)
-        self.tabs.setCurrentWidget(self.qm_tab)
 
     def _pick_postprocessing_folder(self) -> None:
         folder = self._choose_folder("Select Kilosort folder for post processing")
@@ -484,11 +511,98 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self._persist_window_state()
 
     def _save_settings(self) -> None:
-        if hasattr(self.pre_tab, "save_settings"):
-            self.pre_tab.save_settings()
+        self._persist_all_settings()
+        self.statusBar().showMessage("Settings saved.", 3000)
+
+    def _persist_all_settings(self) -> None:
+        persist_preproc = getattr(self.pre_tab, "_persist_settings", None)
+        if callable(persist_preproc):
+            persist_preproc()
+
+        if hasattr(self.cur_tab, "ed_phy_folder"):
+            self.settings.setValue("curation/phy_folder", self.cur_tab.ed_phy_folder.text().strip())
+        if hasattr(self.cur_tab, "ed_bomb_folder"):
+            self.settings.setValue("curation/bomb_folder", self.cur_tab.ed_bomb_folder.text().strip())
+        persist_cur = getattr(self.cur_tab, "_persist_splitter_sizes", None)
+        if callable(persist_cur):
+            persist_cur()
+
+        if hasattr(self.post_tab, "ed_folder"):
+            self.settings.setValue("post/last_folder", self.post_tab.ed_folder.text().strip())
+
+        self.settings.setValue("plot/theme", self._plot_theme)
+        self.settings.setValue("plot/grid", self._plot_grid)
         self._persist_window_state()
         self.settings.sync()
-        self.statusBar().showMessage("Settings saved.", 3000)
+
+    @staticmethod
+    def _copy_qsettings(src: QtCore.QSettings, dst: QtCore.QSettings) -> None:
+        dst.clear()
+        for key in src.allKeys():
+            dst.setValue(key, src.value(key))
+        dst.sync()
+
+    def _reload_settings_from_store(self) -> None:
+        restore_preproc = getattr(self.pre_tab, "_restore_settings", None)
+        if callable(restore_preproc):
+            restore_preproc()
+        restore_cur = getattr(self.cur_tab, "_restore_settings", None)
+        if callable(restore_cur):
+            restore_cur()
+        restore_post = getattr(self.post_tab, "_restore_settings", None)
+        if callable(restore_post):
+            restore_post()
+        self._restore_plot_preferences()
+        self._apply_plot_preferences()
+        self._restore_window_state()
+        self._update_action_states()
+
+    def _export_settings_file(self) -> None:
+        self._persist_all_settings()
+        start = str(self.settings.value("paths/last_folder", str(Path.cwd())))
+        fp, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Settings to File",
+            str(Path(start) / "NeuroPyGuiN_settings.ini"),
+            "INI files (*.ini)",
+        )
+        if not fp:
+            return
+        out_path = Path(fp)
+        if out_path.suffix.lower() != ".ini":
+            out_path = out_path.with_suffix(".ini")
+        file_settings = QtCore.QSettings(str(out_path), QtCore.QSettings.IniFormat)
+        self._copy_qsettings(self.settings, file_settings)
+        self.settings.setValue("paths/last_folder", str(out_path.parent))
+        self.settings.sync()
+        self.pre_tab._append_log(f"Settings file saved: {out_path}")
+        self.statusBar().showMessage(f"Settings exported to {out_path}", 4000)
+
+    def _load_settings_file(self) -> None:
+        start = str(self.settings.value("paths/last_folder", str(Path.cwd())))
+        fp, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load Settings from File",
+            start,
+            "INI files (*.ini)",
+        )
+        if not fp:
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Load Settings from File",
+            "Replace current app settings with the selected settings file?",
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        in_path = Path(fp)
+        file_settings = QtCore.QSettings(str(in_path), QtCore.QSettings.IniFormat)
+        self._copy_qsettings(file_settings, self.settings)
+        self.settings.setValue("paths/last_folder", str(in_path.parent))
+        self.settings.sync()
+        self._reload_settings_from_store()
+        self.pre_tab._append_log(f"Settings file loaded: {in_path}")
+        self.statusBar().showMessage(f"Settings loaded from {in_path}", 4000)
 
     def _clear_folder_history(self) -> None:
         answer = QtWidgets.QMessageBox.question(
@@ -511,7 +625,6 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
             self.settings.remove(key)
         self.cur_tab.ed_phy_folder.clear()
         self.cur_tab.ed_bomb_folder.clear()
-        self.qm_tab.ed_folder.clear()
         self.post_tab.ed_folder.clear()
         QtWidgets.QMessageBox.information(self, "Folder History Cleared", "Saved folders and recents were cleared.")
 
@@ -526,7 +639,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_export_units.setEnabled(current is self.post_tab)
 
     def _refresh_bottom_busy(self) -> None:
-        tabs = [self.pre_tab, self.cur_tab, self.qm_tab, self.post_tab]
+        tabs = [self.pre_tab, self.cur_tab, self.post_tab]
         busy = any(bool(getattr(t, "is_busy", lambda: False)()) for t in tabs)
         if busy:
             if self.bottom_busy.maximum() != 0:
@@ -566,7 +679,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.about(self, "About NeuroPyGuiN", txt)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self._persist_window_state()
+        self._persist_all_settings()
         super().closeEvent(event)
 
 

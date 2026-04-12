@@ -6,6 +6,11 @@ from typing import List, Sequence, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+try:
+    from .side_nav import SideNavStack
+except ImportError:
+    from neuropyguin.side_nav import SideNavStack
+
 
 _STREAM_TO_JS = {
     "ni": 0,
@@ -42,6 +47,7 @@ class TPrimeExtractorSpec:
     value_a: float = 0.0
     value_b: float = 0.0
     debounce_ms: float = 0.0
+    label: str = ""
 
 
 @dataclass
@@ -59,7 +65,8 @@ def _split_flags(raw: str) -> List[str]:
 
 
 def _is_extractor_token(token: str) -> bool:
-    return bool(re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", str(token).strip(), flags=re.IGNORECASE))
+    clean = re.sub(r"\[.*?\]$", "", str(token).strip())
+    return bool(re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", clean, flags=re.IGNORECASE))
 
 
 def _is_bf_token(token: str) -> bool:
@@ -200,10 +207,12 @@ def build_tprime_extractor_string(specs: Sequence[TPrimeExtractorSpec], extra_fl
         mode = str(spec.mode).strip().lower()
         js = _STREAM_TO_JS.get(str(spec.stream_kind).strip().lower(), 0)
         stream_index = 0 if js == 0 else int(spec.stream_index)
+        label_suffix = f"[{spec.label}]" if getattr(spec, "label", "") else ""
         if mode in {"xd", "xid"}:
             parts.append(
                 f"-{mode}="
                 f"{js},{stream_index},{int(spec.word)},{int(spec.value_a)},{_fmt_number(spec.debounce_ms)}"
+                + label_suffix
             )
         else:
             parts.append(
@@ -212,6 +221,7 @@ def build_tprime_extractor_string(specs: Sequence[TPrimeExtractorSpec], extra_fl
                 f"{_fmt_number(spec.value_a)},"
                 f"{_fmt_number(spec.value_b)},"
                 f"{_fmt_number(spec.debounce_ms)}"
+                + label_suffix
             )
     if str(extra_flags).strip():
         parts.extend(_split_flags(extra_flags))
@@ -222,7 +232,13 @@ def parse_tprime_extractor_string(raw: str) -> Tuple[List[TPrimeExtractorSpec], 
     specs: List[TPrimeExtractorSpec] = []
     extras: List[str] = []
     for token in _split_flags(raw):
-        match = re.fullmatch(r"-(xd|xid|xa|xia)=(.+)", token, flags=re.IGNORECASE)
+        label = ""
+        clean_token = token
+        label_match = re.search(r"\[([^\]]*)\]$", token)
+        if label_match:
+            label = label_match.group(1)
+            clean_token = token[: label_match.start()]
+        match = re.fullmatch(r"-(xd|xid|xa|xia)=(.+)", clean_token, flags=re.IGNORECASE)
         if not match:
             extras.append(token)
             continue
@@ -240,6 +256,7 @@ def parse_tprime_extractor_string(raw: str) -> Tuple[List[TPrimeExtractorSpec], 
                         value_a=int(values[3]),
                         value_b=0.0,
                         debounce_ms=float(values[4]),
+                        label=label,
                     )
                 )
             elif mode in {"xa", "xia"} and len(values) >= 6:
@@ -253,6 +270,7 @@ def parse_tprime_extractor_string(raw: str) -> Tuple[List[TPrimeExtractorSpec], 
                         value_a=float(values[3]),
                         value_b=float(values[4]),
                         debounce_ms=float(values[5]),
+                        label=label,
                     )
                 )
             else:
@@ -260,6 +278,10 @@ def parse_tprime_extractor_string(raw: str) -> Tuple[List[TPrimeExtractorSpec], 
         except Exception:
                 extras.append(token)
     return specs, " ".join(extras)
+
+
+def strip_extractor_labels(raw: str) -> str:
+    return re.sub(r"\[[^\]]*\]", "", raw)
 
 
 def catgt_command_extractors(raw: str) -> str:
@@ -280,7 +302,8 @@ def strip_catgt_bf_extractors(raw: str) -> str:
 
 def merge_extractors_into_catgt_command(raw_command: str, extractor_string: str) -> str:
     base = strip_catgt_extractors(raw_command)
-    parts = [part for part in [base.strip(), extractor_string.strip()] if part]
+    clean_extractors = strip_extractor_labels(extractor_string.strip())
+    parts = [part for part in [base.strip(), clean_extractors] if part]
     return " ".join(parts)
 
 
@@ -663,11 +686,12 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.setProperty("compactDialog", True)
         self.setWindowTitle("Build TPrime stream and extractor strings")
-        self.resize(980, 700)
+        self.resize(1100, 760)
         stream_kind, stream_index = parse_tostream_sync_params(initial_to_stream)
         specs, extras = parse_tprime_extractor_string(initial_extractors)
-        fixed_font = QtGui.QFont("Consolas", 10)
+        fixed_font = QtGui.QFont("Consolas", 9)
 
         main = QtWidgets.QVBoxLayout(self)
         main.setContentsMargins(18, 16, 18, 16)
@@ -681,7 +705,22 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         note.setWordWrap(True)
         main.addWidget(note)
 
+        self.section_nav = SideNavStack(
+            "Sections",
+            "Only the selected panel is shown so the extractor table can use the available space.",
+        )
+        main.addWidget(self.section_nav, 1)
+
+        def _new_page() -> tuple[QtWidgets.QWidget, QtWidgets.QVBoxLayout]:
+            page = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(page)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(12)
+            return page, layout
+
+        ref_page, ref_page_layout = _new_page()
         ref_box = QtWidgets.QGroupBox("Reference stream")
+        ref_box.setProperty("settingsSection", True)
         ref_layout = QtWidgets.QVBoxLayout(ref_box)
         ref_layout.setSpacing(10)
         ref_hint = QtWidgets.QLabel(
@@ -691,23 +730,31 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         ref_hint.setObjectName("SectionHint")
         ref_hint.setWordWrap(True)
         ref_layout.addWidget(ref_hint)
-        ref_row = QtWidgets.QHBoxLayout()
-        ref_row.setSpacing(10)
+        ref_form = QtWidgets.QFormLayout()
+        ref_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+        ref_form.setFormAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        ref_form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        ref_form.setHorizontalSpacing(12)
+        ref_form.setVerticalSpacing(10)
         self.cb_stream_kind = QtWidgets.QComboBox()
         self.cb_stream_kind.addItems(["imec", "ni", "obx"])
         self.cb_stream_kind.setCurrentText(stream_kind)
+        self.cb_stream_kind.setMaximumWidth(140)
         self.sp_stream_index = QtWidgets.QSpinBox()
         self.sp_stream_index.setRange(0, 31)
         self.sp_stream_index.setValue(int(stream_index))
-        ref_row.addWidget(QtWidgets.QLabel("Type"))
-        ref_row.addWidget(self.cb_stream_kind)
-        ref_row.addWidget(QtWidgets.QLabel("Index"))
-        ref_row.addWidget(self.sp_stream_index)
-        ref_row.addStretch(1)
-        ref_layout.addLayout(ref_row)
-        main.addWidget(ref_box, 0)
+        self.sp_stream_index.setMaximumWidth(90)
+        ref_form.addRow("Type", self.cb_stream_kind)
+        ref_form.addRow("Index", self.sp_stream_index)
+        ref_layout.addLayout(ref_form)
+        ref_layout.addStretch(1)
+        ref_page_layout.addWidget(ref_box)
+        ref_page_layout.addStretch(1)
+        self.section_nav.add_page("Reference stream", ref_page)
 
+        preset_page, preset_page_layout = _new_page()
         preset_box = QtWidgets.QGroupBox("Common setup: NI analog events to imec")
+        preset_box.setProperty("settingsSection", True)
         preset_layout = QtWidgets.QVBoxLayout(preset_box)
         preset_layout.setSpacing(10)
         preset_hint = QtWidgets.QLabel(
@@ -718,49 +765,65 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         preset_hint.setObjectName("SectionHint")
         preset_hint.setWordWrap(True)
         preset_layout.addWidget(preset_hint)
-        preset_grid = QtWidgets.QGridLayout()
-        preset_grid.setHorizontalSpacing(10)
-        preset_grid.setVerticalSpacing(8)
+        preset_row = QtWidgets.QHBoxLayout()
+        preset_row.setSpacing(18)
+        preset_left = QtWidgets.QFormLayout()
+        preset_left.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+        preset_left.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        preset_left.setHorizontalSpacing(12)
+        preset_left.setVerticalSpacing(10)
+        preset_right = QtWidgets.QFormLayout()
+        preset_right.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+        preset_right.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        preset_right.setHorizontalSpacing(12)
+        preset_right.setVerticalSpacing(10)
         self.sp_preset_imec_index = QtWidgets.QSpinBox()
         self.sp_preset_imec_index.setRange(0, 31)
         self.sp_preset_imec_index.setValue(int(stream_index) if stream_kind == "imec" else 0)
+        self.sp_preset_imec_index.setMaximumWidth(90)
         self.ed_preset_channels = QtWidgets.QLineEdit("0-2")
         self.ed_preset_channels.setPlaceholderText("Example: 0-2,4")
+        self.ed_preset_channels.setMaximumWidth(180)
         self.sp_preset_th1 = QtWidgets.QDoubleSpinBox()
         self.sp_preset_th1.setRange(-10.0, 10.0)
         self.sp_preset_th1.setDecimals(3)
         self.sp_preset_th1.setValue(1.0)
+        self.sp_preset_th1.setMaximumWidth(110)
         self.sp_preset_th2 = QtWidgets.QDoubleSpinBox()
         self.sp_preset_th2.setRange(-10.0, 10.0)
         self.sp_preset_th2.setDecimals(3)
         self.sp_preset_th2.setValue(0.0)
+        self.sp_preset_th2.setMaximumWidth(110)
         self.sp_preset_pulse_ms = QtWidgets.QDoubleSpinBox()
         self.sp_preset_pulse_ms.setRange(0.0, 100000.0)
         self.sp_preset_pulse_ms.setDecimals(3)
         self.sp_preset_pulse_ms.setValue(0.0)
+        self.sp_preset_pulse_ms.setMaximumWidth(110)
         self.ck_preset_include_falling = QtWidgets.QCheckBox("Include falling edges (xia)")
         self.ck_preset_include_falling.setChecked(True)
         self.btn_apply_ni_analog_preset = QtWidgets.QPushButton("Apply NI analog preset")
-        self.btn_apply_ni_analog_preset.setProperty("role", "secondary")
-        preset_grid.addWidget(QtWidgets.QLabel("toStream imec index"), 0, 0)
-        preset_grid.addWidget(self.sp_preset_imec_index, 0, 1)
-        preset_grid.addWidget(QtWidgets.QLabel("NI XA channels"), 0, 2)
-        preset_grid.addWidget(self.ed_preset_channels, 0, 3)
-        preset_grid.addWidget(QtWidgets.QLabel("Threshold 1 (V)"), 1, 0)
-        preset_grid.addWidget(self.sp_preset_th1, 1, 1)
-        preset_grid.addWidget(QtWidgets.QLabel("Threshold 2 (V)"), 1, 2)
-        preset_grid.addWidget(self.sp_preset_th2, 1, 3)
-        preset_grid.addWidget(QtWidgets.QLabel("Pulse ms"), 2, 0)
-        preset_grid.addWidget(self.sp_preset_pulse_ms, 2, 1)
-        preset_grid.addWidget(self.ck_preset_include_falling, 2, 2, 1, 2)
-        preset_layout.addLayout(preset_grid)
+        self.btn_apply_ni_analog_preset.setProperty("role", "primary")
+        preset_left.addRow("toStream imec index", self.sp_preset_imec_index)
+        preset_left.addRow("Threshold 1 (V)", self.sp_preset_th1)
+        preset_left.addRow("Pulse ms", self.sp_preset_pulse_ms)
+        preset_right.addRow("NI XA channels", self.ed_preset_channels)
+        preset_right.addRow("Threshold 2 (V)", self.sp_preset_th2)
+        preset_right.addRow("", self.ck_preset_include_falling)
+        preset_row.addLayout(preset_left)
+        preset_row.addLayout(preset_right)
+        preset_row.addStretch(1)
+        preset_layout.addLayout(preset_row)
         preset_btn_row = QtWidgets.QHBoxLayout()
         preset_btn_row.addStretch(1)
         preset_btn_row.addWidget(self.btn_apply_ni_analog_preset)
         preset_layout.addLayout(preset_btn_row)
-        main.addWidget(preset_box, 0)
+        preset_page_layout.addWidget(preset_box)
+        preset_page_layout.addStretch(1)
+        self.section_nav.add_page("NI analog preset", preset_page)
 
+        extract_page, extract_page_layout = _new_page()
         table_box = QtWidgets.QGroupBox("Event extractors")
+        table_box.setProperty("heroCard", True)
         table_layout = QtWidgets.QVBoxLayout(table_box)
         table_layout.setSpacing(10)
         table_hint = QtWidgets.QLabel(
@@ -793,15 +856,18 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_remove)
         table_layout.addLayout(btn_row)
-        self.tbl = QtWidgets.QTableWidget(0, 7)
+        self.tbl = QtWidgets.QTableWidget(0, 8)
         self.tbl.setAlternatingRowColors(True)
+        self.tbl.setShowGrid(False)
         self.tbl.setHorizontalHeaderLabels(
-            ["Mode", "Stream", "Index", "Word", "Bit / Th1", "Th2", "Pulse ms"]
+            ["Mode", "Stream", "Index", "Word", "Bit / Th1", "Th2", "Pulse ms", "Label"]
         )
         self.tbl.verticalHeader().setVisible(False)
+        self.tbl.verticalHeader().setDefaultSectionSize(34)
         self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.tbl.setMinimumHeight(280)
+        self.tbl.setMinimumHeight(430)
+        self.tbl.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         header = self.tbl.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
@@ -810,6 +876,7 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         header.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(7, QtWidgets.QHeaderView.Stretch)
         table_layout.addWidget(self.tbl)
         help_label = QtWidgets.QLabel(
             "Digital modes: 'Bit / Th1' is the bit number and 'Th2' is ignored. "
@@ -820,9 +887,12 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         help_label.setObjectName("SectionHint")
         help_label.setWordWrap(True)
         table_layout.addWidget(help_label)
-        main.addWidget(table_box, 1)
+        extract_page_layout.addWidget(table_box, 1)
+        self.section_nav.add_page("Event extractors", extract_page)
 
+        extra_page, extra_page_layout = _new_page()
         extra_box = QtWidgets.QGroupBox("Extra extractor flags")
+        extra_box.setProperty("settingsSection", True)
         extra_layout = QtWidgets.QVBoxLayout(extra_box)
         extra_layout.setSpacing(8)
         extra_hint = QtWidgets.QLabel(
@@ -834,9 +904,13 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         self.ed_extra = QtWidgets.QLineEdit(extras)
         self.ed_extra.setPlaceholderText("Example: -bf=0,0,8,3,4,3")
         extra_layout.addWidget(self.ed_extra)
-        main.addWidget(extra_box, 0)
+        extra_page_layout.addWidget(extra_box)
+        extra_page_layout.addStretch(1)
+        self.section_nav.add_page("Extra flags", extra_page)
 
+        preview_page, preview_page_layout = _new_page()
         preview_box = QtWidgets.QGroupBox("Generated values")
+        preview_box.setProperty("settingsSection", True)
         preview_layout = QtWidgets.QVBoxLayout(preview_box)
         preview_layout.setSpacing(10)
         preview_hint = QtWidgets.QLabel(
@@ -872,11 +946,11 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         preview_layout.addLayout(extract_row)
         self.ed_extract_preview = QtWidgets.QPlainTextEdit()
         self.ed_extract_preview.setReadOnly(True)
-        self.ed_extract_preview.setMinimumHeight(86)
-        self.ed_extract_preview.setMaximumHeight(120)
+        self.ed_extract_preview.setMinimumHeight(180)
         self.ed_extract_preview.setFont(fixed_font)
         preview_layout.addWidget(self.ed_extract_preview)
-        main.addWidget(preview_box)
+        preview_page_layout.addWidget(preview_box, 1)
+        self.section_nav.add_page("Generated values", preview_page)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -904,6 +978,7 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
             self._add_row("xd", clear_placeholder=False)
         self._sync_stream_controls()
         self._refresh_preview()
+        self.section_nav.setCurrentIndex(2)
 
     def _new_mode_combo(self, mode: str) -> QtWidgets.QComboBox:
         combo = QtWidgets.QComboBox()
@@ -1013,6 +1088,9 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         value_a = self._new_value_spin(spec.value_a)
         value_b = self._new_value_spin(spec.value_b)
         duration_spin = self._new_value_spin(spec.debounce_ms)
+        label_edit = QtWidgets.QLineEdit(getattr(spec, "label", "") or "")
+        label_edit.setPlaceholderText("e.g. laser, reward")
+        label_edit.textChanged.connect(self._refresh_preview)
         self.tbl.setCellWidget(row, 0, mode_combo)
         self.tbl.setCellWidget(row, 1, stream_combo)
         self.tbl.setCellWidget(row, 2, index_spin)
@@ -1020,6 +1098,7 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         self.tbl.setCellWidget(row, 4, value_a)
         self.tbl.setCellWidget(row, 5, value_b)
         self.tbl.setCellWidget(row, 6, duration_spin)
+        self.tbl.setCellWidget(row, 7, label_edit)
         mode_combo.currentTextChanged.connect(self._sync_row_state_for_sender)
         stream_combo.currentTextChanged.connect(self._sync_row_state_for_sender)
         self._sync_row_state(row)
@@ -1102,6 +1181,7 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
                 )
                 self._add_row("xia", falling_spec)
         self._refresh_preview()
+        self.section_nav.setCurrentIndex(2)
 
     def _row_spec(self, row: int) -> TPrimeExtractorSpec | None:
         mode_combo = self.tbl.cellWidget(row, 0)
@@ -1111,9 +1191,11 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         value_a = self.tbl.cellWidget(row, 4)
         value_b = self.tbl.cellWidget(row, 5)
         duration_spin = self.tbl.cellWidget(row, 6)
+        label_edit = self.tbl.cellWidget(row, 7)
         widgets = [mode_combo, stream_combo, index_spin, word_spin, value_a, value_b, duration_spin]
         if not all(widgets):
             return None
+        label = label_edit.text().strip() if isinstance(label_edit, QtWidgets.QLineEdit) else ""
         return TPrimeExtractorSpec(
             mode=mode_combo.currentText().strip().lower(),
             stream_kind=stream_combo.currentText().strip().lower(),
@@ -1122,6 +1204,7 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
             value_a=float(value_a.value()),
             value_b=float(value_b.value()),
             debounce_ms=float(duration_spin.value()),
+            label=label,
         )
 
     def _refresh_preview(self) -> None:

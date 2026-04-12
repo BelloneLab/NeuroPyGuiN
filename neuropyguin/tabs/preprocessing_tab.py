@@ -7,7 +7,13 @@ import math
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..preprocessing import discover_bin_files, parse_spikeglx_bin_name, validate_spikeglx_ap_bin
+from ..preprocessing import (
+    default_kilosort_output_name,
+    discover_bin_files,
+    parse_spikeglx_bin_name,
+    validate_spikeglx_ap_bin,
+)
+from ..side_nav import SideNavStack
 from ..string_builders import (
     BitFieldBuilderDialog,
     CatGTStringBuilderDialog,
@@ -70,19 +76,55 @@ class Ks4AdvancedDialog(QtWidgets.QDialog):
         ("template_seed", int, 1, "Seed for template initialization."),
         ("cluster_seed", int, 1, "Seed for clustering."),
     ]
+    PARAM_GROUPS = [
+        (
+            "Input and timing",
+            "Input and timing",
+            "Core data-shape and time-window values for the sorter.",
+            ["n_chan_bin", "batch_size", "tmin", "tmax", "nt"],
+        ),
+        (
+            "Detection",
+            "Detection",
+            "Thresholds and nearest-neighbor settings that control spike detection sensitivity.",
+            ["Th_universal", "Th_learned", "Th_single_ch", "nearest_chans", "nearest_templates"],
+        ),
+        (
+            "Templates and drift",
+            "Templates and drift",
+            "Template geometry and drift-correction parameters.",
+            ["nblocks", "dmin", "dminx", "min_template_size", "template_sizes", "templates_from_data", "whitening_range", "sig_interp"],
+        ),
+        (
+            "Quality and seeds",
+            "Quality and seeds",
+            "Split/merge quality thresholds and reproducibility seeds.",
+            ["ccg_threshold", "acg_threshold", "template_seed", "cluster_seed"],
+        ),
+    ]
 
     def __init__(self, values: Dict[str, object], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setProperty("compactDialog", True)
         self.setWindowTitle("Advanced KS4 Parameters")
-        self.resize(720, 620)
+        self.resize(960, 700)
         main = QtWidgets.QVBoxLayout(self)
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        host = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(host)
         self._editors: Dict[str, QtWidgets.QWidget] = {}
 
-        for key, typ, default, desc in self.PARAM_SPECS:
+        note = QtWidgets.QLabel("Only parameters supported by current ks4_helper schema are shown here.")
+        note.setObjectName("SectionHint")
+        note.setWordWrap(True)
+        main.addWidget(note)
+
+        sections = SideNavStack(
+            "Sections",
+            "Edit one KS4 parameter group at a time instead of scrolling through a long form.",
+        )
+        main.addWidget(sections, 1)
+
+        spec_by_key = {key: (key, typ, default, desc) for key, typ, default, desc in self.PARAM_SPECS}
+
+        def _editor_for_spec(key: str, typ, default, desc: str) -> QtWidgets.QWidget:
             val = values.get(key, default)
             editor: QtWidgets.QWidget
             if typ is bool:
@@ -102,13 +144,39 @@ class Ks4AdvancedDialog(QtWidgets.QDialog):
             row.addWidget(help_btn, 0)
             wrap = QtWidgets.QWidget()
             wrap.setLayout(row)
-            form.addRow(key, wrap)
             self._editors[key] = editor
+            return wrap
 
-        scroll.setWidget(host)
-        main.addWidget(scroll, 1)
-        note = QtWidgets.QLabel("Only parameters supported by current ks4_helper schema are shown here.")
-        main.addWidget(note)
+        for label, title, subtitle, keys in self.PARAM_GROUPS:
+            page = QtWidgets.QWidget()
+            page_layout = QtWidgets.QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(12)
+            box = QtWidgets.QGroupBox(title)
+            box.setProperty("settingsSection", True)
+            box_layout = QtWidgets.QVBoxLayout(box)
+            box_layout.setSpacing(10)
+            hint = QtWidgets.QLabel(subtitle)
+            hint.setObjectName("SectionHint")
+            hint.setWordWrap(True)
+            box_layout.addWidget(hint)
+            form = QtWidgets.QFormLayout()
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+            form.setFormAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+            form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            form.setHorizontalSpacing(14)
+            form.setVerticalSpacing(10)
+            for key in keys:
+                _key, typ, default, desc = spec_by_key[key]
+                form.addRow(key, _editor_for_spec(key, typ, default, desc))
+            box_layout.addLayout(form)
+            page_layout.addWidget(box)
+            page_layout.addStretch(1)
+            sections.add_page(label, page)
+
+        sections.setCurrentIndex(0)
+        self.sections = sections
+
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
@@ -147,13 +215,19 @@ class Ks4AdvancedDialog(QtWidgets.QDialog):
 
 class PreprocessingTab(QtWidgets.QWidget):
     openCurationRequested = QtCore.Signal(str)
-    openQualityRequested = QtCore.Signal(str)
+    saveSettingsFileRequested = QtCore.Signal()
+    loadSettingsFileRequested = QtCore.Signal()
 
     def __init__(self, thread_pool: QtCore.QThreadPool) -> None:
         super().__init__()
         self.setAcceptDrops(True)
         self.pool = thread_pool
         self.settings = QtCore.QSettings("NeuroPyGuiN", "NeuroPyGuiN")
+        self._settings_sync_timer = QtCore.QTimer(self)
+        self._settings_sync_timer.setSingleShot(True)
+        self._settings_sync_timer.setInterval(200)
+        self._settings_sync_timer.timeout.connect(self.settings.sync)
+        self._restoring_settings = False
         self.jobs: List[Dict[str, str]] = []
         self.completed_runs: List[Dict[str, str]] = []
         self._queue: List[Dict[str, str]] = []
@@ -251,8 +325,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.list_jobs.setProperty("dropZone", True)
         self.list_jobs.setAlternatingRowColors(True)
         self.list_jobs.setSpacing(4)
-        self.list_jobs.setMinimumHeight(120)
-        self.list_jobs.setMaximumHeight(180)
+        self.list_jobs.setMinimumHeight(220)
+        self.list_jobs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         config = QtWidgets.QGroupBox("Integrated ecephys spike sorting preprocessing")
         config.setProperty("settingsSection", True)
@@ -282,10 +356,9 @@ class PreprocessingTab(QtWidgets.QWidget):
             "stream lives at the run root; existing *_tcat inputs are only suitable for probe/AP-only reruns."
         )
 
-        modules_row = QtWidgets.QHBoxLayout()
+        modules_row = QtWidgets.QVBoxLayout()
         for w in [self.ck_catgt, self.ck_catgt_extract_only, self.ck_ks, self.ck_post, self.ck_noise, self.ck_wvf, self.ck_qm, self.ck_pybomb, self.ck_tprime]:
             modules_row.addWidget(w)
-        modules_row.addStretch(1)
 
         self.cb_ks_ver = QtWidgets.QComboBox()
         self.cb_ks_ver.addItems(["4", "3.0", "2.5", "2.0"])
@@ -388,6 +461,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         wrap_catgt_cmd.setLayout(row_catgt_cmd)
 
         self.ed_output = QtWidgets.QLineEdit(str((Path.cwd() / "NeuroPyGuiN_output").resolve()))
+        self.ck_mirror_raw_hierarchy_output = QtWidgets.QCheckBox(
+            "Mirror rawData hierarchy into output root and append spike_sorting"
+        )
         btn_output = QtWidgets.QPushButton("Browse")
         btn_output.setProperty("role", "ghost")
         out_row = QtWidgets.QHBoxLayout()
@@ -625,8 +701,21 @@ class PreprocessingTab(QtWidgets.QWidget):
             2,
         )
         paths_grid.addWidget(
-            make_field("JSON root", json_wrap, "Folder where generated pipeline JSON files are stored."),
+            make_field(
+                "Output layout",
+                self.ck_mirror_raw_hierarchy_output,
+                "When enabled, raw SpikeGLX inputs under a .../rawData/.../<session>/<run>/<probe>/ layout are "
+                "written under <Output root>/.../<session>/spike_sorting/. The CatGT run folder then lives inside "
+                "that spike_sorting folder.",
+            ),
             4,
+            0,
+            1,
+            2,
+        )
+        paths_grid.addWidget(
+            make_field("JSON root", json_wrap, "Folder where generated pipeline JSON files are stored."),
+            5,
             0,
             1,
             2,
@@ -659,20 +748,6 @@ class PreprocessingTab(QtWidgets.QWidget):
         queue_layout.addWidget(self.list_jobs, 1)
         queue_layout.addWidget(self.lbl_queue_summary)
 
-        params_box = QtWidgets.QGroupBox("Integrated ecephys spike sorting preprocessing")
-        params_box.setProperty("settingsSection", True)
-        params_layout = QtWidgets.QHBoxLayout(params_box)
-        params_layout.setSpacing(12)
-        params_hint = QtWidgets.QLabel(
-            "Pipeline steps, sorter settings, synchronization values, and tool paths open in a separate window."
-        )
-        params_hint.setObjectName("SectionHint")
-        params_hint.setWordWrap(True)
-        self.btn_open_params = QtWidgets.QPushButton("Open parameters")
-        self.btn_open_params.setProperty("role", "secondary")
-        params_layout.addWidget(params_hint, 1)
-        params_layout.addWidget(self.btn_open_params, 0, QtCore.Qt.AlignTop)
-
         self.progress = QtWidgets.QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(6)
@@ -690,16 +765,18 @@ class PreprocessingTab(QtWidgets.QWidget):
         done_hint.setObjectName("SectionHint")
         done_hint.setWordWrap(True)
         done_layout.addWidget(done_hint)
+        self.list_completed = QtWidgets.QListWidget()
+        self.list_completed.setAlternatingRowColors(True)
+        self.list_completed.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.list_completed.setSpacing(4)
+        self.list_completed.setMinimumHeight(220)
+        self.list_completed.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        done_layout.addWidget(self.list_completed, 1)
         done_row = QtWidgets.QHBoxLayout()
-        self.cb_completed = QtWidgets.QComboBox()
-        self.cb_completed.setMinimumWidth(300)
         self.btn_to_curation = QtWidgets.QPushButton("To Curation")
-        self.btn_to_quality = QtWidgets.QPushButton("To Quality Metrics")
         self.btn_to_curation.setProperty("role", "secondary")
-        self.btn_to_quality.setProperty("role", "secondary")
-        done_row.addWidget(self.cb_completed, 1)
+        done_row.addStretch(1)
         done_row.addWidget(self.btn_to_curation)
-        done_row.addWidget(self.btn_to_quality)
         done_layout.addLayout(done_row)
 
         log_box = QtWidgets.QGroupBox("Pipeline log")
@@ -716,33 +793,71 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.log.setReadOnly(True)
         self.log.setProperty("logView", True)
         self.log.setPlaceholderText("Pipeline output will appear here.")
-        self.log.setMinimumHeight(150)
-        self.log.setMaximumHeight(220)
+        self.log.setMinimumHeight(220)
+        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         log_layout.addLayout(log_header)
         log_layout.addWidget(self.log, 1)
 
-        config_scroll = QtWidgets.QScrollArea()
-        config_scroll.setWidgetResizable(True)
-        config_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        config_scroll.setWidget(config)
-        self.params_dialog = QtWidgets.QDialog(self)
-        self.params_dialog.setWindowTitle("Preprocessing parameters")
-        self.params_dialog.setModal(False)
-        self.params_dialog.resize(1320, 900)
-        self.params_dialog.setMinimumSize(980, 720)
-        params_dialog_layout = QtWidgets.QVBoxLayout(self.params_dialog)
-        params_dialog_layout.addWidget(config_scroll, 1)
-        params_btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-        self.btn_save_params = params_btns.addButton("Save Settings", QtWidgets.QDialogButtonBox.ActionRole)
+        for box in [queue_box, done_box, log_box]:
+            box.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        settings_page = QtWidgets.QWidget()
+        settings_page_layout = QtWidgets.QVBoxLayout(settings_page)
+        settings_page_layout.setContentsMargins(0, 0, 0, 0)
+        settings_page_layout.setSpacing(12)
+        settings_hint = QtWidgets.QLabel(
+            "Only the selected settings section is shown so the central panel can stay dense and readable. "
+            "Save As Default updates the next-launch defaults, while the file buttons export or import a full app preset."
+        )
+        settings_hint.setObjectName("SectionHint")
+        settings_hint.setWordWrap(True)
+        settings_page_layout.addWidget(settings_hint)
+
+        params_sections = SideNavStack(
+            "Sections",
+            "Switch between pipeline steps, sorter setup, synchronization, and output paths.",
+        )
+        settings_page_layout.addWidget(params_sections, 1)
+
+        def _new_params_page(box: QtWidgets.QGroupBox) -> QtWidgets.QWidget:
+            page = QtWidgets.QWidget()
+            page_layout = QtWidgets.QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(12)
+            page_layout.addWidget(box)
+            page_layout.addStretch(1)
+            return page
+
+        params_sections.add_page("Pipeline steps", _new_params_page(steps_box))
+        params_sections.add_page("Run naming", _new_params_page(acquisition_box))
+        params_sections.add_page("Sorting and metrics", _new_params_page(metrics_box))
+        params_sections.add_page("Sync and CatGT", _new_params_page(sync_box))
+        params_sections.add_page("Tool and outputs", _new_params_page(paths_box))
+        params_sections.setCurrentIndex(0)
+        self.params_sections = params_sections
+
+        settings_actions = QtWidgets.QHBoxLayout()
+        self.btn_load_settings_file = QtWidgets.QPushButton("Load Settings File")
+        self.btn_save_settings_file = QtWidgets.QPushButton("Save Settings File")
+        self.btn_load_settings_file.setProperty("role", "ghost")
+        self.btn_save_settings_file.setProperty("role", "ghost")
+        settings_actions.addWidget(self.btn_load_settings_file, 0)
+        settings_actions.addWidget(self.btn_save_settings_file, 0)
+        settings_actions.addStretch(1)
+        self.btn_save_params = QtWidgets.QPushButton("Save As Default")
         self.btn_save_params.setProperty("role", "secondary")
         self.btn_save_params.clicked.connect(self.save_settings)
-        params_btns.rejected.connect(self.params_dialog.close)
-        params_dialog_layout.addWidget(params_btns, 0)
+        settings_actions.addWidget(self.btn_save_params, 0)
+        settings_page_layout.addLayout(settings_actions)
 
-        main.addWidget(queue_box, 0)
-        main.addWidget(params_box, 0)
-        main.addWidget(done_box)
-        main.addWidget(log_box, 0)
+        work_sections = SideNavStack(vertical_labels=True, compact_rail=True)
+        work_sections.add_page("Queue", queue_box)
+        self.settings_section_index = work_sections.add_page("Settings", settings_page)
+        work_sections.add_page("Log", log_box)
+        work_sections.add_page("Completed", done_box)
+        work_sections.setCurrentIndex(0)
+        self.work_sections = work_sections
+        main.addWidget(work_sections, 1)
         main.addWidget(self.progress, 0)
         self._refresh_queue_summary()
 
@@ -753,9 +868,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_remove.clicked.connect(self._remove_selected)
         self.btn_clear.clicked.connect(self._clear)
         self.btn_run.clicked.connect(self._run_queue)
-        self.btn_open_params.clicked.connect(self._open_parameters_window)
         self.btn_copy_log.clicked.connect(self._copy_log)
         self.list_jobs.filesDropped.connect(self._consume_drop)
+        self.list_completed.itemDoubleClicked.connect(lambda _item: self._open_selected_curation())
         btn_output.clicked.connect(lambda: self._pick_folder(self.ed_output))
         btn_json.clicked.connect(lambda: self._pick_folder(self.ed_json))
         btn_catgt_path.clicked.connect(lambda: self._pick_folder(self.ed_catgt_path))
@@ -764,7 +879,20 @@ class PreprocessingTab(QtWidgets.QWidget):
         btn_ks4_repo.clicked.connect(lambda: self._pick_folder(self.ed_ks4_repo))
         btn_ks_tmp.clicked.connect(lambda: self._pick_folder(self.ed_ks_tmp))
         self.ed_output.editingFinished.connect(self._persist_settings)
+        self.ck_mirror_raw_hierarchy_output.toggled.connect(lambda _checked: self._persist_settings())
         self.ed_json.editingFinished.connect(self._persist_settings)
+        for checkbox in [
+            self.ck_catgt,
+            self.ck_catgt_extract_only,
+            self.ck_tprime,
+            self.ck_ks,
+            self.ck_post,
+            self.ck_noise,
+            self.ck_wvf,
+            self.ck_qm,
+            self.ck_pybomb,
+        ]:
+            checkbox.toggled.connect(lambda _checked=False: self._persist_settings())
         self.cb_ks_ver.currentTextChanged.connect(self._persist_settings)
         self.ed_gate.editingFinished.connect(self._persist_settings)
         self.ed_trigger.editingFinished.connect(self._persist_settings)
@@ -791,16 +919,13 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_build_bitfield.clicked.connect(self._open_bitfield_builder)
         self.btn_build_tprime.clicked.connect(self._open_tprime_builder)
         self.btn_to_curation.clicked.connect(self._open_selected_curation)
-        self.btn_to_quality.clicked.connect(self._open_selected_quality)
         self.btn_adv_ks4.clicked.connect(self._open_ks4_advanced)
+        self.btn_save_settings_file.clicked.connect(self.saveSettingsFileRequested.emit)
+        self.btn_load_settings_file.clicked.connect(self.loadSettingsFileRequested.emit)
 
     def _open_parameters_window(self) -> None:
-        state = self.params_dialog.windowState()
-        if state & QtCore.Qt.WindowMinimized:
-            self.params_dialog.setWindowState(state & ~QtCore.Qt.WindowMinimized)
-        self.params_dialog.show()
-        self.params_dialog.raise_()
-        self.params_dialog.activateWindow()
+        if hasattr(self, "work_sections") and hasattr(self, "settings_section_index"):
+            self.work_sections.setCurrentIndex(int(self.settings_section_index))
 
     def _pick_folder(self, target: QtWidgets.QLineEdit) -> None:
         start = self.settings.value("paths/last_folder", str(Path.cwd()))
@@ -901,7 +1026,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         else:
             msg = f"{n_jobs} recordings queued and ready to run."
         if self.completed_runs:
-            msg += f" {len(self.completed_runs)} completed run(s) available below."
+            msg += f" {len(self.completed_runs)} completed run(s) available in Completed."
         self.lbl_queue_summary.setText(msg)
 
     def _remove_selected(self) -> None:
@@ -920,6 +1045,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         return EcephysPipelineConfig(
             output_root=self.ed_output.text().strip(),
             json_root=self.ed_json.text().strip(),
+            mirror_raw_hierarchy_output=self.ck_mirror_raw_hierarchy_output.isChecked(),
             run_catgt=self.ck_catgt.isChecked(),
             run_catgt_extract_only=self.ck_catgt_extract_only.isChecked(),
             run_tprime=self.ck_tprime.isChecked(),
@@ -961,6 +1087,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             self._append_log("No jobs in queue.")
             return
         self._persist_settings()
+        self.settings.sync()
 
         self._queue = list(self.jobs)
         self._running = True
@@ -996,10 +1123,15 @@ class PreprocessingTab(QtWidgets.QWidget):
             if not ks_folder:
                 ks_ver = self.cb_ks_ver.currentText()
                 ks_tag = {"2.0": "ks2", "2.5": "ks25", "3.0": "ks3", "4": "ks4"}.get(ks_ver, "ks4")
-                ks_folder = str((Path(self.ed_output.text().strip()) / run_name / ks_tag).resolve())
+                ks_folder = str(
+                    (Path(self.ed_output.text().strip()) / run_name / default_kilosort_output_name(ks_tag, self.ed_probe.text().strip())).resolve()
+                )
             label = f"{run_name} | {ks_folder}"
             self.completed_runs.append({"run_name": run_name, "ks_folder": ks_folder, "label": label})
-            self.cb_completed.addItem(label, ks_folder)
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.UserRole, ks_folder)
+            self.list_completed.addItem(item)
+            self.list_completed.setCurrentItem(item)
         self._refresh_queue_summary()
         self._run_next()
 
@@ -1011,47 +1143,71 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._append_log("Log copied to clipboard.")
 
     def _restore_settings(self) -> None:
-        output_root = self.settings.value("preproc/output_root", "")
-        json_root = self.settings.value("preproc/json_root", "")
-        if output_root:
-            self.ed_output.setText(str(output_root))
-        if json_root:
-            self.ed_json.setText(str(json_root))
-        self.cb_ks_ver.setCurrentText(str(self.settings.value("preproc/ks_ver", self.cb_ks_ver.currentText())))
-        self.ed_gate.setText(str(self.settings.value("preproc/gate_string", self.ed_gate.text())))
-        self.ed_trigger.setText(str(self.settings.value("preproc/trigger_string", self.ed_trigger.text())))
-        self.ed_probe.setText(str(self.settings.value("preproc/probe_string", self.ed_probe.text())))
-        self.ed_region.setText(str(self.settings.value("preproc/region_name", self.ed_region.text())))
-        self.ed_ks_th.setText(str(self.settings.value("preproc/ks_th", self.ed_ks_th.text())))
-        self.ed_ni_extract.setText(str(self.settings.value("preproc/ni_extract_string", self.ed_ni_extract.text())))
-        self.ed_catgt_cmd.setText(str(self.settings.value("preproc/catgt_cmd_string", self.ed_catgt_cmd.text())))
-        self.ed_tostream.setText(str(self.settings.value("preproc/tostream_sync_params", self.ed_tostream.text())))
-        car_mode = self.settings.value("preproc/catgt_car_mode", "gbldmx")
-        idx = self.cb_catgt_car_mode.findText(str(car_mode))
-        if idx >= 0:
-            self.cb_catgt_car_mode.setCurrentIndex(idx)
-        self.ed_qm_isi.setValue(float(self.settings.value("preproc/qm_isi_thresh", float(self.ed_qm_isi.value()))))
-        self.ed_sync_period.setValue(float(self.settings.value("preproc/sync_period", float(self.ed_sync_period.value()))))
-        self.sp_loccar_min.setValue(float(self.settings.value("preproc/catgt_loccar_min_um", 40.0)))
-        self.sp_loccar_max.setValue(float(self.settings.value("preproc/catgt_loccar_max_um", 160.0)))
-        self.sp_ks4_dup_ms.setValue(float(self.settings.value("preproc/ks4_duplicate_spike_ms", 0.25)))
-        self.sp_ks4_min_template.setValue(float(self.settings.value("preproc/ks4_min_template_size_um", 10.0)))
-        self.sp_cwaves_um.setValue(float(self.settings.value("preproc/c_waves_snr_um", 160.0)))
-        self.ed_catgt_path.setText(str(self.settings.value("preproc/catgt_path", self.ed_catgt_path.text())))
-        self.ed_tprime_path.setText(str(self.settings.value("preproc/tprime_path", self.ed_tprime_path.text())))
-        self.ed_cwaves_path.setText(str(self.settings.value("preproc/cwaves_path", self.ed_cwaves_path.text())))
-        self.ed_ks4_repo.setText(str(self.settings.value("preproc/ks4_repo_path", self.ed_ks4_repo.text())))
-        self.ed_ks_tmp.setText(str(self.settings.value("preproc/kilosort_output_tmp", self.ed_ks_tmp.text())))
-        self.ck_catgt_extract_only.setChecked(bool(self.settings.value("preproc/run_catgt_extract_only", False, type=bool)))
-        raw_adv = str(self.settings.value("preproc/ks4_advanced_params_json", "{}"))
+        self._restoring_settings = True
         try:
-            self._ks4_adv_params = json.loads(raw_adv) if raw_adv else {}
-        except Exception:
-            self._ks4_adv_params = {}
+            output_root = self.settings.value("preproc/output_root", "")
+            json_root = self.settings.value("preproc/json_root", "")
+            if output_root:
+                self.ed_output.setText(str(output_root))
+            if json_root:
+                self.ed_json.setText(str(json_root))
+            self.ck_mirror_raw_hierarchy_output.setChecked(
+                bool(self.settings.value("preproc/mirror_raw_hierarchy_output", False, type=bool))
+            )
+            self.cb_ks_ver.setCurrentText(str(self.settings.value("preproc/ks_ver", self.cb_ks_ver.currentText())))
+            self.ed_gate.setText(str(self.settings.value("preproc/gate_string", self.ed_gate.text())))
+            self.ed_trigger.setText(str(self.settings.value("preproc/trigger_string", self.ed_trigger.text())))
+            self.ed_probe.setText(str(self.settings.value("preproc/probe_string", self.ed_probe.text())))
+            self.ed_region.setText(str(self.settings.value("preproc/region_name", self.ed_region.text())))
+            self.ed_ks_th.setText(str(self.settings.value("preproc/ks_th", self.ed_ks_th.text())))
+            self.ed_ni_extract.setText(str(self.settings.value("preproc/ni_extract_string", self.ed_ni_extract.text())))
+            self.ed_catgt_cmd.setText(str(self.settings.value("preproc/catgt_cmd_string", self.ed_catgt_cmd.text())))
+            self.ed_tostream.setText(str(self.settings.value("preproc/tostream_sync_params", self.ed_tostream.text())))
+            car_mode = self.settings.value("preproc/catgt_car_mode", "gbldmx")
+            idx = self.cb_catgt_car_mode.findText(str(car_mode))
+            if idx >= 0:
+                self.cb_catgt_car_mode.setCurrentIndex(idx)
+            self.ed_qm_isi.setValue(float(self.settings.value("preproc/qm_isi_thresh", float(self.ed_qm_isi.value()))))
+            self.ed_sync_period.setValue(float(self.settings.value("preproc/sync_period", float(self.ed_sync_period.value()))))
+            self.sp_loccar_min.setValue(float(self.settings.value("preproc/catgt_loccar_min_um", 40.0)))
+            self.sp_loccar_max.setValue(float(self.settings.value("preproc/catgt_loccar_max_um", 160.0)))
+            self.sp_ks4_dup_ms.setValue(float(self.settings.value("preproc/ks4_duplicate_spike_ms", 0.25)))
+            self.sp_ks4_min_template.setValue(float(self.settings.value("preproc/ks4_min_template_size_um", 10.0)))
+            self.sp_cwaves_um.setValue(float(self.settings.value("preproc/c_waves_snr_um", 160.0)))
+            self.ed_catgt_path.setText(str(self.settings.value("preproc/catgt_path", self.ed_catgt_path.text())))
+            self.ed_tprime_path.setText(str(self.settings.value("preproc/tprime_path", self.ed_tprime_path.text())))
+            self.ed_cwaves_path.setText(str(self.settings.value("preproc/cwaves_path", self.ed_cwaves_path.text())))
+            self.ed_ks4_repo.setText(str(self.settings.value("preproc/ks4_repo_path", self.ed_ks4_repo.text())))
+            self.ed_ks_tmp.setText(str(self.settings.value("preproc/kilosort_output_tmp", self.ed_ks_tmp.text())))
+            for key, checkbox in [
+                ("preproc/run_catgt", self.ck_catgt),
+                ("preproc/run_catgt_extract_only", self.ck_catgt_extract_only),
+                ("preproc/run_tprime", self.ck_tprime),
+                ("preproc/run_kilosort", self.ck_ks),
+                ("preproc/run_kilosort_postproc", self.ck_post),
+                ("preproc/run_noise_templates", self.ck_noise),
+                ("preproc/run_mean_waveforms", self.ck_wvf),
+                ("preproc/run_quality_metrics", self.ck_qm),
+                ("preproc/run_pybombcell", self.ck_pybomb),
+            ]:
+                checkbox.setChecked(bool(self.settings.value(key, checkbox.isChecked(), type=bool)))
+            raw_adv = str(self.settings.value("preproc/ks4_advanced_params_json", "{}"))
+            try:
+                self._ks4_adv_params = json.loads(raw_adv) if raw_adv else {}
+            except Exception:
+                self._ks4_adv_params = {}
+        finally:
+            self._restoring_settings = False
 
     def _persist_settings(self) -> None:
+        if self._restoring_settings:
+            return
         self.settings.setValue("preproc/output_root", self.ed_output.text().strip())
         self.settings.setValue("preproc/json_root", self.ed_json.text().strip())
+        self.settings.setValue(
+            "preproc/mirror_raw_hierarchy_output",
+            self.ck_mirror_raw_hierarchy_output.isChecked(),
+        )
         self.settings.setValue("preproc/ks_ver", self.cb_ks_ver.currentText())
         self.settings.setValue("preproc/gate_string", self.ed_gate.text().strip())
         self.settings.setValue("preproc/trigger_string", self.ed_trigger.text().strip())
@@ -1074,13 +1230,25 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.settings.setValue("preproc/cwaves_path", self.ed_cwaves_path.text().strip())
         self.settings.setValue("preproc/ks4_repo_path", self.ed_ks4_repo.text().strip())
         self.settings.setValue("preproc/kilosort_output_tmp", self.ed_ks_tmp.text().strip())
-        self.settings.setValue("preproc/run_catgt_extract_only", self.ck_catgt_extract_only.isChecked())
+        for key, checkbox in [
+            ("preproc/run_catgt", self.ck_catgt),
+            ("preproc/run_catgt_extract_only", self.ck_catgt_extract_only),
+            ("preproc/run_tprime", self.ck_tprime),
+            ("preproc/run_kilosort", self.ck_ks),
+            ("preproc/run_kilosort_postproc", self.ck_post),
+            ("preproc/run_noise_templates", self.ck_noise),
+            ("preproc/run_mean_waveforms", self.ck_wvf),
+            ("preproc/run_quality_metrics", self.ck_qm),
+            ("preproc/run_pybombcell", self.ck_pybomb),
+        ]:
+            self.settings.setValue(key, checkbox.isChecked())
         self.settings.setValue("preproc/ks4_advanced_params_json", json.dumps(self._ks4_adv_params))
+        self._settings_sync_timer.start()
 
     def save_settings(self) -> None:
         self._persist_settings()
         self.settings.sync()
-        self._append_log("Preprocessing settings saved.")
+        self._append_log("Preprocessing settings saved as defaults for the next app launch.")
 
     def _set_last_folder(self, folder: str) -> None:
         self.settings.setValue("paths/last_folder", folder)
@@ -1130,14 +1298,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         menu.exec(self.btn_recent_folders.mapToGlobal(self.btn_recent_folders.rect().bottomLeft()))
 
     def _open_selected_curation(self) -> None:
-        folder = self.cb_completed.currentData()
+        item = self.list_completed.currentItem()
+        if item is None and self.list_completed.count():
+            item = self.list_completed.item(self.list_completed.count() - 1)
+        folder = item.data(QtCore.Qt.UserRole) if item is not None else None
         if folder:
             self.openCurationRequested.emit(str(folder))
-
-    def _open_selected_quality(self) -> None:
-        folder = self.cb_completed.currentData()
-        if folder:
-            self.openQualityRequested.emit(str(folder))
 
     def is_busy(self) -> bool:
         return bool(self._running)
@@ -1160,9 +1326,11 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._append_log("CatGT command string updated from builder.")
 
     def _open_tprime_builder(self) -> None:
-        current_extractors = catgt_command_extractors(self.ed_catgt_cmd.text().strip())
+        # Labels are preserved only in the dedicated extractor field. The CatGT
+        # command stores the executable flags without label suffixes.
+        current_extractors = self.ed_ni_extract.text().strip()
         if not current_extractors:
-            current_extractors = self.ed_ni_extract.text().strip()
+            current_extractors = catgt_command_extractors(self.ed_catgt_cmd.text().strip())
         dlg = TPrimeStringBuilderDialog(
             self.ed_tostream.text().strip(),
             current_extractors,
@@ -1188,5 +1356,3 @@ class PreprocessingTab(QtWidgets.QWidget):
         )
         self._persist_settings()
         self._append_log("CatGT bit-field extractor flags updated from builder.")
-
-

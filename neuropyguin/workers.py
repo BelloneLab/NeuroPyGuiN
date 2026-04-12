@@ -112,6 +112,7 @@ class FunctionWorker(QtCore.QRunnable):
 class EcephysPipelineConfig:
     output_root: str
     json_root: str
+    mirror_raw_hierarchy_output: bool
     run_catgt: bool
     run_catgt_extract_only: bool
     run_tprime: bool
@@ -428,7 +429,9 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 continuous_file=str(bin_file),
                 input_meta_path=str(input_meta),
                 extracted_data_directory=str(job_out),
-                kilosort_output_directory=str(job_out / ks_tag),
+                # CatGT-only passes do not use the Kilosort output directory, so keep this
+                # on an existing folder to avoid creating a stray placeholder sorter folder.
+                kilosort_output_directory=str(job_out),
                 catGT_run_name=trial["catgt_run_name"],
                 gate_string=trial["gate_string"],
                 trigger_string=trial["trigger_string"],
@@ -633,7 +636,9 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 continuous_file=str(bin_file),
                 input_meta_path=str(input_meta),
                 extracted_data_directory=str(job_out),
-                kilosort_output_directory=str(job_out / ks_tag),
+                # CatGT itself does not need a sorter output directory; reusing the existing
+                # extracted-data root avoids creating a misleading bare "ks4" folder.
+                kilosort_output_directory=str(job_out),
                 catGT_run_name=trial["catgt_run_name"],
                 gate_string=trial["gate_string"],
                 trigger_string=trial["trigger_string"],
@@ -699,7 +704,8 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             continuous_file=str(processing_bin),
             input_meta_path=str(processing_meta),
             extracted_data_directory=str(extracted_data_root),
-            kilosort_output_directory=str(processing_bin.parent / ks_tag),
+            # Extract-only reruns should not materialize a placeholder sorter folder.
+            kilosort_output_directory=str(processing_bin.parent),
             catGT_run_name=catgt_context["catgt_run_name"],
             gate_string=gate_string,
             trigger_string="cat",
@@ -764,6 +770,41 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         extra = "" if len(found) <= 6 else f" (+{len(found) - 6} more)"
         _safe_emit(self.signals.log, f"[{self.job['name']}] Verified NI extractor outputs: {preview}{extra}")
 
+    def _apply_extractor_labels(
+        self,
+        *,
+        catgt_run_dir: Path,
+        source_run_name: str,
+        gate_string: str,
+        ni_extract_string: str,
+    ) -> None:
+        from .preprocessing import extractor_label_rename_map
+
+        rename_map = extractor_label_rename_map(ni_extract_string, source_run_name, gate_string)
+        if not rename_map:
+            return
+        copied: List[str] = []
+        for original_pattern, labelled_name in rename_map.items():
+            matches = sorted(catgt_run_dir.glob(original_pattern))
+            for src in matches:
+                dest = src.parent / labelled_name
+                if dest.exists():
+                    continue
+                try:
+                    import shutil
+                    shutil.copy2(str(src), str(dest))
+                    copied.append(f"{src.name} -> {dest.name}")
+                except Exception as exc:
+                    _safe_emit(
+                        self.signals.log,
+                        f"[{self.job['name']}] Warning: could not copy labelled extractor {src.name}: {exc}",
+                    )
+        if copied:
+            _safe_emit(
+                self.signals.log,
+                f"[{self.job['name']}] Labelled extractor copies: {', '.join(copied)}",
+            )
+
     @QtCore.Slot()
     def run(self) -> None:
         repo = ensure_ecephys_on_sys_path()
@@ -773,12 +814,17 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 catgt_extract_only_flags,
                 catgt_extract_only_stream_string,
                 catgt_stream_string,
+                default_kilosort_output_name,
+                default_pipeline_output_dir,
                 default_pipeline_ks_output_dir,
                 expected_ni_catgt_output_patterns,
+                extractor_label_rename_map,
                 is_catgt_processed_bin,
                 has_ni_catgt_extractors,
                 merge_extractors_into_catgt_command,
                 parse_catgt_processed_bin_context,
+                resolve_labelled_output_context,
+                parse_spikeglx_bin_name,
                 validate_spikeglx_ap_bin,
             )
         except Exception as exc:
@@ -882,8 +928,18 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         f"[{self.job['name']}] Input already appears CatGT-processed; skipping CatGT and using local KS area near {bin_file.parent}.",
                     )
             else:
-                extracted_data_root = output_root / run_name
+                extracted_data_root = default_pipeline_output_dir(
+                    str(bin_file),
+                    output_root,
+                    run_name=run_name,
+                    mirror_raw_hierarchy=self.cfg.mirror_raw_hierarchy_output,
+                )
                 extracted_data_root.mkdir(parents=True, exist_ok=True)
+                if self.cfg.mirror_raw_hierarchy_output:
+                    _safe_emit(
+                        self.signals.log,
+                        f"[{self.job['name']}] Mirrored raw hierarchy output root: {extracted_data_root}",
+                    )
                 ks_folder = default_pipeline_ks_output_dir(
                     str(bin_file),
                     ks_tag,
@@ -933,11 +989,18 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 )
                 catgt_output_context = parse_catgt_processed_bin_context(str(processing_bin))
                 if catgt_output_context:
+                    catgt_context = catgt_output_context
                     self._verify_ni_extractor_outputs(
                         catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
                         source_run_name=catgt_output_context["source_run_name"],
                         gate_string=catgt_output_context["gate_string"],
                         catgt_cmd_string=effective_catgt_cmd,
+                    )
+                    self._apply_extractor_labels(
+                        catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
+                        source_run_name=catgt_output_context["source_run_name"],
+                        gate_string=catgt_output_context["gate_string"],
+                        ni_extract_string=self.cfg.ni_extract_string,
                     )
                 ks_folder = default_pipeline_ks_output_dir(
                     str(processing_bin),
@@ -985,6 +1048,12 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         gate_string=catgt_context["gate_string"],
                         catgt_cmd_string=effective_catgt_cmd,
                     )
+                    self._apply_extractor_labels(
+                        catgt_run_dir=Path(catgt_context["catgt_run_dir"]),
+                        source_run_name=catgt_context["source_run_name"],
+                        gate_string=catgt_context["gate_string"],
+                        ni_extract_string=self.cfg.ni_extract_string,
+                    )
                 else:
                     _safe_emit(
                         self.signals.log,
@@ -1005,11 +1074,18 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         catgt_stream_string=extract_only_stream,
                     )
                     if extract_context:
+                        catgt_context = extract_context
                         self._verify_ni_extractor_outputs(
                             catgt_run_dir=Path(extract_context["catgt_run_dir"]),
                             source_run_name=extract_context["source_run_name"],
                             gate_string=extract_context["gate_string"],
                             catgt_cmd_string=effective_catgt_cmd,
+                        )
+                        self._apply_extractor_labels(
+                            catgt_run_dir=Path(extract_context["catgt_run_dir"]),
+                            source_run_name=extract_context["source_run_name"],
+                            gate_string=extract_context["gate_string"],
+                            ni_extract_string=self.cfg.ni_extract_string,
                         )
                 done += 1
                 _safe_emit(self.signals.progress, int(done * 100 / total))
@@ -1032,8 +1108,17 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             ) and not self.cfg.run_kilosort
             if needs_existing_ks:
                 requested_ks_folder = ks_folder
+                # When mirrored hierarchy is active the default flat ks_folder
+                # (output_root/run_name/ks_tag) is far from the real location
+                # inside extracted_data_root.  Use the mirrored root as the
+                # resolver hint so parent-walking starts in the right area.
+                resolver_hint = (
+                    extracted_data_root / default_kilosort_output_name(ks_tag, probe_string)
+                    if self.cfg.mirror_raw_hierarchy_output
+                    else ks_folder
+                )
                 resolved_ks = self._resolve_existing_ks_folder(
-                    ks_folder,
+                    resolver_hint,
                     extracted_data_root,
                     processing_bin,
                     ks_tag,
@@ -1048,6 +1133,25 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 if ks_folder != requested_ks_folder:
                     _safe_emit(self.signals.log, f"[{self.job['name']}] Resolved existing KS folder: {ks_folder}")
                 resolved_processing_bin = self._resolve_processing_bin_for_ks_folder(ks_folder, processing_bin)
+                if resolved_processing_bin is not None:
+                    expected_identity = parse_spikeglx_bin_name(str(processing_bin))
+                    resolved_identity = parse_spikeglx_bin_name(str(resolved_processing_bin))
+                    expected_run = str(expected_identity.get("run_name") or run_name)
+                    expected_gate = str(expected_identity.get("gate_string") or gate_string)
+                    expected_probe = str(expected_identity.get("probe_string") or probe_string)
+                    resolved_run = str(resolved_identity.get("run_name") or "")
+                    resolved_gate = str(resolved_identity.get("gate_string") or "")
+                    resolved_probe = str(resolved_identity.get("probe_string") or "")
+                    if (
+                        (resolved_run and resolved_run != expected_run)
+                        or (resolved_gate and resolved_gate != expected_gate)
+                        or (resolved_probe and resolved_probe != expected_probe)
+                    ):
+                        raise RuntimeError(
+                            f"Resolved existing {ks_tag} folder {ks_folder} belongs to "
+                            f"{resolved_run or '?'} g{resolved_gate or '?'} imec{resolved_probe or '?'} "
+                            f"instead of the queued recording {expected_run} g{expected_gate} imec{expected_probe}."
+                        )
                 if resolved_processing_bin is not None and resolved_processing_bin != processing_bin:
                     processing_bin = resolved_processing_bin
                     processing_meta = self._meta_for_bin(processing_bin)
@@ -1103,7 +1207,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     gate_string=gate_string,
                     trigger_string=trigger_string,
                     probe_string=probe_string,
-                    tPrime_ni_ex_list=self.cfg.ni_extract_string,
+                    tPrime_ni_ex_list=re.sub(r"\[[^\]]*\]", "", self.cfg.ni_extract_string),
                     sync_period=self.cfg.sync_period,
                     toStream_sync_params=self.cfg.tostream_sync_params,
                     ks_output_tag=ks_tag,
@@ -1114,6 +1218,14 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     external_kilosort_output_tmp=self.cfg.kilosort_output_tmp,
                 )
                 self._run_module("tPrime_helper", tprime_in, tprime_out, self.job["workdir"])
+                tprime_context = resolve_labelled_output_context(str(processing_bin), catgt_context)
+                if tprime_context:
+                    self._apply_extractor_labels(
+                        catgt_run_dir=Path(tprime_context["catgt_run_dir"]),
+                        source_run_name=tprime_context["source_run_name"],
+                        gate_string=tprime_context["gate_string"],
+                        ni_extract_string=self.cfg.ni_extract_string,
+                    )
                 done += 1
                 _safe_emit(self.signals.progress, int(done * 100 / total))
 
@@ -1152,6 +1264,3 @@ def ensure_job_dirs(output_root: Path, run_name: str) -> Dict[str, Path]:
         "ks_output": job_root / "ks4-output.json",
     }
     return paths
-
-
-

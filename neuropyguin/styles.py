@@ -247,6 +247,39 @@ QPushButton[role="ghost"]:hover {
     background: %(surface_alt)s;
     border-color: %(border_soft)s;
 }
+QFrame[navRail="true"] {
+    background: %(surface)s;
+    border: 1px solid %(border_soft)s;
+    border-radius: 18px;
+}
+QFrame[navRail="true"][compactRail="true"] {
+    border-radius: 16px;
+}
+QPushButton[navButton="true"] {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    color: %(text_soft)s;
+    font-weight: 600;
+    min-height: 34px;
+    padding: 8px 12px;
+    text-align: left;
+}
+QPushButton[navButton="true"][verticalLabel="true"] {
+    min-width: 40px;
+    max-width: 40px;
+    min-height: 88px;
+    padding: 10px 4px;
+}
+QPushButton[navButton="true"]:hover {
+    background: %(surface_alt)s;
+    border-color: %(border_soft)s;
+}
+QPushButton[navButton="true"]:checked {
+    background: %(primary_tint)s;
+    border-color: %(primary_soft)s;
+    color: %(text_heading)s;
+}
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QListWidget, QTableWidget {
     border: 1px solid %(border_soft)s;
     border-radius: 12px;
@@ -344,6 +377,63 @@ QLabel#SectionHint {
     color: %(text_muted)s;
     font-size: 13px;
     padding-bottom: 4px;
+}
+QWidget[compactDialog="true"] {
+    font-size: 13px;
+}
+QWidget[compactDialog="true"] QGroupBox {
+    border-radius: 16px;
+    margin-top: 14px;
+    padding: 14px 14px 12px 14px;
+    font-size: 14px;
+}
+QWidget[compactDialog="true"] QGroupBox::title {
+    border-radius: 10px;
+    left: 12px;
+    padding: 3px 9px;
+}
+QWidget[compactDialog="true"] QPushButton {
+    border-radius: 10px;
+    min-height: 18px;
+    padding: 7px 12px;
+}
+QWidget[compactDialog="true"] QPushButton[navButton="true"] {
+    min-height: 32px;
+    padding: 8px 10px;
+}
+QWidget[compactDialog="true"] QPushButton[navButton="true"][verticalLabel="true"] {
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 80px;
+    padding: 8px 2px;
+}
+QWidget[compactDialog="true"] QLineEdit,
+QWidget[compactDialog="true"] QComboBox,
+QWidget[compactDialog="true"] QSpinBox,
+QWidget[compactDialog="true"] QDoubleSpinBox,
+QWidget[compactDialog="true"] QPlainTextEdit,
+QWidget[compactDialog="true"] QListWidget,
+QWidget[compactDialog="true"] QTableWidget {
+    border-radius: 10px;
+    min-height: 28px;
+    padding: 5px 8px;
+}
+QWidget[compactDialog="true"] QCheckBox {
+    font-size: 13px;
+    spacing: 6px;
+}
+QWidget[compactDialog="true"] QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+}
+QWidget[compactDialog="true"] QHeaderView::section {
+    padding: 6px 8px;
+}
+QWidget[compactDialog="true"] QLabel#FieldTitle {
+    font-size: 13px;
+}
+QWidget[compactDialog="true"] QLabel#SectionHint {
+    font-size: 12px;
 }
 QLabel#QueueSummary {
     color: %(text_soft)s;

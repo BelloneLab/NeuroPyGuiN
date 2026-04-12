@@ -80,7 +80,11 @@ def _tokenize_path(path: Path) -> set[str]:
     return {
         token
         for token in re.split(r"[^a-z0-9]+", raw)
-        if len(token) >= 3 and token not in {"spike", "sorting", "processeddata", "output", "neuropygui"}
+        if len(token) >= 3 and token not in {
+            "spike", "sorting", "processeddata", "output", "neuropygui",
+            "npx", "neuropixels", "data", "raw", "processed", "catgt",
+            "imec", "test", "bin", "tmp",
+        }
     }
 
 
@@ -126,12 +130,16 @@ def find_kilosort_output_dir(
     if has_kilosort_output(direct):
         return direct
 
+    requested_tokens = _tokenize_path(requested)
     candidates: list[tuple[tuple[int, int, int, int, int], Path]] = []
     for root_index, root in enumerate(_iter_search_roots(requested, extra_roots)):
         if not root.exists() or not root.is_dir():
             continue
         for node, depth in _walk_dirs(root, max_depth):
             if not has_kilosort_output(node):
+                continue
+            overlap = _tokenize_path(node) & requested_tokens
+            if not overlap:
                 continue
             score = (
                 root_index,
