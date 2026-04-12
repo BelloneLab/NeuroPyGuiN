@@ -2,6 +2,8 @@
 
 GUI for Neuropixels preprocessing, curation, quality metrics, and post-processing.
 
+![NeuroPyGuiN](./neuropyguin/assets/big.jpg)
+
 ## Features
 
 ### Preprocessing

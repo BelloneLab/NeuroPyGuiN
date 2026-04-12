@@ -541,6 +541,18 @@ QProgressBar[footerProgress="true"] {
 QProgressBar[footerProgress="true"]::chunk {
     border-radius: 3px;
 }
+QProgressBar[stepProgress="true"] {
+    min-height: 10px;
+    max-height: 10px;
+    border-radius: 6px;
+    border: 1px solid %(border_soft)s;
+    background: %(surface_alt)s;
+    padding: 0;
+}
+QProgressBar[stepProgress="true"]::chunk {
+    border-radius: 5px;
+    background: %(progress_chunk)s;
+}
 QMenu {
     background: %(window_elevated)s;
     color: %(text)s;
@@ -567,6 +579,31 @@ QPlainTextEdit[logView="true"] {
     border: 1px solid %(border)s;
     font-family: "Cascadia Mono";
     font-size: 13px;
+}
+QWidget[stepStatusCard="true"] {
+    background: %(surface_muted)s;
+    border: 1px solid %(border)s;
+    border-radius: 18px;
+}
+QWidget[stepStatusItem="true"] {
+    background: %(surface_raised)s;
+    border: 1px solid %(border_soft)s;
+    border-radius: 14px;
+}
+QLabel#StepStatusRunName {
+    font-size: 16px;
+    font-weight: 700;
+    color: %(text_heading)s;
+}
+QLabel#StepStatusTitle {
+    font-size: 13px;
+    font-weight: 700;
+    color: %(text_heading)s;
+}
+QLabel#StepStatusPercent {
+    font-size: 12px;
+    font-weight: 700;
+    color: %(text_soft)s;
 }
 """
 

@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 import json
@@ -49,6 +51,101 @@ class BinDropList(QtWidgets.QListWidget):
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+
+class StepStatusItem(QtWidgets.QWidget):
+    _ASSET_ROOT = Path(__file__).resolve().parents[1] / "assets"
+    _OK_ICON = _ASSET_ROOT / "ok-icon.png"
+    _LOADING_ICON = _ASSET_ROOT / "loading-icon.gif"
+    _FAILED_ICON = _ASSET_ROOT / "failed.gif"
+
+    def __init__(self, title: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._movie: QtGui.QMovie | None = None
+        self._title = title
+        self.setProperty("stepStatusItem", True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        header = QtWidgets.QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        self.icon_label = QtWidgets.QLabel()
+        self.icon_label.setFixedSize(18, 18)
+        self.icon_label.setScaledContents(True)
+        self.icon_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.title_label = QtWidgets.QLabel(title)
+        self.title_label.setObjectName("StepStatusTitle")
+        self.percent_label = QtWidgets.QLabel("Pending")
+        self.percent_label.setObjectName("StepStatusPercent")
+        header.addWidget(self.icon_label, 0)
+        header.addWidget(self.title_label, 1)
+        header.addWidget(self.percent_label, 0)
+        layout.addLayout(header)
+
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setProperty("stepProgress", True)
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress, 0)
+        self.set_pending()
+
+    def _clear_movie(self) -> None:
+        if self._movie is not None:
+            self._movie.stop()
+        self._movie = None
+        self.icon_label.clear()
+
+    def _set_icon_pixmap(self, path: Path) -> None:
+        self._clear_movie()
+        pixmap = QtGui.QPixmap(str(path))
+        if not pixmap.isNull():
+            self.icon_label.setPixmap(pixmap.scaled(18, 18, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+
+    def _set_icon_movie(self, path: Path) -> None:
+        self._clear_movie()
+        movie = QtGui.QMovie(str(path))
+        if not movie.isValid():
+            return
+        movie.setScaledSize(QtCore.QSize(18, 18))
+        self.icon_label.setMovie(movie)
+        movie.start()
+        self._movie = movie
+
+    def set_pending(self) -> None:
+        self._clear_movie()
+        self.percent_label.setText("Pending")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+
+    def set_running(self) -> None:
+        self._set_icon_movie(self._LOADING_ICON)
+        self.percent_label.setText("Running")
+        self.progress.setRange(0, 0)
+
+    def set_progress(self, percent: int) -> None:
+        percent = max(0, min(100, int(percent)))
+        if self.progress.maximum() == 0:
+            self.progress.setRange(0, 100)
+        self.progress.setValue(percent)
+        self.percent_label.setText(f"{percent}%")
+        if percent < 100 and self._movie is None:
+            self._set_icon_movie(self._LOADING_ICON)
+
+    def set_finished(self) -> None:
+        self._set_icon_pixmap(self._OK_ICON)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
+        self.percent_label.setText("100%")
+
+    def set_failed(self) -> None:
+        self._set_icon_movie(self._FAILED_ICON)
+        if self.progress.maximum() == 0:
+            self.progress.setRange(0, 100)
+        self.percent_label.setText("Failed")
 
 
 class Ks4AdvancedDialog(QtWidgets.QDialog):
@@ -215,6 +312,7 @@ class Ks4AdvancedDialog(QtWidgets.QDialog):
 
 class PreprocessingTab(QtWidgets.QWidget):
     openCurationRequested = QtCore.Signal(str)
+    openPostProcessingRequested = QtCore.Signal(str)
     saveSettingsFileRequested = QtCore.Signal()
     loadSettingsFileRequested = QtCore.Signal()
 
@@ -229,10 +327,11 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._settings_sync_timer.timeout.connect(self.settings.sync)
         self._restoring_settings = False
         self.jobs: List[Dict[str, str]] = []
-        self.completed_runs: List[Dict[str, str]] = []
+        self.completed_runs: List[Dict[str, object]] = []
         self._queue: List[Dict[str, str]] = []
         self._running = False
         self._ks4_adv_params: Dict[str, object] = {}
+        self._active_run_context: Dict[str, object] | None = None
 
         self._build_ui()
         self._restore_settings()
@@ -761,7 +860,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         done_box.setProperty("settingsSection", True)
         done_layout = QtWidgets.QVBoxLayout(done_box)
         done_layout.setSpacing(8)
-        done_hint = QtWidgets.QLabel("Jump directly from a finished run into curation or quality-metrics review.")
+        done_hint = QtWidgets.QLabel(
+            "Finished runs stay in history until Clear History. Double-click opens curation, and right-click exposes more actions."
+        )
         done_hint.setObjectName("SectionHint")
         done_hint.setWordWrap(True)
         done_layout.addWidget(done_hint)
@@ -771,6 +872,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.list_completed.setSpacing(4)
         self.list_completed.setMinimumHeight(220)
         self.list_completed.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.list_completed.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         done_layout.addWidget(self.list_completed, 1)
         done_row = QtWidgets.QHBoxLayout()
         self.btn_to_curation = QtWidgets.QPushButton("To Curation")
@@ -795,8 +897,46 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.log.setPlaceholderText("Pipeline output will appear here.")
         self.log.setMinimumHeight(220)
         self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        log_body = QtWidgets.QHBoxLayout()
+        log_body.setSpacing(12)
+        log_body.addWidget(self.log, 3)
+
+        step_status_panel = QtWidgets.QWidget()
+        step_status_panel.setProperty("stepStatusCard", True)
+        step_status_panel.setMinimumWidth(320)
+        step_status_panel.setMaximumWidth(420)
+        step_status_layout = QtWidgets.QVBoxLayout(step_status_panel)
+        step_status_layout.setContentsMargins(14, 14, 14, 14)
+        step_status_layout.setSpacing(10)
+        step_status_title = QtWidgets.QLabel("Current run")
+        step_status_title.setObjectName("FieldTitle")
+        self.lbl_active_run_name = QtWidgets.QLabel("No active run")
+        self.lbl_active_run_name.setObjectName("StepStatusRunName")
+        self.lbl_active_run_name.setWordWrap(True)
+        step_status_hint = QtWidgets.QLabel(
+            "Each enabled preprocessing step is tracked here while the worker writes detailed output on the left."
+        )
+        step_status_hint.setObjectName("SectionHint")
+        step_status_hint.setWordWrap(True)
+        step_status_layout.addWidget(step_status_title, 0)
+        step_status_layout.addWidget(self.lbl_active_run_name, 0)
+        step_status_layout.addWidget(step_status_hint, 0)
+
+        self.step_status_scroll = QtWidgets.QScrollArea()
+        self.step_status_scroll.setWidgetResizable(True)
+        self.step_status_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.step_status_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.step_status_host = QtWidgets.QWidget()
+        self.step_status_host_layout = QtWidgets.QVBoxLayout(self.step_status_host)
+        self.step_status_host_layout.setContentsMargins(0, 0, 0, 0)
+        self.step_status_host_layout.setSpacing(8)
+        self.step_status_scroll.setWidget(self.step_status_host)
+        step_status_layout.addWidget(self.step_status_scroll, 1)
+        log_body.addWidget(step_status_panel, 1)
+        self._step_widgets: Dict[str, StepStatusItem] = {}
+        self._clear_step_status_panel()
         log_layout.addLayout(log_header)
-        log_layout.addWidget(self.log, 1)
+        log_layout.addLayout(log_body, 1)
 
         for box in [queue_box, done_box, log_box]:
             box.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
@@ -871,6 +1011,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_copy_log.clicked.connect(self._copy_log)
         self.list_jobs.filesDropped.connect(self._consume_drop)
         self.list_completed.itemDoubleClicked.connect(lambda _item: self._open_selected_curation())
+        self.list_completed.customContextMenuRequested.connect(self._open_completed_context_menu)
         btn_output.clicked.connect(lambda: self._pick_folder(self.ed_output))
         btn_json.clicked.connect(lambda: self._pick_folder(self.ed_json))
         btn_catgt_path.clicked.connect(lambda: self._pick_folder(self.ed_catgt_path))
@@ -1080,6 +1221,236 @@ class PreprocessingTab(QtWidgets.QWidget):
             kilosort_output_tmp=self.ed_ks_tmp.text().strip(),
         )
 
+    @staticmethod
+    def _serialize_cfg(cfg: EcephysPipelineConfig) -> Dict[str, object]:
+        data = asdict(cfg)
+        return json.loads(json.dumps(data))
+
+    @staticmethod
+    def _normalize_completed_entry(entry: Dict[str, object]) -> Dict[str, object]:
+        out = {
+            "run_name": str(entry.get("run_name") or ""),
+            "ks_folder": str(entry.get("ks_folder") or ""),
+            "bin_file": str(entry.get("bin_file") or ""),
+            "label": str(entry.get("label") or ""),
+            "finished_at": str(entry.get("finished_at") or ""),
+            "job_snapshot": dict(entry.get("job_snapshot") or {}),
+            "cfg_snapshot": dict(entry.get("cfg_snapshot") or {}),
+        }
+        if not out["label"]:
+            out["label"] = f"{out['run_name']} | {out['ks_folder']}"
+        return out
+
+    def _add_completed_item(self, entry: Dict[str, object]) -> None:
+        normalized = self._normalize_completed_entry(entry)
+        item = QtWidgets.QListWidgetItem(str(normalized["label"]))
+        item.setData(QtCore.Qt.UserRole, normalized)
+        tooltip_lines = [str(normalized["ks_folder"])]
+        if normalized["finished_at"]:
+            tooltip_lines.append(f"Completed: {normalized['finished_at']}")
+        if normalized["bin_file"]:
+            tooltip_lines.append(f"Input: {normalized['bin_file']}")
+        item.setToolTip("\n".join(tooltip_lines))
+        self.list_completed.addItem(item)
+
+    def _persist_completed_history(self) -> None:
+        payload = [self._normalize_completed_entry(entry) for entry in self.completed_runs]
+        self.settings.setValue("preproc/completed_runs_history_json", json.dumps(payload))
+        self._settings_sync_timer.start()
+
+    def _restore_completed_history(self) -> None:
+        self.completed_runs.clear()
+        self.list_completed.clear()
+        raw_history = self.settings.value("preproc/completed_runs_history_json", "[]")
+        try:
+            payload = json.loads(str(raw_history) or "[]")
+        except Exception:
+            payload = []
+        if not isinstance(payload, list):
+            payload = []
+        for raw_entry in payload:
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = self._normalize_completed_entry(raw_entry)
+            if not entry["run_name"] or not entry["ks_folder"]:
+                continue
+            self.completed_runs.append(entry)
+            self._add_completed_item(entry)
+        if self.list_completed.count():
+            self.list_completed.setCurrentRow(self.list_completed.count() - 1)
+
+    def _completed_entry_from_item(self, item: QtWidgets.QListWidgetItem | None) -> Dict[str, object] | None:
+        if item is None:
+            return None
+        raw_entry = item.data(QtCore.Qt.UserRole)
+        if not isinstance(raw_entry, dict):
+            return None
+        return self._normalize_completed_entry(raw_entry)
+
+    def _selected_completed_entry(self) -> Dict[str, object] | None:
+        item = self.list_completed.currentItem()
+        if item is None and self.list_completed.count():
+            item = self.list_completed.item(self.list_completed.count() - 1)
+        return self._completed_entry_from_item(item)
+
+    def _show_completed_run_parameters(self, entry: Dict[str, object]) -> None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Run Parameters: {entry.get('run_name', '')}")
+        dlg.resize(860, 620)
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        summary = QtWidgets.QLabel(
+            f"Completed: {entry.get('finished_at') or 'unknown'}\n"
+            f"Kilosort folder: {entry.get('ks_folder', '')}\n"
+            f"Input bin: {entry.get('bin_file', '') or 'unknown'}"
+        )
+        summary.setWordWrap(True)
+        summary.setObjectName("SectionHint")
+        layout.addWidget(summary)
+
+        viewer = QtWidgets.QPlainTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setProperty("logView", True)
+        viewer.setPlainText(
+            json.dumps(
+                {
+                    "run_name": entry.get("run_name"),
+                    "finished_at": entry.get("finished_at"),
+                    "ks_folder": entry.get("ks_folder"),
+                    "bin_file": entry.get("bin_file"),
+                    "job_snapshot": entry.get("job_snapshot", {}),
+                    "cfg_snapshot": entry.get("cfg_snapshot", {}),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        layout.addWidget(viewer, 1)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        btns.button(QtWidgets.QDialogButtonBox.Close).clicked.connect(dlg.accept)
+        layout.addWidget(btns)
+        dlg.exec()
+
+    def _open_completed_folder(self, entry: Dict[str, object]) -> None:
+        folder = Path(str(entry.get("ks_folder") or ""))
+        if not folder.exists():
+            self._append_log(f"Completed folder not found: {folder}")
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
+
+    def _requeue_completed_entry(self, entry: Dict[str, object]) -> None:
+        bin_file = str(entry.get("bin_file") or "")
+        if not bin_file:
+            self._append_log(f"No input bin stored for completed run {entry.get('run_name', '')}.")
+            return
+        if not Path(bin_file).exists():
+            self._append_log(f"Input bin no longer exists: {bin_file}")
+            return
+        self._add_paths([bin_file])
+        if hasattr(self, "work_sections"):
+            self.work_sections.setCurrentIndex(0)
+        self._append_log(
+            f"Re-queued {entry.get('run_name', '')} from {bin_file}. Adjust settings if needed, then run queue."
+        )
+
+    def _open_completed_in_postprocessing(self, entry: Dict[str, object]) -> None:
+        folder = str(entry.get("ks_folder") or "")
+        if folder:
+            self.openPostProcessingRequested.emit(folder)
+
+    def _open_completed_context_menu(self, pos: QtCore.QPoint) -> None:
+        item = self.list_completed.itemAt(pos)
+        if item is None:
+            return
+        self.list_completed.setCurrentItem(item)
+        entry = self._completed_entry_from_item(item)
+        if entry is None:
+            return
+        menu = QtWidgets.QMenu(self)
+        act_open_folder = menu.addAction("Open Folder in Explorer")
+        act_view_params = menu.addAction("View Run Parameters")
+        act_requeue = menu.addAction("Re-run with New Parameters")
+        act_post = menu.addAction("Load in Post-Processing")
+        action = menu.exec(self.list_completed.viewport().mapToGlobal(pos))
+        if action is act_open_folder:
+            self._open_completed_folder(entry)
+        elif action is act_view_params:
+            self._show_completed_run_parameters(entry)
+        elif action is act_requeue:
+            self._requeue_completed_entry(entry)
+        elif action is act_post:
+            self._open_completed_in_postprocessing(entry)
+
+    def _planned_step_definitions(self, cfg: EcephysPipelineConfig) -> List[tuple[str, str]]:
+        steps: List[tuple[str, str]] = []
+        if cfg.run_catgt:
+            steps.append(("catgt_extract_only" if cfg.run_catgt_extract_only else "catgt", "CatGT extract-only" if cfg.run_catgt_extract_only else "CatGT"))
+        elif cfg.run_catgt_extract_only:
+            steps.append(("catgt_extract_only", "CatGT extract-only"))
+        if cfg.run_kilosort:
+            steps.append(("kilosort", "Kilosort"))
+        if cfg.run_kilosort_postproc:
+            steps.append(("kilosort_postproc", "Kilosort Postprocessing"))
+        if cfg.run_noise_templates:
+            steps.append(("noise_templates", "Noise Templates"))
+        if cfg.run_mean_waveforms:
+            steps.append(("mean_waveforms", "Mean Waveforms"))
+        if cfg.run_quality_metrics:
+            steps.append(("quality_metrics", "Quality Metrics"))
+        if cfg.run_tprime:
+            steps.append(("tprime", "TPrime"))
+        if cfg.run_pybombcell:
+            steps.append(("pybombcell", "py_bombcell"))
+        return steps
+
+    def _clear_step_status_panel(self) -> None:
+        self._step_widgets.clear()
+        while self.step_status_host_layout.count():
+            item = self.step_status_host_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.lbl_active_run_name.setText("No active run")
+        placeholder = QtWidgets.QLabel("Run a queue item to see live step status here.")
+        placeholder.setObjectName("SectionHint")
+        placeholder.setWordWrap(True)
+        self.step_status_host_layout.addWidget(placeholder, 0)
+        self.step_status_host_layout.addStretch(1)
+
+    def _prepare_step_status_panel(self, run_name: str, cfg: EcephysPipelineConfig) -> None:
+        self._clear_step_status_panel()
+        self.lbl_active_run_name.setText(run_name)
+        for step_key, label in self._planned_step_definitions(cfg):
+            widget = StepStatusItem(label, self.step_status_host)
+            self._step_widgets[step_key] = widget
+            self.step_status_host_layout.insertWidget(self.step_status_host_layout.count() - 1, widget)
+        if not self._step_widgets:
+            placeholder = QtWidgets.QLabel("No enabled preprocessing steps for this run.")
+            placeholder.setObjectName("SectionHint")
+            placeholder.setWordWrap(True)
+            self.step_status_host_layout.insertWidget(self.step_status_host_layout.count() - 1, placeholder)
+
+    def _on_worker_step_started(self, step_key: str, _label: str) -> None:
+        widget = self._step_widgets.get(step_key)
+        if widget is not None:
+            widget.set_running()
+
+    def _on_worker_step_progress(self, step_key: str, percent: int) -> None:
+        widget = self._step_widgets.get(step_key)
+        if widget is not None:
+            widget.set_progress(percent)
+
+    def _on_worker_step_finished(self, step_key: str, ok: bool) -> None:
+        widget = self._step_widgets.get(step_key)
+        if widget is not None:
+            if ok:
+                widget.set_finished()
+            else:
+                widget.set_failed()
+
     def _run_queue(self) -> None:
         if self._running:
             return
@@ -1107,18 +1478,33 @@ class PreprocessingTab(QtWidgets.QWidget):
 
         job = self._queue.pop(0)
         self._refresh_queue_summary()
-        worker = EcephysPipelineWorker(job, self._collect_cfg())
+        cfg = self._collect_cfg()
+        self._prepare_step_status_panel(str(job.get("name") or "Unknown run"), cfg)
+        self._active_run_context = {
+            "job_snapshot": dict(job),
+            "cfg_snapshot": self._serialize_cfg(cfg),
+        }
+        worker = EcephysPipelineWorker(job, cfg)
         worker.signals.log.connect(self._append_log)
         worker.signals.progress.connect(self.progress.setValue)
         worker.signals.error.connect(self._append_log)
+        worker.signals.stepStarted.connect(self._on_worker_step_started)
+        worker.signals.stepProgress.connect(self._on_worker_step_progress)
+        worker.signals.stepFinished.connect(self._on_worker_step_finished)
         worker.signals.finished.connect(self._on_job_finished)
         self.pool.start(worker)
 
     def _on_job_finished(self, result: Dict) -> None:
         status = "OK" if result.get("ok") else "FAILED"
         self._append_log(f"Job {result.get('job')} finished: {status}")
+        run_name = str(result.get("job", ""))
+        if not result.get("ok"):
+            if self._step_widgets and not any(widget.percent_label.text() == "Failed" for widget in self._step_widgets.values()):
+                first_widget = next(iter(self._step_widgets.values()))
+                if first_widget.percent_label.text() == "Pending":
+                    first_widget.set_failed()
+        self.lbl_active_run_name.setText(f"{run_name} ({'completed' if result.get('ok') else 'failed'})")
         if result.get("ok"):
-            run_name = str(result.get("job", ""))
             ks_folder = str(result.get("ks_folder") or "")
             if not ks_folder:
                 ks_ver = self.cb_ks_ver.currentText()
@@ -1126,12 +1512,42 @@ class PreprocessingTab(QtWidgets.QWidget):
                 ks_folder = str(
                     (Path(self.ed_output.text().strip()) / run_name / default_kilosort_output_name(ks_tag, self.ed_probe.text().strip())).resolve()
                 )
-            label = f"{run_name} | {ks_folder}"
-            self.completed_runs.append({"run_name": run_name, "ks_folder": ks_folder, "label": label})
-            item = QtWidgets.QListWidgetItem(label)
-            item.setData(QtCore.Qt.UserRole, ks_folder)
-            self.list_completed.addItem(item)
-            self.list_completed.setCurrentItem(item)
+            active_context = self._active_run_context or {}
+            entry = self._normalize_completed_entry(
+                {
+                    "run_name": run_name,
+                    "ks_folder": ks_folder,
+                    "label": f"{run_name} | {ks_folder}",
+                    "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "bin_file": str((active_context.get("job_snapshot") or {}).get("bin_file") or ""),
+                    "job_snapshot": active_context.get("job_snapshot") or {},
+                    "cfg_snapshot": active_context.get("cfg_snapshot") or {},
+                }
+            )
+            existing_index = next(
+                (idx for idx, existing in enumerate(self.completed_runs) if existing.get("ks_folder") == entry["ks_folder"]),
+                None,
+            )
+            if existing_index is None:
+                self.completed_runs.append(entry)
+                self._add_completed_item(entry)
+                target_row = self.list_completed.count() - 1
+            else:
+                self.completed_runs[existing_index] = entry
+                existing_item = self.list_completed.item(existing_index)
+                if existing_item is not None:
+                    existing_item.setText(str(entry["label"]))
+                    existing_item.setData(QtCore.Qt.UserRole, entry)
+                    tooltip_lines = [str(entry["ks_folder"])]
+                    if entry["finished_at"]:
+                        tooltip_lines.append(f"Completed: {entry['finished_at']}")
+                    if entry["bin_file"]:
+                        tooltip_lines.append(f"Input: {entry['bin_file']}")
+                    existing_item.setToolTip("\n".join(tooltip_lines))
+                target_row = existing_index
+            self.list_completed.setCurrentRow(target_row)
+            self._persist_completed_history()
+        self._active_run_context = None
         self._refresh_queue_summary()
         self._run_next()
 
@@ -1196,6 +1612,7 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self._ks4_adv_params = json.loads(raw_adv) if raw_adv else {}
             except Exception:
                 self._ks4_adv_params = {}
+            self._restore_completed_history()
         finally:
             self._restoring_settings = False
 
@@ -1298,12 +1715,16 @@ class PreprocessingTab(QtWidgets.QWidget):
         menu.exec(self.btn_recent_folders.mapToGlobal(self.btn_recent_folders.rect().bottomLeft()))
 
     def _open_selected_curation(self) -> None:
-        item = self.list_completed.currentItem()
-        if item is None and self.list_completed.count():
-            item = self.list_completed.item(self.list_completed.count() - 1)
-        folder = item.data(QtCore.Qt.UserRole) if item is not None else None
-        if folder:
-            self.openCurationRequested.emit(str(folder))
+        entry = self._selected_completed_entry()
+        if entry:
+            self.openCurationRequested.emit(str(entry.get("ks_folder") or ""))
+
+    def clear_completed_history(self) -> None:
+        self.completed_runs.clear()
+        self.list_completed.clear()
+        self.settings.remove("preproc/completed_runs_history_json")
+        self.settings.sync()
+        self._refresh_queue_summary()
 
     def is_busy(self) -> bool:
         return bool(self._running)

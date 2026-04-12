@@ -60,6 +60,26 @@ else:
 TAB_TITLES = ["Preprocessing", "Curation", "Post Processing"]
 STARTUP_TAB_OPTIONS = ["Last Used", *TAB_TITLES]
 PLOT_THEME_OPTIONS = ["Light", "Dark"]
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
+SMALL_APP_ICON_PATH = ASSET_DIR / "small.jpg"
+BIG_SPLASH_IMAGE_PATH = ASSET_DIR / "big.jpg"
+
+
+def _load_app_icon() -> QtGui.QIcon:
+    pixmap = QtGui.QPixmap(str(SMALL_APP_ICON_PATH))
+    if pixmap.isNull():
+        return QtGui.QIcon()
+    return QtGui.QIcon(pixmap)
+
+
+def _load_splash_pixmap() -> QtGui.QPixmap:
+    pixmap = QtGui.QPixmap(str(BIG_SPLASH_IMAGE_PATH))
+    if pixmap.isNull():
+        return QtGui.QPixmap()
+    max_width = min(960, pixmap.width())
+    if max_width > 0 and pixmap.width() > max_width:
+        return pixmap.scaledToWidth(max_width, QtCore.Qt.SmoothTransformation)
+    return pixmap
 
 
 class PreferencesDialog(QtWidgets.QDialog):
@@ -178,6 +198,9 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("NeuroPyGuiN")
+        app_icon = _load_app_icon()
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
         self.setMinimumSize(1180, 760)
         self._set_startup_geometry()
 
@@ -205,6 +228,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self._build_menu_bar()
 
         self.pre_tab.openCurationRequested.connect(self._open_curation)
+        self.pre_tab.openPostProcessingRequested.connect(self._open_postprocessing)
         self.pre_tab.saveSettingsFileRequested.connect(self._export_settings_file)
         self.pre_tab.loadSettingsFileRequested.connect(self._load_settings_file)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -391,6 +415,10 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
     def _open_curation(self, folder: str) -> None:
         self.cur_tab.open_ks_folder(folder)
         self.tabs.setCurrentWidget(self.cur_tab)
+
+    def _open_postprocessing(self, folder: str) -> None:
+        self.post_tab.open_ks_folder(folder)
+        self.tabs.setCurrentWidget(self.post_tab)
 
     def _restore_plot_preferences(self) -> None:
         theme = str(self.settings.value("plot/theme", "Light"))
@@ -608,7 +636,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         answer = QtWidgets.QMessageBox.question(
             self,
             "Clear Folder History",
-            "Remove saved folder history and recent-file lists for this app?",
+            "Remove saved folder history, recent-file lists, and completed-run history for this app?",
         )
         if answer != QtWidgets.QMessageBox.Yes:
             return
@@ -617,16 +645,24 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
             "paths/last_file_dir",
             "recent_files",
             "recent_folders",
+            "preproc/completed_runs_history_json",
             "curation/phy_folder",
             "curation/bomb_folder",
             "quality/last_folder",
             "post/last_folder",
         ]:
             self.settings.remove(key)
+        clear_completed_history = getattr(self.pre_tab, "clear_completed_history", None)
+        if callable(clear_completed_history):
+            clear_completed_history()
         self.cur_tab.ed_phy_folder.clear()
         self.cur_tab.ed_bomb_folder.clear()
         self.post_tab.ed_folder.clear()
-        QtWidgets.QMessageBox.information(self, "Folder History Cleared", "Saved folders and recents were cleared.")
+        QtWidgets.QMessageBox.information(
+            self,
+            "History Cleared",
+            "Saved folders, recents, and completed-run history were cleared.",
+        )
 
     def _on_tab_changed(self, index: int) -> None:
         self.settings.setValue("ui/last_tab_index", int(index))
@@ -685,12 +721,33 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("NeuroPyGuiN")
+    app.setApplicationDisplayName("NeuroPyGuiN")
+    app_icon = _load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     fusion = QtWidgets.QStyleFactory.create("Fusion")
     if fusion is not None:
         app.setStyle(fusion)
     app.setFont(QtGui.QFont("Segoe UI", 10))
+    splash = None
+    splash_pixmap = _load_splash_pixmap()
+    if not splash_pixmap.isNull():
+        splash = QtWidgets.QSplashScreen(
+            splash_pixmap,
+            QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.FramelessWindowHint,
+        )
+        splash.show()
+        splash.showMessage(
+            "Loading NeuroPyGuiN...",
+            QtCore.Qt.AlignBottom | QtCore.Qt.AlignHCenter,
+            QtGui.QColor("#f4f7ff"),
+        )
+        app.processEvents()
     win = NeuroPyGuiNMainWindow()
     win.showMaximized()
+    if splash is not None:
+        splash.finish(win)
     return app.exec()
 
 

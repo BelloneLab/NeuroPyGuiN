@@ -35,6 +35,9 @@ class WorkerSignals(QtCore.QObject):
     progress = QtCore.Signal(int)
     finished = QtCore.Signal(dict)
     error = QtCore.Signal(str)
+    stepStarted = QtCore.Signal(str, str)
+    stepProgress = QtCore.Signal(str, int)
+    stepFinished = QtCore.Signal(str, bool)
 
 
 class PipelineWorker(QtCore.QRunnable):
@@ -153,6 +156,37 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         self.job = job
         self.cfg = cfg
         self.signals = WorkerSignals()
+        self._active_step_key: str | None = None
+        self._step_progress_cache: Dict[str, int] = {}
+
+    def _begin_step(self, step_key: str, label: str) -> None:
+        self._active_step_key = step_key
+        self._step_progress_cache.pop(step_key, None)
+        _safe_emit(self.signals.stepStarted, step_key, label)
+
+    def _finish_step(self, step_key: str, ok: bool) -> None:
+        if ok:
+            _safe_emit(self.signals.stepProgress, step_key, 100)
+        _safe_emit(self.signals.stepFinished, step_key, ok)
+        if self._active_step_key == step_key:
+            self._active_step_key = None
+
+    def _emit_step_progress_from_line(self, line: str) -> None:
+        step_key = self._active_step_key
+        if not step_key:
+            return
+        matches = re.findall(r"(\d{1,3})%", str(line))
+        if not matches:
+            return
+        try:
+            percent = int(matches[-1])
+        except Exception:
+            return
+        percent = max(0, min(100, percent))
+        if self._step_progress_cache.get(step_key) == percent:
+            return
+        self._step_progress_cache[step_key] = percent
+        _safe_emit(self.signals.stepProgress, step_key, percent)
 
     def _run_module(self, module_name: str, input_json: Path, output_json: Path, cwd: str) -> List[str]:
         cmd: Sequence[str] = (
@@ -183,6 +217,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             if line:
                 lines.append(line)
                 _safe_emit(self.signals.log, line)
+                self._emit_step_progress_from_line(line)
         rc = proc.wait()
         if rc != 0:
             raise RuntimeError(f"{module_name} exited with code {rc}")
@@ -948,20 +983,38 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     run_name=run_name,
                 )
 
-            modules: List[str] = []
+            module_steps: List[Tuple[str, str, str]] = []
             if self.cfg.run_kilosort:
-                modules.append("ks4_helper" if self.cfg.ks_ver == "4" else "kilosort_helper")
+                module_steps.append(
+                    (
+                        "kilosort",
+                        "Kilosort",
+                        "ks4_helper" if self.cfg.ks_ver == "4" else "kilosort_helper",
+                    )
+                )
             if self.cfg.run_kilosort_postproc:
-                modules.append("kilosort_postprocessing")
+                module_steps.append(("kilosort_postproc", "Kilosort Postprocessing", "kilosort_postprocessing"))
             if self.cfg.run_noise_templates:
-                modules.append("noise_templates")
+                module_steps.append(("noise_templates", "Noise Templates", "noise_templates"))
             if self.cfg.run_mean_waveforms:
-                modules.append("mean_waveforms")
+                module_steps.append(("mean_waveforms", "Mean Waveforms", "mean_waveforms"))
             if self.cfg.run_quality_metrics:
-                modules.append("quality_metrics")
+                module_steps.append(("quality_metrics", "Quality Metrics", "quality_metrics"))
 
             done = 0
-            total = max(len(modules) + int(run_catgt_effective or run_catgt_extract_only) + int(self.cfg.run_tprime) + int(self.cfg.run_pybombcell), 1)
+            total = max(len(module_steps) + int(run_catgt_effective or run_catgt_extract_only) + int(self.cfg.run_tprime) + int(self.cfg.run_pybombcell), 1)
+
+            def execute_step(step_key: str, step_label: str, fn) -> None:
+                nonlocal done
+                self._begin_step(step_key, step_label)
+                try:
+                    fn()
+                except Exception:
+                    self._finish_step(step_key, False)
+                    raise
+                self._finish_step(step_key, True)
+                done += 1
+                _safe_emit(self.signals.progress, int(done * 100 / total))
 
             module_in = json_root / f"{run_name}_modules-input.json"
             module_out = json_root / f"{run_name}_modules-output.json"
@@ -972,94 +1025,10 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             processing_meta = input_meta
 
             if run_catgt_effective:
-                _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT stream selection: {full_catgt_stream}")
-                processing_bin, processing_meta = self._run_catgt_with_retries(
-                    create_input_json_fn=createInputJson,
-                    run_name=run_name,
-                    bin_file=bin_file,
-                    input_meta=input_meta,
-                    job_out=extracted_data_root,
-                    ks_tag=ks_tag,
-                    gate_string=gate_string,
-                    trigger_string=trigger_string,
-                    probe_string=probe_string,
-                    json_root=json_root,
-                    catgt_cmd_string=effective_catgt_cmd,
-                    catgt_stream_string=full_catgt_stream,
-                )
-                catgt_output_context = parse_catgt_processed_bin_context(str(processing_bin))
-                if catgt_output_context:
-                    catgt_context = catgt_output_context
-                    self._verify_ni_extractor_outputs(
-                        catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
-                        source_run_name=catgt_output_context["source_run_name"],
-                        gate_string=catgt_output_context["gate_string"],
-                        catgt_cmd_string=effective_catgt_cmd,
-                    )
-                    self._apply_extractor_labels(
-                        catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
-                        source_run_name=catgt_output_context["source_run_name"],
-                        gate_string=catgt_output_context["gate_string"],
-                        ni_extract_string=self.cfg.ni_extract_string,
-                    )
-                ks_folder = default_pipeline_ks_output_dir(
-                    str(processing_bin),
-                    ks_tag,
-                    probe_string,
-                    output_root=output_root,
-                    run_name=run_name,
-                    store_next_to_bin=True,
-                )
-                _safe_emit(
-                    self.signals.log,
-                    f"[{self.job['name']}] Using KS folder next to CatGT output: {ks_folder}",
-                )
-                done += 1
-                _safe_emit(self.signals.progress, int(done * 100 / total))
-            elif run_catgt_extract_only:
-                _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT extract-only stream selection: {extract_only_stream}")
-                if catgt_processed_input:
-                    if "-ni" in extract_only_stream.split():
-                        raise RuntimeError(
-                            "CatGT NI extract-only requires the raw session input, not a *_tcat.imecX.ap.bin file. "
-                            "The NI stream lives at the run root and CatGT output folders usually contain only the "
-                            "generated *.nidq.x*/bf* text files, not a reusable *_tcat.nidq.bin. Queue the raw "
-                            "*_gX_tY.imecX.ap.bin file for NI extraction or TPrime alignment."
-                        )
-                    if not catgt_context:
-                        raise RuntimeError("CatGT extract-only mode could not resolve the existing CatGT output layout.")
-                    self._run_catgt_extract_only(
-                        create_input_json_fn=createInputJson,
-                        processing_bin=processing_bin,
-                        processing_meta=processing_meta,
-                        extracted_data_root=extracted_data_root,
-                        ks_tag=ks_tag,
-                        session_run_name=run_name,
-                        gate_string=gate_string,
-                        probe_string=probe_string,
-                        json_root=json_root,
-                        catgt_cmd_string=extract_only_catgt_cmd,
-                        catgt_stream_string=extract_only_stream,
-                        catgt_context=catgt_context,
-                    )
-                    self._verify_ni_extractor_outputs(
-                        catgt_run_dir=Path(catgt_context["catgt_run_dir"]),
-                        source_run_name=catgt_context["source_run_name"],
-                        gate_string=catgt_context["gate_string"],
-                        catgt_cmd_string=effective_catgt_cmd,
-                    )
-                    self._apply_extractor_labels(
-                        catgt_run_dir=Path(catgt_context["catgt_run_dir"]),
-                        source_run_name=catgt_context["source_run_name"],
-                        gate_string=catgt_context["gate_string"],
-                        ni_extract_string=self.cfg.ni_extract_string,
-                    )
-                else:
-                    _safe_emit(
-                        self.signals.log,
-                        f"[{self.job['name']}] Running CatGT extract-only from raw AP input: {bin_file}",
-                    )
-                    extract_context = self._run_catgt_extract_only_from_raw(
+                def _run_catgt_step() -> None:
+                    nonlocal processing_bin, processing_meta, catgt_context, ks_folder
+                    _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT stream selection: {full_catgt_stream}")
+                    processing_bin, processing_meta = self._run_catgt_with_retries(
                         create_input_json_fn=createInputJson,
                         run_name=run_name,
                         bin_file=bin_file,
@@ -1070,25 +1039,113 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         trigger_string=trigger_string,
                         probe_string=probe_string,
                         json_root=json_root,
-                        catgt_cmd_string=extract_only_catgt_cmd,
-                        catgt_stream_string=extract_only_stream,
+                        catgt_cmd_string=effective_catgt_cmd,
+                        catgt_stream_string=full_catgt_stream,
                     )
-                    if extract_context:
-                        catgt_context = extract_context
+                    catgt_output_context = parse_catgt_processed_bin_context(str(processing_bin))
+                    if catgt_output_context:
+                        catgt_context = catgt_output_context
                         self._verify_ni_extractor_outputs(
-                            catgt_run_dir=Path(extract_context["catgt_run_dir"]),
-                            source_run_name=extract_context["source_run_name"],
-                            gate_string=extract_context["gate_string"],
+                            catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
+                            source_run_name=catgt_output_context["source_run_name"],
+                            gate_string=catgt_output_context["gate_string"],
                             catgt_cmd_string=effective_catgt_cmd,
                         )
                         self._apply_extractor_labels(
-                            catgt_run_dir=Path(extract_context["catgt_run_dir"]),
-                            source_run_name=extract_context["source_run_name"],
-                            gate_string=extract_context["gate_string"],
+                            catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
+                            source_run_name=catgt_output_context["source_run_name"],
+                            gate_string=catgt_output_context["gate_string"],
                             ni_extract_string=self.cfg.ni_extract_string,
                         )
-                done += 1
-                _safe_emit(self.signals.progress, int(done * 100 / total))
+                    ks_folder = default_pipeline_ks_output_dir(
+                        str(processing_bin),
+                        ks_tag,
+                        probe_string,
+                        output_root=output_root,
+                        run_name=run_name,
+                        store_next_to_bin=True,
+                    )
+                    _safe_emit(
+                        self.signals.log,
+                        f"[{self.job['name']}] Using KS folder next to CatGT output: {ks_folder}",
+                    )
+
+                execute_step("catgt", "CatGT", _run_catgt_step)
+            elif run_catgt_extract_only:
+                def _run_catgt_extract_only_step() -> None:
+                    nonlocal catgt_context
+                    _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT extract-only stream selection: {extract_only_stream}")
+                    if catgt_processed_input:
+                        if "-ni" in extract_only_stream.split():
+                            raise RuntimeError(
+                                "CatGT NI extract-only requires the raw session input, not a *_tcat.imecX.ap.bin file. "
+                                "The NI stream lives at the run root and CatGT output folders usually contain only the "
+                                "generated *.nidq.x*/bf* text files, not a reusable *_tcat.nidq.bin. Queue the raw "
+                                "*_gX_tY.imecX.ap.bin file for NI extraction or TPrime alignment."
+                            )
+                        if not catgt_context:
+                            raise RuntimeError("CatGT extract-only mode could not resolve the existing CatGT output layout.")
+                        self._run_catgt_extract_only(
+                            create_input_json_fn=createInputJson,
+                            processing_bin=processing_bin,
+                            processing_meta=processing_meta,
+                            extracted_data_root=extracted_data_root,
+                            ks_tag=ks_tag,
+                            session_run_name=run_name,
+                            gate_string=gate_string,
+                            probe_string=probe_string,
+                            json_root=json_root,
+                            catgt_cmd_string=extract_only_catgt_cmd,
+                            catgt_stream_string=extract_only_stream,
+                            catgt_context=catgt_context,
+                        )
+                        self._verify_ni_extractor_outputs(
+                            catgt_run_dir=Path(catgt_context["catgt_run_dir"]),
+                            source_run_name=catgt_context["source_run_name"],
+                            gate_string=catgt_context["gate_string"],
+                            catgt_cmd_string=effective_catgt_cmd,
+                        )
+                        self._apply_extractor_labels(
+                            catgt_run_dir=Path(catgt_context["catgt_run_dir"]),
+                            source_run_name=catgt_context["source_run_name"],
+                            gate_string=catgt_context["gate_string"],
+                            ni_extract_string=self.cfg.ni_extract_string,
+                        )
+                    else:
+                        _safe_emit(
+                            self.signals.log,
+                            f"[{self.job['name']}] Running CatGT extract-only from raw AP input: {bin_file}",
+                        )
+                        extract_context = self._run_catgt_extract_only_from_raw(
+                            create_input_json_fn=createInputJson,
+                            run_name=run_name,
+                            bin_file=bin_file,
+                            input_meta=input_meta,
+                            job_out=extracted_data_root,
+                            ks_tag=ks_tag,
+                            gate_string=gate_string,
+                            trigger_string=trigger_string,
+                            probe_string=probe_string,
+                            json_root=json_root,
+                            catgt_cmd_string=extract_only_catgt_cmd,
+                            catgt_stream_string=extract_only_stream,
+                        )
+                        if extract_context:
+                            catgt_context = extract_context
+                            self._verify_ni_extractor_outputs(
+                                catgt_run_dir=Path(extract_context["catgt_run_dir"]),
+                                source_run_name=extract_context["source_run_name"],
+                                gate_string=extract_context["gate_string"],
+                                catgt_cmd_string=effective_catgt_cmd,
+                            )
+                            self._apply_extractor_labels(
+                                catgt_run_dir=Path(extract_context["catgt_run_dir"]),
+                                source_run_name=extract_context["source_run_name"],
+                                gate_string=extract_context["gate_string"],
+                                ni_extract_string=self.cfg.ni_extract_string,
+                            )
+
+                execute_step("catgt_extract_only", "CatGT extract-only", _run_catgt_extract_only_step)
 
             if self.cfg.run_kilosort:
                 archived_ks = archive_output_dir(ks_folder)
@@ -1190,62 +1247,68 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             if self.cfg.ks_ver == "4":
                 self._apply_ks4_overrides(module_in, self.cfg.ks4_advanced_params)
 
-            for module in modules:
-                self._run_module(module, module_in, module_out, self.job["workdir"])
-                done += 1
-                _safe_emit(self.signals.progress, int(done * 100 / total))
+            for step_key, step_label, module_name in module_steps:
+                execute_step(
+                    step_key,
+                    step_label,
+                    lambda module_name=module_name: self._run_module(module_name, module_in, module_out, self.job["workdir"]),
+                )
 
             if self.cfg.run_tprime:
-                createInputJson(
-                    str(tprime_in),
-                    npx_directory=str(processing_bin.parent),
-                    continuous_file=str(processing_bin),
-                    input_meta_path=str(processing_meta),
-                    extracted_data_directory=str(extracted_data_root),
-                    kilosort_output_directory=str(ks_folder),
-                    catGT_run_name=run_name,
-                    gate_string=gate_string,
-                    trigger_string=trigger_string,
-                    probe_string=probe_string,
-                    tPrime_ni_ex_list=re.sub(r"\[[^\]]*\]", "", self.cfg.ni_extract_string),
-                    sync_period=self.cfg.sync_period,
-                    toStream_sync_params=self.cfg.tostream_sync_params,
-                    ks_output_tag=ks_tag,
-                    external_catgt_path=str(catgt_dir),
-                    external_tprime_path=str(tprime_dir),
-                    external_cwaves_path=str(cwaves_dir),
-                    external_ks4_repo_path=self.cfg.ks4_repo_path,
-                    external_kilosort_output_tmp=self.cfg.kilosort_output_tmp,
-                )
-                self._run_module("tPrime_helper", tprime_in, tprime_out, self.job["workdir"])
-                tprime_context = resolve_labelled_output_context(str(processing_bin), catgt_context)
-                if tprime_context:
-                    self._apply_extractor_labels(
-                        catgt_run_dir=Path(tprime_context["catgt_run_dir"]),
-                        source_run_name=tprime_context["source_run_name"],
-                        gate_string=tprime_context["gate_string"],
-                        ni_extract_string=self.cfg.ni_extract_string,
+                def _run_tprime_step() -> None:
+                    createInputJson(
+                        str(tprime_in),
+                        npx_directory=str(processing_bin.parent),
+                        continuous_file=str(processing_bin),
+                        input_meta_path=str(processing_meta),
+                        extracted_data_directory=str(extracted_data_root),
+                        kilosort_output_directory=str(ks_folder),
+                        catGT_run_name=run_name,
+                        gate_string=gate_string,
+                        trigger_string=trigger_string,
+                        probe_string=probe_string,
+                        tPrime_ni_ex_list=re.sub(r"\[[^\]]*\]", "", self.cfg.ni_extract_string),
+                        sync_period=self.cfg.sync_period,
+                        toStream_sync_params=self.cfg.tostream_sync_params,
+                        ks_output_tag=ks_tag,
+                        external_catgt_path=str(catgt_dir),
+                        external_tprime_path=str(tprime_dir),
+                        external_cwaves_path=str(cwaves_dir),
+                        external_ks4_repo_path=self.cfg.ks4_repo_path,
+                        external_kilosort_output_tmp=self.cfg.kilosort_output_tmp,
                     )
-                done += 1
-                _safe_emit(self.signals.progress, int(done * 100 / total))
+                    self._run_module("tPrime_helper", tprime_in, tprime_out, self.job["workdir"])
+                    tprime_context = resolve_labelled_output_context(str(processing_bin), catgt_context)
+                    if tprime_context:
+                        self._apply_extractor_labels(
+                            catgt_run_dir=Path(tprime_context["catgt_run_dir"]),
+                            source_run_name=tprime_context["source_run_name"],
+                            gate_string=tprime_context["gate_string"],
+                            ni_extract_string=self.cfg.ni_extract_string,
+                        )
+
+                execute_step("tprime", "TPrime", _run_tprime_step)
 
             if self.cfg.run_pybombcell:
                 from .pybombcell_integration import run_pybombcell_on_folder
 
-                ks_folder_str = str(ks_folder)
-                _safe_emit(self.signals.log, f"[{self.job['name']}] Running py_bombcell on {ks_folder_str}")
-                payload = run_pybombcell_on_folder(ks_folder_str, save_plots=True)
-                _safe_emit(
-                    self.signals.log,
-                    f"[{self.job['name']}] py_bombcell done: units={payload.get('n_units', 'NA')} "
-                    f"metrics={payload.get('metrics_csv', '')}"
-                )
-                done += 1
-                _safe_emit(self.signals.progress, int(done * 100 / total))
+                def _run_pybombcell_step() -> None:
+                    ks_folder_str = str(ks_folder)
+                    _safe_emit(self.signals.log, f"[{self.job['name']}] Running py_bombcell on {ks_folder_str}")
+                    payload = run_pybombcell_on_folder(ks_folder_str, save_plots=True)
+                    _safe_emit(
+                        self.signals.log,
+                        f"[{self.job['name']}] py_bombcell done: units={payload.get('n_units', 'NA')} "
+                        f"metrics={payload.get('metrics_csv', '')}"
+                    )
+
+                execute_step("pybombcell", "py_bombcell", _run_pybombcell_step)
 
             _safe_emit(self.signals.finished, {"job": self.job["name"], "ok": True, "ks_folder": str(ks_folder.resolve())})
         except Exception as exc:
             tb = traceback.format_exc()
+            if self._active_step_key:
+                self._finish_step(self._active_step_key, False)
             _safe_emit(self.signals.error, f"{self.job['name']} failed: {exc}")
             _safe_emit(self.signals.error, tb)
             _safe_emit(self.signals.finished, {"job": self.job["name"], "ok": False})
