@@ -19,9 +19,11 @@ from ..bombcell_core import (
     bombcell_get_default_thresholds,
     bombcell_label_units_from_metrics,
     run_bombcell_on_folder_with_thresholds,
+    sync_phy_cluster_group,
 )
 from ..ecephys_runtime import ecephys_subprocess_env
 from ..ks_output_resolver import find_kilosort_output_dir, find_metrics_file
+from ..phy_integration import ensure_phy_short_isi_plugin
 from ..pybombcell_integration import run_pybombcell_on_folder
 from ..side_nav import SideNavStack
 from ..workers import FunctionWorker
@@ -522,6 +524,20 @@ class CurationTab(QtWidgets.QWidget):
         repair_message = _repair_phy_params_path(folder)
         if repair_message:
             self._log(repair_message)
+        try:
+            plugin_status = ensure_phy_short_isi_plugin()
+            if plugin_status.get("plugin_updated") or plugin_status.get("config_updated"):
+                self._log("Phy plugin ready: added `Split short ISI` context-menu action.")
+            if plugin_status.get("gamepad_plugin_updated"):
+                self._log("Phy gamepad plugin ready: controller curation + gamification enabled.")
+        except Exception as exc:
+            self._log(f"Could not install NeuroPyGuiN Phy plugin: {exc}")
+        sync_result = sync_phy_cluster_group(folder, force=False)
+        if sync_result.get("updated"):
+            self._log(
+                f"Updated cluster_group.tsv from {sync_result.get('source', 'labels')} "
+                f"({sync_result.get('n_units', 0)} units)"
+            )
 
         if self.phy_process.state() != QtCore.QProcess.NotRunning:
             self._log("Phy is already running.")
@@ -855,6 +871,12 @@ class CurationTab(QtWidgets.QWidget):
             )
         else:
             self._log(f"py_bombcell completed | units={payload.get('n_units', 'NA')} | plots={payload.get('plots_dir', '')}")
+        sync_result = payload.get("phy_group_sync", {})
+        if isinstance(sync_result, dict) and sync_result.get("updated"):
+            self._log(
+                f"Updated cluster_group.tsv from {sync_result.get('source', 'labels')} "
+                f"({sync_result.get('n_units', 0)} units)"
+            )
         self._load_metrics(allow_compute=False)
 
     def _on_compute_metrics_finished(self, result: Dict, folder: Path) -> None:
@@ -1212,6 +1234,12 @@ class CurationTab(QtWidgets.QWidget):
             f"good={counts.get('good', 0)} noise={counts.get('noise', 0)} "
             f"mua={counts.get('mua', 0)} non_soma={counts.get('non_soma', 0)}"
         )
+        sync_result = payload.get("phy_group_sync", {})
+        if isinstance(sync_result, dict) and sync_result.get("updated"):
+            self._log(
+                f"Updated cluster_group.tsv from {sync_result.get('source', 'labels')} "
+                f"({sync_result.get('n_units', 0)} units)"
+            )
         self._recompute_preview()
 
     def _log(self, line: str) -> None:

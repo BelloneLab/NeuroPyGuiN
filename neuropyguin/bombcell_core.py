@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -111,6 +111,109 @@ def run_bombcell_on_folder(folder: str) -> Dict:
     return run_bombcell_on_folder_with_thresholds(folder=folder, thresholds=None)
 
 
+def _normalize_label_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    cols = [str(c) for c in out.columns]
+    if "cluster_id" in cols:
+        out = out.set_index("cluster_id", drop=True)
+    elif "unit_id" in cols:
+        out = out.set_index("unit_id", drop=True)
+    elif cols:
+        c0 = cols[0]
+        if c0.lower().startswith("unnamed") or c0.lower() in {"id", "cluster", "unit"}:
+            out = out.set_index(c0, drop=True)
+    try:
+        idx = pd.to_numeric(out.index, errors="coerce")
+        valid = ~pd.isna(idx)
+        if valid.any():
+            out = out.loc[valid]
+            out.index = idx[valid].astype(int)
+    except Exception:
+        pass
+    return out
+
+
+def _labels_to_phy_groups(labels: pd.Series) -> pd.Series:
+    out = labels.astype(str).str.strip().str.lower()
+    remap = {
+        "non-soma": "non_soma",
+        "non soma": "non_soma",
+        "non_somatic": "non_soma",
+    }
+    out = out.map(lambda v: remap.get(v, v))
+    return out
+
+
+def _read_label_source_for_phy(ks_folder: Path) -> Tuple[Optional[pd.Series], str]:
+    bombcell_csv = ks_folder / "bombcell_labels.csv"
+    if bombcell_csv.exists():
+        try:
+            df = _normalize_label_df(pd.read_csv(bombcell_csv))
+            if "bombcell_label" in df.columns:
+                return _labels_to_phy_groups(df["bombcell_label"]), "bombcell_labels.csv"
+        except Exception:
+            pass
+
+    ks_label_tsv = ks_folder / "cluster_KSLabel.tsv"
+    if ks_label_tsv.exists():
+        try:
+            df = _normalize_label_df(pd.read_csv(ks_label_tsv, sep="\t"))
+            if "KSLabel" in df.columns:
+                return _labels_to_phy_groups(df["KSLabel"]), "cluster_KSLabel.tsv"
+        except Exception:
+            pass
+
+    return None, ""
+
+
+def sync_phy_cluster_group(ks_folder: str | Path, force: bool = False) -> Dict[str, object]:
+    folder = Path(ks_folder)
+    source_labels, source_name = _read_label_source_for_phy(folder)
+    if source_labels is None or source_labels.empty:
+        return {
+            "updated": False,
+            "reason": "no_label_source",
+            "path": str(folder / "cluster_group.tsv"),
+            "source": source_name,
+        }
+
+    group_path = folder / "cluster_group.tsv"
+    existing: Optional[pd.Series] = None
+    if group_path.exists():
+        try:
+            current_df = _normalize_label_df(pd.read_csv(group_path, sep="\t"))
+            if "group" in current_df.columns:
+                existing = _labels_to_phy_groups(current_df["group"])
+        except Exception:
+            existing = None
+
+    should_write = force or (existing is None)
+    if existing is not None and not force:
+        has_good = bool((existing == "good").any())
+        all_noise = bool((existing == "noise").all()) if len(existing) else False
+        source_has_non_noise = bool((source_labels != "noise").any())
+        should_write = (not has_good) and all_noise and source_has_non_noise
+
+    if not should_write:
+        return {
+            "updated": False,
+            "reason": "existing_kept",
+            "path": str(group_path),
+            "source": source_name,
+        }
+
+    out = pd.DataFrame({"cluster_id": source_labels.index.astype(int), "group": source_labels.values})
+    out = out.sort_values("cluster_id")
+    out.to_csv(group_path, sep="\t", index=False)
+    return {
+        "updated": True,
+        "reason": "written",
+        "path": str(group_path),
+        "source": source_name,
+        "n_units": int(len(out)),
+    }
+
+
 def run_bombcell_on_folder_with_thresholds(folder: str, thresholds: Optional[dict] = None) -> Dict:
     ks_folder = Path(folder)
     metrics_path = ks_folder / "metrics.csv"
@@ -126,6 +229,12 @@ def run_bombcell_on_folder_with_thresholds(folder: str, thresholds: Optional[dic
     labels = bombcell_label_units_from_metrics(metrics, thresholds=thresholds)
     out = ks_folder / "bombcell_labels.csv"
     labels.to_csv(out)
+    sync_result = sync_phy_cluster_group(ks_folder, force=True)
 
     counts = labels["bombcell_label"].value_counts().to_dict()
-    return {"output": str(out), "n_units": int(len(labels)), "counts": counts}
+    return {
+        "output": str(out),
+        "n_units": int(len(labels)),
+        "counts": counts,
+        "phy_group_sync": sync_result,
+    }

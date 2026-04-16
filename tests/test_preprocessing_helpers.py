@@ -3,18 +3,23 @@ from __future__ import annotations
 from pathlib import Path
 
 from neuropyguin.preprocessing import (
+    catgt_extract_command_string,
     catgt_extract_only_flags,
     catgt_extract_only_stream_string,
+    catgt_extract_stream_selection,
     catgt_stream_string,
     default_kilosort_output_name,
     default_local_ks_output_dir,
     default_pipeline_output_dir,
     default_pipeline_ks_output_dir,
+    discover_completed_runs,
     expected_ni_catgt_output_patterns,
     extractor_label_rename_map,
     has_ni_catgt_extractors,
+    infer_completed_run_name,
     is_catgt_processed_bin,
     merge_extractors_into_catgt_command,
+    parse_kilosort_params_dat_path,
     parse_catgt_processed_bin_context,
     resolve_labelled_output_context,
     parse_spikeglx_bin_name,
@@ -80,6 +85,26 @@ def test_default_pipeline_ks_output_dir_uses_root_for_raw_inputs() -> None:
             "0",
             output_root=r"D:\sorting",
             run_name="vocal01",
+        )
+        == expected
+    )
+
+
+def test_default_pipeline_ks_output_dir_can_mirror_raw_inputs_into_spike_sorting() -> None:
+    bin_file = Path(
+        r"B:\NPX\rawData\VTA_NPX\31101\1\31101_1_NPX_basal_g0\31101_1_NPX_basal_g0_imec0\31101_1_NPX_basal_g0_t0.imec0.ap.bin"
+    )
+    expected = Path(
+        r"B:\NPX\processedData\VTA_NPX\31101\1\spike_sorting\imec0_ks4"
+    )
+    assert (
+        default_pipeline_ks_output_dir(
+            str(bin_file),
+            "ks4",
+            "0",
+            output_root=r"B:\NPX\processedData",
+            run_name="31101_1_NPX_basal",
+            mirror_raw_hierarchy=True,
         )
         == expected
     )
@@ -164,6 +189,18 @@ def test_catgt_extract_only_flags_keep_extractors_but_strip_filtering() -> None:
     assert catgt_extract_only_flags(cmd) == "-prb_fld -out_prb_fld -xa=0,0,0,2,0,0 -xd=0,0,8,3,0 -no_tshift"
 
 
+def test_catgt_extract_command_string_keeps_full_command_when_ap_save_enabled() -> None:
+    cmd = "-prb_fld -out_prb_fld -apfilter=butter,12,300,10000 -gfix=0.4,0.1,0.02 -xd=0,0,8,3,0"
+    assert catgt_extract_command_string(cmd, save_ap_bin=True) == cmd
+    assert catgt_extract_command_string(cmd, save_ap_bin=False) == "-prb_fld -out_prb_fld -xd=0,0,8,3,0 -no_tshift"
+
+
+def test_catgt_extract_stream_selection_forces_ap_when_ap_save_enabled() -> None:
+    cmd = "-prb_fld -out_prb_fld"
+    assert catgt_extract_stream_selection(cmd, save_ap_bin=False) == ""
+    assert catgt_extract_stream_selection(cmd, save_ap_bin=True) == "-ap"
+
+
 def test_merge_extractors_into_catgt_command_replaces_existing_extractor_tokens() -> None:
     cmd = "-prb_fld -out_prb_fld -gfix=0.4,0.1,0.02 -xa=0,0,0,2,0,0"
     extractors = "-xa=0,0,0,1.1,0,0 -xa=0,0,1,1.1,0,0"
@@ -186,6 +223,53 @@ def test_parse_catgt_processed_bin_context_returns_run_root_details() -> None:
         "trigger_string": "cat",
         "probe_string": "0",
     }
+
+
+def test_parse_kilosort_params_dat_path_reads_dat_path_line(tmp_path: Path) -> None:
+    params = tmp_path / "params.py"
+    params.write_text("sample_rate = 30000\ndat_path = 'B:/NPX/rawData/VTA_NPX/31098/2/run_g0/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n", encoding="utf-8")
+    assert parse_kilosort_params_dat_path(params) == r"B:\NPX\rawData\VTA_NPX\31098\2\run_g0\run_g0_imec0\run_g0_t0.imec0.ap.bin"
+
+
+def test_infer_completed_run_name_prefers_catgt_ancestor() -> None:
+    ks_folder = Path(
+        r"B:\NPX\processedData\VTA_NPX\31098\2\spike_sorting\catgt_31098_2_NPX_object_social_food_g0\31098_2_NPX_object_social_food_g0_imec0\imec0_ks4"
+    )
+    assert infer_completed_run_name(ks_folder) == "31098_2_NPX_object_social_food"
+
+
+def test_discover_completed_runs_finds_kilosort_outputs_under_processed_root(tmp_path: Path) -> None:
+    processed_root = tmp_path / "processedData"
+    ks_folder = (
+        processed_root
+        / "VTA_NPX"
+        / "31098"
+        / "2"
+        / "spike_sorting"
+        / "catgt_31098_2_NPX_object_social_food_g0"
+        / "31098_2_NPX_object_social_food_g0_imec0"
+        / "imec0_ks4"
+    )
+    ks_folder.mkdir(parents=True)
+    params_file = ks_folder / "params.py"
+    params_file.write_text(
+        "sample_rate = 30000\n"
+        "dat_path = 'B:/NPX/rawData/VTA_NPX/31098/2/31098_2_NPX_object_social_food_g0/"
+        "31098_2_NPX_object_social_food_g0_imec0/31098_2_NPX_object_social_food_g0_t0.imec0.ap.bin'\n",
+        encoding="utf-8",
+    )
+
+    entries = discover_completed_runs(processed_root)
+
+    assert len(entries) == 1
+    assert entries[0]["run_name"] == "31098_2_NPX_object_social_food"
+    assert entries[0]["ks_folder"] == str(ks_folder.resolve())
+    assert entries[0]["bin_file"] == (
+        r"B:\NPX\rawData\VTA_NPX\31098\2\31098_2_NPX_object_social_food_g0"
+        r"\31098_2_NPX_object_social_food_g0_imec0\31098_2_NPX_object_social_food_g0_t0.imec0.ap.bin"
+    )
+    assert entries[0]["params_file"] == str(params_file.resolve())
+    assert entries[0]["source_root"] == str(processed_root.resolve())
 
 
 def test_resolve_labelled_output_context_falls_back_to_existing_catgt_context_for_raw_input() -> None:

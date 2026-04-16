@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -219,6 +220,27 @@ def catgt_extract_only_stream_string(catgt_command: str, ni_extract_string: str 
     return " ".join(out)
 
 
+def catgt_extract_command_string(catgt_command: str, *, save_ap_bin: bool = False) -> str:
+    if save_ap_bin:
+        return str(catgt_command).strip()
+    return catgt_extract_only_flags(catgt_command)
+
+
+def catgt_extract_stream_selection(catgt_command: str, ni_extract_string: str = "", *, save_ap_bin: bool = False) -> str:
+    stream = catgt_extract_only_stream_string(catgt_command, ni_extract_string)
+    if not save_ap_bin:
+        return stream
+    parts = [part for part in str(stream).split() if part.strip()]
+    lowered = [part.lower() for part in parts]
+    if "-ap" not in lowered:
+        parts.insert(0, "-ap")
+    out: List[str] = []
+    for part in parts:
+        if part not in out:
+            out.append(part)
+    return " ".join(out)
+
+
 def catgt_extract_only_flags(catgt_command: str) -> str:
     keep_exact = {"-prb_fld", "-out_prb_fld", "-prb_miss_ok", "-t_miss_ok", "-no_auto_sync"}
     parts: List[str] = []
@@ -236,6 +258,73 @@ def catgt_extract_only_flags(catgt_command: str) -> str:
 def is_catgt_processed_bin(bin_file: str) -> bool:
     name = Path(bin_file).name.lower()
     return "catgt" in name or "tcat" in name
+
+
+def _is_kilosort_output_dir_name(name: str) -> bool:
+    return bool(re.fullmatch(r"(?:imec\d+_ks\d+|ks(?:2|25|3|4))", str(name).strip(), flags=re.IGNORECASE))
+
+
+def parse_kilosort_params_dat_path(params_file: str | Path) -> str:
+    path = Path(params_file)
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    match = re.search(r"(?m)^\s*dat_path\s*=\s*['\"]([^'\"]+)['\"]", text)
+    if not match:
+        return ""
+    raw = match.group(1).strip()
+    if not raw:
+        return ""
+    return str(Path(raw.replace("/", "\\")))
+
+
+def infer_completed_run_name(ks_folder: str | Path) -> str:
+    folder = Path(ks_folder)
+    for parent in [folder.parent, *folder.parents]:
+        match = re.fullmatch(r"catgt_(?P<run>.+)_g\d+", parent.name, flags=re.IGNORECASE)
+        if match:
+            return match.group("run").replace(" ", "_")
+        match = re.fullmatch(r"(?P<run>.+)_g\d+_imec\d+", parent.name, flags=re.IGNORECASE)
+        if match:
+            return match.group("run").replace(" ", "_")
+    return folder.parent.name.replace(" ", "_")
+
+
+def discover_completed_runs(root_path: str | Path) -> List[Dict[str, str]]:
+    root = Path(root_path).expanduser()
+    if not root.is_dir():
+        return []
+
+    entries: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for params_file in sorted(root.rglob("params.py"), key=lambda p: p.stat().st_mtime, reverse=True):
+        ks_folder = params_file.parent
+        if not _is_kilosort_output_dir_name(ks_folder.name):
+            continue
+        ks_folder_str = str(ks_folder.resolve())
+        if ks_folder_str in seen:
+            continue
+        seen.add(ks_folder_str)
+        bin_file = parse_kilosort_params_dat_path(params_file)
+        run_name = ""
+        if bin_file:
+            run_name = str(parse_spikeglx_bin_name(bin_file).get("run_name") or "").strip()
+        if not run_name:
+            run_name = infer_completed_run_name(ks_folder)
+        finished_at = datetime.fromtimestamp(params_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        entries.append(
+            {
+                "run_name": run_name,
+                "ks_folder": ks_folder_str,
+                "bin_file": bin_file,
+                "label": f"{run_name} | {ks_folder_str}",
+                "finished_at": finished_at,
+                "params_file": str(params_file.resolve()),
+                "source_root": str(root.resolve()),
+            }
+        )
+    return entries
 
 
 def default_kilosort_output_name(ks_tag: str, probe_string: str) -> str:
@@ -325,10 +414,19 @@ def default_pipeline_ks_output_dir(
     output_root: str | Path,
     run_name: str,
     store_next_to_bin: bool = False,
+    mirror_raw_hierarchy: bool = False,
 ) -> Path:
     if store_next_to_bin or is_catgt_processed_bin(bin_file):
         return default_local_ks_output_dir(bin_file, ks_tag, probe_string)
-    return Path(output_root).expanduser() / str(run_name).strip() / default_kilosort_output_name(ks_tag, probe_string)
+    root = Path(output_root).expanduser()
+    if mirror_raw_hierarchy:
+        return default_pipeline_output_dir(
+            bin_file,
+            root,
+            run_name=run_name,
+            mirror_raw_hierarchy=True,
+        ) / default_kilosort_output_name(ks_tag, probe_string)
+    return root / str(run_name).strip() / default_kilosort_output_name(ks_tag, probe_string)
 
 
 def write_step_json(path: Path, payload: Dict) -> None:

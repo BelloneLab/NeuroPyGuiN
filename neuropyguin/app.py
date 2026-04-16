@@ -63,6 +63,7 @@ PLOT_THEME_OPTIONS = ["Light", "Dark"]
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
 SMALL_APP_ICON_PATH = ASSET_DIR / "small.jpg"
 BIG_SPLASH_IMAGE_PATH = ASSET_DIR / "big.jpg"
+WINDOWS_APP_ID = "BelloneLab.NeuroPyGuiN"
 
 
 def _load_app_icon() -> QtGui.QIcon:
@@ -80,6 +81,17 @@ def _load_splash_pixmap() -> QtGui.QPixmap:
     if max_width > 0 and pixmap.width() > max_width:
         return pixmap.scaledToWidth(max_width, QtCore.Qt.SmoothTransformation)
     return pixmap
+
+
+def _set_windows_taskbar_app_id() -> None:
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+    except Exception:
+        pass
 
 
 class PreferencesDialog(QtWidgets.QDialog):
@@ -720,6 +732,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    _set_windows_taskbar_app_id()
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("NeuroPyGuiN")
     app.setApplicationDisplayName("NeuroPyGuiN")

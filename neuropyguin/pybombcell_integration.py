@@ -6,6 +6,7 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
+from .bombcell_core import sync_phy_cluster_group
 from .pybombcell_runtime import ensure_pybombcell_on_sys_path
 
 
@@ -96,6 +97,7 @@ def run_pybombcell_on_folder(ks_folder: str, save_plots: bool = True, force_reco
 
     labels = pd.DataFrame({"cluster_id": np.asarray(out_param["unique_templates"], dtype=int), "bombcell_label": unit_type_string})
     labels.to_csv(labels_csv, index=False)
+    sync_result = sync_phy_cluster_group(ks, force=True)
 
     return {
         "metrics_csv": str(out_csv),
@@ -103,4 +105,5 @@ def run_pybombcell_on_folder(ks_folder: str, save_plots: bool = True, force_reco
         "plots_dir": str(plots_dir),
         "n_units": int(len(labels)),
         "cached": False,
+        "phy_group_sync": sync_result,
     }

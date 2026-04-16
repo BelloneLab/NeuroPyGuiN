@@ -116,6 +116,7 @@ class EcephysPipelineConfig:
     output_root: str
     json_root: str
     mirror_raw_hierarchy_output: bool
+    save_catgt_ap_bin: bool
     run_catgt: bool
     run_catgt_extract_only: bool
     run_tprime: bool
@@ -846,8 +847,8 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         try:
             from ecephys_spike_sorting.scripts.create_input_json import createInputJson
             from .preprocessing import (
-                catgt_extract_only_flags,
-                catgt_extract_only_stream_string,
+                catgt_extract_command_string,
+                catgt_extract_stream_selection,
                 catgt_stream_string,
                 default_kilosort_output_name,
                 default_pipeline_output_dir,
@@ -914,8 +915,24 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     f"[{self.job['name']}] Merged extractor field into CatGT command: {effective_catgt_cmd}",
                 )
             full_catgt_stream = catgt_stream_string(effective_catgt_cmd)
-            extract_only_catgt_cmd = catgt_extract_only_flags(effective_catgt_cmd)
-            extract_only_stream = catgt_extract_only_stream_string(effective_catgt_cmd)
+            extract_only_catgt_cmd = catgt_extract_command_string(
+                effective_catgt_cmd,
+                save_ap_bin=False,
+            )
+            extract_only_stream = catgt_extract_stream_selection(
+                effective_catgt_cmd,
+                self.cfg.ni_extract_string,
+                save_ap_bin=False,
+            )
+            extract_only_save_ap_cmd = catgt_extract_command_string(
+                effective_catgt_cmd,
+                save_ap_bin=self.cfg.save_catgt_ap_bin,
+            )
+            extract_only_save_ap_stream = catgt_extract_stream_selection(
+                effective_catgt_cmd,
+                self.cfg.ni_extract_string,
+                save_ap_bin=self.cfg.save_catgt_ap_bin,
+            )
             if has_ni_catgt_extractors(effective_catgt_cmd):
                 expected_ni = expected_ni_catgt_output_patterns(effective_catgt_cmd, run_name, gate_string)
                 if expected_ni:
@@ -946,6 +963,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     probe_string,
                     output_root=output_root,
                     run_name=run_name,
+                    mirror_raw_hierarchy=self.cfg.mirror_raw_hierarchy_output,
                 )
                 if not self.cfg.run_kilosort:
                     resolved_local_ks = self._resolve_existing_ks_folder(
@@ -1073,8 +1091,9 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 execute_step("catgt", "CatGT", _run_catgt_step)
             elif run_catgt_extract_only:
                 def _run_catgt_extract_only_step() -> None:
-                    nonlocal catgt_context
-                    _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT extract-only stream selection: {extract_only_stream}")
+                    nonlocal catgt_context, processing_bin, processing_meta, ks_folder
+                    active_extract_stream = extract_only_save_ap_stream if (self.cfg.save_catgt_ap_bin and not catgt_processed_input) else extract_only_stream
+                    _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT extract-only stream selection: {active_extract_stream}")
                     if catgt_processed_input:
                         if "-ni" in extract_only_stream.split():
                             raise RuntimeError(
@@ -1112,38 +1131,85 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                             ni_extract_string=self.cfg.ni_extract_string,
                         )
                     else:
-                        _safe_emit(
-                            self.signals.log,
-                            f"[{self.job['name']}] Running CatGT extract-only from raw AP input: {bin_file}",
-                        )
-                        extract_context = self._run_catgt_extract_only_from_raw(
-                            create_input_json_fn=createInputJson,
-                            run_name=run_name,
-                            bin_file=bin_file,
-                            input_meta=input_meta,
-                            job_out=extracted_data_root,
-                            ks_tag=ks_tag,
-                            gate_string=gate_string,
-                            trigger_string=trigger_string,
-                            probe_string=probe_string,
-                            json_root=json_root,
-                            catgt_cmd_string=extract_only_catgt_cmd,
-                            catgt_stream_string=extract_only_stream,
-                        )
-                        if extract_context:
-                            catgt_context = extract_context
-                            self._verify_ni_extractor_outputs(
-                                catgt_run_dir=Path(extract_context["catgt_run_dir"]),
-                                source_run_name=extract_context["source_run_name"],
-                                gate_string=extract_context["gate_string"],
-                                catgt_cmd_string=effective_catgt_cmd,
+                        if self.cfg.save_catgt_ap_bin:
+                            _safe_emit(
+                                self.signals.log,
+                                f"[{self.job['name']}] Extract-only AP save enabled; running full CatGT AP processing so a *_tcat.imec{probe_string}.ap.bin is kept in the CatGT folder.",
                             )
-                            self._apply_extractor_labels(
-                                catgt_run_dir=Path(extract_context["catgt_run_dir"]),
-                                source_run_name=extract_context["source_run_name"],
-                                gate_string=extract_context["gate_string"],
-                                ni_extract_string=self.cfg.ni_extract_string,
+                            processing_bin, processing_meta = self._run_catgt_with_retries(
+                                create_input_json_fn=createInputJson,
+                                run_name=run_name,
+                                bin_file=bin_file,
+                                input_meta=input_meta,
+                                job_out=extracted_data_root,
+                                ks_tag=ks_tag,
+                                gate_string=gate_string,
+                                trigger_string=trigger_string,
+                                probe_string=probe_string,
+                                json_root=json_root,
+                                catgt_cmd_string=extract_only_save_ap_cmd,
+                                catgt_stream_string=extract_only_save_ap_stream,
                             )
+                            catgt_output_context = parse_catgt_processed_bin_context(str(processing_bin))
+                            if catgt_output_context:
+                                catgt_context = catgt_output_context
+                                self._verify_ni_extractor_outputs(
+                                    catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
+                                    source_run_name=catgt_output_context["source_run_name"],
+                                    gate_string=catgt_output_context["gate_string"],
+                                    catgt_cmd_string=effective_catgt_cmd,
+                                )
+                                self._apply_extractor_labels(
+                                    catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
+                                    source_run_name=catgt_output_context["source_run_name"],
+                                    gate_string=catgt_output_context["gate_string"],
+                                    ni_extract_string=self.cfg.ni_extract_string,
+                                )
+                            ks_folder = default_pipeline_ks_output_dir(
+                                str(processing_bin),
+                                ks_tag,
+                                probe_string,
+                                output_root=output_root,
+                                run_name=run_name,
+                                store_next_to_bin=True,
+                            )
+                            _safe_emit(
+                                self.signals.log,
+                                f"[{self.job['name']}] Saved CatGT AP output: {processing_bin}",
+                            )
+                        else:
+                            _safe_emit(
+                                self.signals.log,
+                                f"[{self.job['name']}] Running CatGT extract-only from raw AP input: {bin_file}",
+                            )
+                            extract_context = self._run_catgt_extract_only_from_raw(
+                                create_input_json_fn=createInputJson,
+                                run_name=run_name,
+                                bin_file=bin_file,
+                                input_meta=input_meta,
+                                job_out=extracted_data_root,
+                                ks_tag=ks_tag,
+                                gate_string=gate_string,
+                                trigger_string=trigger_string,
+                                probe_string=probe_string,
+                                json_root=json_root,
+                                catgt_cmd_string=extract_only_catgt_cmd,
+                                catgt_stream_string=extract_only_stream,
+                            )
+                            if extract_context:
+                                catgt_context = extract_context
+                                self._verify_ni_extractor_outputs(
+                                    catgt_run_dir=Path(extract_context["catgt_run_dir"]),
+                                    source_run_name=extract_context["source_run_name"],
+                                    gate_string=extract_context["gate_string"],
+                                    catgt_cmd_string=effective_catgt_cmd,
+                                )
+                                self._apply_extractor_labels(
+                                    catgt_run_dir=Path(extract_context["catgt_run_dir"]),
+                                    source_run_name=extract_context["source_run_name"],
+                                    gate_string=extract_context["gate_string"],
+                                    ni_extract_string=self.cfg.ni_extract_string,
+                                )
 
                 execute_step("catgt_extract_only", "CatGT extract-only", _run_catgt_extract_only_step)
 

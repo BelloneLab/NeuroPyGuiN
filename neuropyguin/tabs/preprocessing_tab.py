@@ -11,6 +11,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..preprocessing import (
     default_kilosort_output_name,
+    discover_completed_runs,
     discover_bin_files,
     parse_spikeglx_bin_name,
     validate_spikeglx_ap_bin,
@@ -315,6 +316,7 @@ class PreprocessingTab(QtWidgets.QWidget):
     openPostProcessingRequested = QtCore.Signal(str)
     saveSettingsFileRequested = QtCore.Signal()
     loadSettingsFileRequested = QtCore.Signal()
+    _OK_ICON = Path(__file__).resolve().parents[1] / "assets" / "ok-icon.png"
 
     def __init__(self, thread_pool: QtCore.QThreadPool) -> None:
         super().__init__()
@@ -327,6 +329,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._settings_sync_timer.timeout.connect(self.settings.sync)
         self._restoring_settings = False
         self.jobs: List[Dict[str, str]] = []
+        self._raw_run_catalog: Dict[str, Dict[str, str]] = {}
         self.completed_runs: List[Dict[str, object]] = []
         self._queue: List[Dict[str, str]] = []
         self._running = False
@@ -397,13 +400,18 @@ class PreprocessingTab(QtWidgets.QWidget):
         top.setSpacing(8)
         self.btn_add_files = QtWidgets.QPushButton("Add AP .bin files")
         self.btn_add_folder = QtWidgets.QPushButton("Add folder")
+        self.btn_scan_raw_root = QtWidgets.QPushButton("Scan raw root")
         self.btn_recent_files = QtWidgets.QPushButton("Open recent file")
         self.btn_recent_folders = QtWidgets.QPushButton("Open recent folder")
+        self.cb_queue_filter = QtWidgets.QComboBox()
+        self.cb_queue_filter.addItem("Non-processed", "non_processed")
+        self.cb_queue_filter.addItem("All runs", "all")
         self.btn_remove = QtWidgets.QPushButton("Remove selected")
         self.btn_clear = QtWidgets.QPushButton("Clear")
         self.btn_run = QtWidgets.QPushButton("Run queue")
         self.btn_add_files.setProperty("role", "secondary")
         self.btn_add_folder.setProperty("role", "secondary")
+        self.btn_scan_raw_root.setProperty("role", "secondary")
         self.btn_recent_files.setProperty("role", "ghost")
         self.btn_recent_folders.setProperty("role", "ghost")
         self.btn_remove.setProperty("role", "ghost")
@@ -411,9 +419,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_run.setProperty("role", "primary")
         top.addWidget(self.btn_add_files)
         top.addWidget(self.btn_add_folder)
+        top.addWidget(self.btn_scan_raw_root)
         top.addWidget(self.btn_recent_files)
         top.addWidget(self.btn_recent_folders)
         top.addStretch(1)
+        top.addWidget(QtWidgets.QLabel("Show"))
+        top.addWidget(self.cb_queue_filter)
         top.addWidget(self.btn_remove)
         top.addWidget(self.btn_clear)
         top.addWidget(self.btn_run)
@@ -426,6 +437,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.list_jobs.setSpacing(4)
         self.list_jobs.setMinimumHeight(220)
         self.list_jobs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.list_jobs.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
 
         config = QtWidgets.QGroupBox("Integrated ecephys spike sorting preprocessing")
         config.setProperty("settingsSection", True)
@@ -435,6 +447,7 @@ class PreprocessingTab(QtWidgets.QWidget):
 
         self.ck_catgt = QtWidgets.QCheckBox("CatGT")
         self.ck_catgt_extract_only = QtWidgets.QCheckBox("CatGT extract-only")
+        self.ck_save_catgt_ap_bin = QtWidgets.QCheckBox("Save CatGT AP bin")
         self.ck_tprime = QtWidgets.QCheckBox("TPrime")
         self.ck_ks = QtWidgets.QCheckBox("Kilosort")
         self.ck_post = QtWidgets.QCheckBox("Kilosort Postprocessing")
@@ -453,6 +466,10 @@ class PreprocessingTab(QtWidgets.QWidget):
             "Run a CatGT extract-only pass to regenerate XA/XD/XIA/XID event text files without repeating filtering "
             "or gfix. Queue the raw *.imecX.ap.bin input for NI extraction or TPrime alignment because the NI "
             "stream lives at the run root; existing *_tcat inputs are only suitable for probe/AP-only reruns."
+        )
+        self.ck_save_catgt_ap_bin.setToolTip(
+            "When enabled, raw-input CatGT extract-only reruns keep a real *_tcat.imecX.ap.bin in the CatGT folder "
+            "by running the full CatGT AP-processing path. Disable this to regenerate only the extractor text files."
         )
 
         modules_row = QtWidgets.QVBoxLayout()
@@ -809,8 +826,19 @@ class PreprocessingTab(QtWidgets.QWidget):
             ),
             4,
             0,
+        )
+        paths_grid.addWidget(
+            make_field(
+                "CatGT extract-only AP output",
+                self.ck_save_catgt_ap_bin,
+                "Keep a *_tcat.imecX.ap.bin and matching .meta in the CatGT probe folder when CatGT extract-only "
+                "is used on raw AP input. This reruns the full CatGT AP processing instead of generating only text "
+                "extractor outputs.",
+            ),
+            4,
             1,
-            2,
+            1,
+            1,
         )
         paths_grid.addWidget(
             make_field("JSON root", json_wrap, "Folder where generated pipeline JSON files are stored."),
@@ -861,7 +889,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         done_layout = QtWidgets.QVBoxLayout(done_box)
         done_layout.setSpacing(8)
         done_hint = QtWidgets.QLabel(
-            "Finished runs stay in history until Clear History. Double-click opens curation, and right-click exposes more actions."
+            "Finished runs stay in history until Clear History. You can also scan an existing processed-data root to import completed runs. Double-click opens curation, and right-click exposes more actions."
         )
         done_hint.setObjectName("SectionHint")
         done_hint.setWordWrap(True)
@@ -875,8 +903,11 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.list_completed.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         done_layout.addWidget(self.list_completed, 1)
         done_row = QtWidgets.QHBoxLayout()
+        self.btn_scan_completed_root = QtWidgets.QPushButton("Scan processed root")
+        self.btn_scan_completed_root.setProperty("role", "ghost")
         self.btn_to_curation = QtWidgets.QPushButton("To Curation")
         self.btn_to_curation.setProperty("role", "secondary")
+        done_row.addWidget(self.btn_scan_completed_root, 0)
         done_row.addStretch(1)
         done_row.addWidget(self.btn_to_curation)
         done_layout.addLayout(done_row)
@@ -994,7 +1025,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         work_sections.add_page("Queue", queue_box)
         self.settings_section_index = work_sections.add_page("Settings", settings_page)
         work_sections.add_page("Log", log_box)
-        work_sections.add_page("Completed", done_box)
+        self.completed_section_index = work_sections.add_page("Completed", done_box)
         work_sections.setCurrentIndex(0)
         self.work_sections = work_sections
         main.addWidget(work_sections, 1)
@@ -1003,13 +1034,17 @@ class PreprocessingTab(QtWidgets.QWidget):
 
         self.btn_add_files.clicked.connect(self._add_files)
         self.btn_add_folder.clicked.connect(self._add_folder)
+        self.btn_scan_raw_root.clicked.connect(self._scan_raw_root)
         self.btn_recent_files.clicked.connect(self._open_recent_file_menu)
         self.btn_recent_folders.clicked.connect(self._open_recent_folder_menu)
+        self.cb_queue_filter.currentIndexChanged.connect(self._on_queue_filter_changed)
         self.btn_remove.clicked.connect(self._remove_selected)
         self.btn_clear.clicked.connect(self._clear)
         self.btn_run.clicked.connect(self._run_queue)
         self.btn_copy_log.clicked.connect(self._copy_log)
+        self.btn_scan_completed_root.clicked.connect(self._scan_completed_root)
         self.list_jobs.filesDropped.connect(self._consume_drop)
+        self.list_jobs.customContextMenuRequested.connect(self._open_job_context_menu)
         self.list_completed.itemDoubleClicked.connect(lambda _item: self._open_selected_curation())
         self.list_completed.customContextMenuRequested.connect(self._open_completed_context_menu)
         btn_output.clicked.connect(lambda: self._pick_folder(self.ed_output))
@@ -1021,10 +1056,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         btn_ks_tmp.clicked.connect(lambda: self._pick_folder(self.ed_ks_tmp))
         self.ed_output.editingFinished.connect(self._persist_settings)
         self.ck_mirror_raw_hierarchy_output.toggled.connect(lambda _checked: self._persist_settings())
+        self.cb_queue_filter.currentIndexChanged.connect(lambda _idx: self._persist_settings())
         self.ed_json.editingFinished.connect(self._persist_settings)
         for checkbox in [
             self.ck_catgt,
             self.ck_catgt_extract_only,
+            self.ck_save_catgt_ap_bin,
             self.ck_tprime,
             self.ck_ks,
             self.ck_post,
@@ -1115,14 +1152,83 @@ class PreprocessingTab(QtWidgets.QWidget):
     def _consume_drop(self, dropped: List[str]) -> None:
         self._add_paths(dropped)
 
-    def _add_paths(self, paths: List[str]) -> None:
-        bins = discover_bin_files(paths)
-        if not bins and paths:
-            self._append_log("No valid AP files found. Expected names like *.imec0.ap.bin")
-        existing = {j["bin_file"] for j in self.jobs}
+    @staticmethod
+    def _normalized_path(path: str) -> str:
+        try:
+            return str(Path(path).resolve())
+        except Exception:
+            return str(Path(path))
+
+    def _queue_filter_mode(self) -> str:
+        return str(self.cb_queue_filter.currentData() or "non_processed")
+
+    def _completed_entry_for_job(self, job: Dict[str, str]) -> Dict[str, object] | None:
+        job_bin = self._normalized_path(str(job.get("bin_file") or ""))
+        job_run = str(job.get("name") or "")
+        job_gate = str(job.get("gate_string") or "")
+        job_probe = str(job.get("probe_string") or "")
+        for entry in self.completed_runs:
+            entry_bin = str(entry.get("bin_file") or "")
+            if entry_bin and self._normalized_path(entry_bin) == job_bin:
+                return self._normalize_completed_entry(entry)
+            if entry_bin:
+                parsed = parse_spikeglx_bin_name(entry_bin)
+                entry_run = str(parsed.get("run_name") or entry.get("run_name") or "")
+                entry_gate = str(parsed.get("gate_string") or "")
+                entry_probe = str(parsed.get("probe_string") or "")
+            else:
+                entry_run = str(entry.get("run_name") or "")
+                entry_gate = str((entry.get("job_snapshot") or {}).get("gate_string") or "")
+                entry_probe = str((entry.get("job_snapshot") or {}).get("probe_string") or "")
+            if entry_run == job_run and entry_gate == job_gate and entry_probe == job_probe:
+                return self._normalize_completed_entry(entry)
+        return None
+
+    def _queue_item_text(self, job: Dict[str, str], completed_entry: Dict[str, object] | None = None) -> str:
+        base = (
+            f"{job['name']}  |  g{job['gate_string']} t{job['trigger_string']} p{job['probe_string']}  |  {job['bin_file']}"
+        )
+        if completed_entry is not None:
+            return f"{base}  |  completed"
+        return base
+
+    def _refresh_job_list_view(self) -> None:
+        if not hasattr(self, "list_jobs"):
+            return
+        self.list_jobs.clear()
+        if self._queue_filter_mode() == "all":
+            jobs_to_show = list(self._raw_run_catalog.values())
+        else:
+            jobs_to_show = list(self.jobs)
+        queue_bin_paths = {self._normalized_path(str(job.get("bin_file") or "")) for job in self.jobs}
+        ok_icon = QtGui.QIcon(str(self._OK_ICON)) if self._OK_ICON.exists() else QtGui.QIcon()
+        for job in jobs_to_show:
+            completed_entry = self._completed_entry_for_job(job)
+            item = QtWidgets.QListWidgetItem(self._queue_item_text(job, completed_entry))
+            payload = {
+                "job": dict(job),
+                "bin_file": str(job.get("bin_file") or ""),
+                "in_queue": self._normalized_path(str(job.get("bin_file") or "")) in queue_bin_paths,
+                "completed_entry": completed_entry,
+            }
+            item.setData(QtCore.Qt.UserRole, payload)
+            if completed_entry is not None and not ok_icon.isNull():
+                item.setIcon(ok_icon)
+                tooltip = [
+                    "Completed run",
+                    *self._completed_tooltip_lines(completed_entry),
+                ]
+                item.setToolTip("\n".join(tooltip))
+            else:
+                item.setToolTip(str(job.get("bin_file") or ""))
+            self.list_jobs.addItem(item)
+
+    def _ingest_bins(self, bins: List[str], *, queue_completed: bool) -> tuple[int, int, int]:
+        added_catalog = 0
+        queued = 0
+        completed = 0
+        existing_queue = {self._normalized_path(j["bin_file"]) for j in self.jobs}
         for b in bins:
-            if b in existing:
-                continue
             ok, reason = validate_spikeglx_ap_bin(b)
             if not ok:
                 self._append_log(f"Skipping {b}: {reason}")
@@ -1136,10 +1242,27 @@ class PreprocessingTab(QtWidgets.QWidget):
                 "trigger_string": parsed["trigger_string"],
                 "probe_string": parsed["probe_string"],
             }
+            norm_bin = self._normalized_path(b)
+            if norm_bin not in self._raw_run_catalog:
+                added_catalog += 1
+            self._raw_run_catalog[norm_bin] = job
+            is_completed = self._completed_entry_for_job(job) is not None
+            if is_completed:
+                completed += 1
+            if is_completed and not queue_completed:
+                continue
+            if norm_bin in existing_queue:
+                continue
             self.jobs.append(job)
-            self.list_jobs.addItem(
-                f"{parsed['run_name']}  |  g{parsed['gate_string']} t{parsed['trigger_string']} p{parsed['probe_string']}  |  {b}"
-            )
+            existing_queue.add(norm_bin)
+            queued += 1
+        return added_catalog, queued, completed
+
+    def _add_paths(self, paths: List[str]) -> None:
+        bins = discover_bin_files(paths)
+        if not bins and paths:
+            self._append_log("No valid AP files found. Expected names like *.imec0.ap.bin")
+        _added_catalog, queued, completed = self._ingest_bins(bins, queue_completed=True)
         if paths:
             first = paths[0]
             p = Path(first)
@@ -1151,12 +1274,20 @@ class PreprocessingTab(QtWidgets.QWidget):
                     self._set_last_folder(str(p))
                     self._add_recent("recent_folders", str(p))
                 self._persist_settings()
+        if bins:
+            self._append_log(
+                f"Added {queued} run(s) to queue from selection."
+                + (f" {completed} already completed run(s) are still shown with the completed icon in All runs." if completed else "")
+            )
+        self._refresh_job_list_view()
         self._refresh_queue_summary()
 
     def _refresh_queue_summary(self) -> None:
         if not hasattr(self, "lbl_queue_summary"):
             return
         n_jobs = len(self.jobs)
+        total_known = len(self._raw_run_catalog)
+        total_completed = sum(1 for job in self._raw_run_catalog.values() if self._completed_entry_for_job(job) is not None)
         if self._running:
             remaining = len(self._queue)
             msg = f"{n_jobs} recording(s) loaded. Queue running with {remaining} remaining after the active job."
@@ -1166,20 +1297,45 @@ class PreprocessingTab(QtWidgets.QWidget):
             msg = "1 recording queued and ready to run."
         else:
             msg = f"{n_jobs} recordings queued and ready to run."
+        if total_known and self._queue_filter_mode() == "all":
+            msg += f" Showing {total_known} known raw run(s), {total_completed} completed."
+        elif total_known:
+            pending_known = max(total_known - total_completed, 0)
+            msg += f" {pending_known} known non-processed run(s) in the current raw-run catalog."
         if self.completed_runs:
             msg += f" {len(self.completed_runs)} completed run(s) available in Completed."
         self.lbl_queue_summary.setText(msg)
 
+    def _on_queue_filter_changed(self, _index: int) -> None:
+        self._refresh_job_list_view()
+        self._refresh_queue_summary()
+
     def _remove_selected(self) -> None:
-        selected_rows = sorted({i.row() for i in self.list_jobs.selectedIndexes()}, reverse=True)
-        for row in selected_rows:
-            self.list_jobs.takeItem(row)
-            self.jobs.pop(row)
+        selected_items = list(self.list_jobs.selectedItems())
+        if not selected_items:
+            return
+        remove_bins: List[str] = []
+        ignored = 0
+        for item in selected_items:
+            payload = item.data(QtCore.Qt.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            if bool(payload.get("in_queue")):
+                remove_bins.append(self._normalized_path(str(payload.get("bin_file") or "")))
+            else:
+                ignored += 1
+        if remove_bins:
+            remove_set = set(remove_bins)
+            self.jobs = [job for job in self.jobs if self._normalized_path(job["bin_file"]) not in remove_set]
+        if ignored:
+            self._append_log("Completed-only runs shown in All runs were not removed from history or catalog.")
+        self._refresh_job_list_view()
         self._refresh_queue_summary()
 
     def _clear(self) -> None:
         self.list_jobs.clear()
         self.jobs.clear()
+        self._raw_run_catalog.clear()
         self._refresh_queue_summary()
 
     def _collect_cfg(self) -> EcephysPipelineConfig:
@@ -1187,6 +1343,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             output_root=self.ed_output.text().strip(),
             json_root=self.ed_json.text().strip(),
             mirror_raw_hierarchy_output=self.ck_mirror_raw_hierarchy_output.isChecked(),
+            save_catgt_ap_bin=self.ck_save_catgt_ap_bin.isChecked(),
             run_catgt=self.ck_catgt.isChecked(),
             run_catgt_extract_only=self.ck_catgt_extract_only.isChecked(),
             run_tprime=self.ck_tprime.isChecked(),
@@ -1234,6 +1391,8 @@ class PreprocessingTab(QtWidgets.QWidget):
             "bin_file": str(entry.get("bin_file") or ""),
             "label": str(entry.get("label") or ""),
             "finished_at": str(entry.get("finished_at") or ""),
+            "params_file": str(entry.get("params_file") or ""),
+            "source_root": str(entry.get("source_root") or ""),
             "job_snapshot": dict(entry.get("job_snapshot") or {}),
             "cfg_snapshot": dict(entry.get("cfg_snapshot") or {}),
         }
@@ -1241,17 +1400,44 @@ class PreprocessingTab(QtWidgets.QWidget):
             out["label"] = f"{out['run_name']} | {out['ks_folder']}"
         return out
 
+    @staticmethod
+    def _completed_tooltip_lines(entry: Dict[str, object]) -> List[str]:
+        lines = [str(entry["ks_folder"])]
+        if entry.get("finished_at"):
+            lines.append(f"Completed: {entry['finished_at']}")
+        if entry.get("bin_file"):
+            lines.append(f"Input: {entry['bin_file']}")
+        if entry.get("params_file"):
+            lines.append(f"Params: {entry['params_file']}")
+        if entry.get("source_root"):
+            lines.append(f"Scanned from: {entry['source_root']}")
+        return lines
+
     def _add_completed_item(self, entry: Dict[str, object]) -> None:
         normalized = self._normalize_completed_entry(entry)
         item = QtWidgets.QListWidgetItem(str(normalized["label"]))
         item.setData(QtCore.Qt.UserRole, normalized)
-        tooltip_lines = [str(normalized["ks_folder"])]
-        if normalized["finished_at"]:
-            tooltip_lines.append(f"Completed: {normalized['finished_at']}")
-        if normalized["bin_file"]:
-            tooltip_lines.append(f"Input: {normalized['bin_file']}")
-        item.setToolTip("\n".join(tooltip_lines))
+        item.setToolTip("\n".join(self._completed_tooltip_lines(normalized)))
         self.list_completed.addItem(item)
+
+    def _upsert_completed_entry(self, entry: Dict[str, object]) -> int:
+        normalized = self._normalize_completed_entry(entry)
+        existing_index = next(
+            (idx for idx, existing in enumerate(self.completed_runs) if existing.get("ks_folder") == normalized["ks_folder"]),
+            None,
+        )
+        if existing_index is None:
+            self.completed_runs.append(normalized)
+            self._add_completed_item(normalized)
+            return self.list_completed.count() - 1
+
+        self.completed_runs[existing_index] = normalized
+        existing_item = self.list_completed.item(existing_index)
+        if existing_item is not None:
+            existing_item.setText(str(normalized["label"]))
+            existing_item.setData(QtCore.Qt.UserRole, normalized)
+            existing_item.setToolTip("\n".join(self._completed_tooltip_lines(normalized)))
+        return existing_index
 
     def _persist_completed_history(self) -> None:
         payload = [self._normalize_completed_entry(entry) for entry in self.completed_runs]
@@ -1278,6 +1464,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             self._add_completed_item(entry)
         if self.list_completed.count():
             self.list_completed.setCurrentRow(self.list_completed.count() - 1)
+        self._refresh_job_list_view()
 
     def _completed_entry_from_item(self, item: QtWidgets.QListWidgetItem | None) -> Dict[str, object] | None:
         if item is None:
@@ -1302,7 +1489,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         summary = QtWidgets.QLabel(
             f"Completed: {entry.get('finished_at') or 'unknown'}\n"
             f"Kilosort folder: {entry.get('ks_folder', '')}\n"
-            f"Input bin: {entry.get('bin_file', '') or 'unknown'}"
+            f"Input bin: {entry.get('bin_file', '') or 'unknown'}\n"
+            f"Params file: {entry.get('params_file', '') or 'unknown'}"
         )
         summary.setWordWrap(True)
         summary.setObjectName("SectionHint")
@@ -1318,6 +1506,8 @@ class PreprocessingTab(QtWidgets.QWidget):
                     "finished_at": entry.get("finished_at"),
                     "ks_folder": entry.get("ks_folder"),
                     "bin_file": entry.get("bin_file"),
+                    "params_file": entry.get("params_file"),
+                    "source_root": entry.get("source_root"),
                     "job_snapshot": entry.get("job_snapshot", {}),
                     "cfg_snapshot": entry.get("cfg_snapshot", {}),
                 },
@@ -1361,20 +1551,13 @@ class PreprocessingTab(QtWidgets.QWidget):
         if folder:
             self.openPostProcessingRequested.emit(folder)
 
-    def _open_completed_context_menu(self, pos: QtCore.QPoint) -> None:
-        item = self.list_completed.itemAt(pos)
-        if item is None:
-            return
-        self.list_completed.setCurrentItem(item)
-        entry = self._completed_entry_from_item(item)
-        if entry is None:
-            return
+    def _show_completed_entry_menu(self, entry: Dict[str, object], global_pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
         act_open_folder = menu.addAction("Open Folder in Explorer")
         act_view_params = menu.addAction("View Run Parameters")
         act_requeue = menu.addAction("Re-run with New Parameters")
         act_post = menu.addAction("Load in Post-Processing")
-        action = menu.exec(self.list_completed.viewport().mapToGlobal(pos))
+        action = menu.exec(global_pos)
         if action is act_open_folder:
             self._open_completed_folder(entry)
         elif action is act_view_params:
@@ -1384,12 +1567,152 @@ class PreprocessingTab(QtWidgets.QWidget):
         elif action is act_post:
             self._open_completed_in_postprocessing(entry)
 
+    def _scan_raw_root(self) -> None:
+        start = str(
+            self.settings.value(
+                "paths/last_raw_root",
+                self.settings.value("paths/last_folder", self.ed_output.text().strip() or str(Path.cwd())),
+            )
+        )
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Scan Raw Root for Runs",
+            start,
+        )
+        if not folder:
+            return
+        self.settings.setValue("paths/last_raw_root", folder)
+        self._set_last_folder(folder)
+        self._add_recent("recent_folders", folder)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            bins = discover_bin_files([folder])
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if not bins:
+            self._append_log(f"No raw SpikeGLX AP bins found under {folder}")
+            return
+        added_catalog, queued, completed = self._ingest_bins(bins, queue_completed=False)
+        self._refresh_job_list_view()
+        self._refresh_queue_summary()
+        if hasattr(self, "work_sections"):
+            self.work_sections.setCurrentIndex(0)
+        self._append_log(
+            f"Scanned raw root {folder}: found {len(bins)} run(s), added {added_catalog} to catalog, queued {queued} non-processed run(s), skipped {completed} completed run(s)."
+        )
+
+    def _open_job_context_menu(self, pos: QtCore.QPoint) -> None:
+        item = self.list_jobs.itemAt(pos)
+        if item is None:
+            return
+        self.list_jobs.setCurrentItem(item)
+        payload = item.data(QtCore.Qt.UserRole)
+        if not isinstance(payload, dict):
+            return
+        entry = payload.get("completed_entry")
+        if isinstance(entry, dict):
+            menu = QtWidgets.QMenu(self)
+            act_completed = menu.addAction("Completed Run Actions...")
+            act_completed.setEnabled(False)
+            menu.addSeparator()
+            act_open_folder = menu.addAction("Open Folder in Explorer")
+            act_view_params = menu.addAction("View Run Parameters")
+            act_requeue = menu.addAction("Re-run with New Parameters")
+            act_post = menu.addAction("Load in Post-Processing")
+            act_remove = None
+            if bool(payload.get("in_queue")):
+                menu.addSeparator()
+                act_remove = menu.addAction("Remove from Queue")
+            action = menu.exec(self.list_jobs.viewport().mapToGlobal(pos))
+            completed_entry = self._normalize_completed_entry(entry)
+            if action is act_open_folder:
+                self._open_completed_folder(completed_entry)
+            elif action is act_view_params:
+                self._show_completed_run_parameters(completed_entry)
+            elif action is act_requeue:
+                self._requeue_completed_entry(completed_entry)
+            elif action is act_post:
+                self._open_completed_in_postprocessing(completed_entry)
+            elif act_remove is not None and action is act_remove:
+                self._remove_selected()
+            return
+
+        if bool(payload.get("in_queue")):
+            menu = QtWidgets.QMenu(self)
+            act_remove = menu.addAction("Remove from Queue")
+            action = menu.exec(self.list_jobs.viewport().mapToGlobal(pos))
+            if action is act_remove:
+                self._remove_selected()
+
+    def _scan_completed_root(self) -> None:
+        start = str(
+            self.settings.value(
+                "paths/last_processed_root",
+                self.settings.value("paths/last_folder", self.ed_output.text().strip() or str(Path.cwd())),
+            )
+        )
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Scan Processed Root for Completed Runs",
+            start,
+        )
+        if not folder:
+            return
+        self.settings.setValue("paths/last_processed_root", folder)
+        self._set_last_folder(folder)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            discovered = discover_completed_runs(folder)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if not discovered:
+            self._append_log(f"No completed Kilosort runs found under {folder}")
+            return
+
+        added = 0
+        updated = 0
+        last_row = -1
+        existing_paths = {str(entry.get("ks_folder") or "") for entry in self.completed_runs}
+        for entry in discovered:
+            if str(entry.get("ks_folder") or "") in existing_paths:
+                updated += 1
+            else:
+                added += 1
+            last_row = self._upsert_completed_entry(entry)
+            existing_paths.add(str(entry.get("ks_folder") or ""))
+
+        if last_row >= 0:
+            self.list_completed.setCurrentRow(last_row)
+        self._persist_completed_history()
+        self._refresh_job_list_view()
+        self._refresh_queue_summary()
+        if hasattr(self, "work_sections"):
+            self.work_sections.setCurrentIndex(self.completed_section_index)
+        self._append_log(
+            f"Scanned {folder}: found {len(discovered)} completed run(s), added {added}, updated {updated}."
+        )
+
+    def _open_completed_context_menu(self, pos: QtCore.QPoint) -> None:
+        item = self.list_completed.itemAt(pos)
+        if item is None:
+            return
+        self.list_completed.setCurrentItem(item)
+        entry = self._completed_entry_from_item(item)
+        if entry is None:
+            return
+        self._show_completed_entry_menu(entry, self.list_completed.viewport().mapToGlobal(pos))
+
     def _planned_step_definitions(self, cfg: EcephysPipelineConfig) -> List[tuple[str, str]]:
         steps: List[tuple[str, str]] = []
         if cfg.run_catgt:
-            steps.append(("catgt_extract_only" if cfg.run_catgt_extract_only else "catgt", "CatGT extract-only" if cfg.run_catgt_extract_only else "CatGT"))
+            if cfg.run_catgt_extract_only:
+                label = "CatGT extract-only + AP save" if cfg.save_catgt_ap_bin else "CatGT extract-only"
+                steps.append(("catgt_extract_only", label))
+            else:
+                steps.append(("catgt", "CatGT"))
         elif cfg.run_catgt_extract_only:
-            steps.append(("catgt_extract_only", "CatGT extract-only"))
+            label = "CatGT extract-only + AP save" if cfg.save_catgt_ap_bin else "CatGT extract-only"
+            steps.append(("catgt_extract_only", label))
         if cfg.run_kilosort:
             steps.append(("kilosort", "Kilosort"))
         if cfg.run_kilosort_postproc:
@@ -1524,29 +1847,10 @@ class PreprocessingTab(QtWidgets.QWidget):
                     "cfg_snapshot": active_context.get("cfg_snapshot") or {},
                 }
             )
-            existing_index = next(
-                (idx for idx, existing in enumerate(self.completed_runs) if existing.get("ks_folder") == entry["ks_folder"]),
-                None,
-            )
-            if existing_index is None:
-                self.completed_runs.append(entry)
-                self._add_completed_item(entry)
-                target_row = self.list_completed.count() - 1
-            else:
-                self.completed_runs[existing_index] = entry
-                existing_item = self.list_completed.item(existing_index)
-                if existing_item is not None:
-                    existing_item.setText(str(entry["label"]))
-                    existing_item.setData(QtCore.Qt.UserRole, entry)
-                    tooltip_lines = [str(entry["ks_folder"])]
-                    if entry["finished_at"]:
-                        tooltip_lines.append(f"Completed: {entry['finished_at']}")
-                    if entry["bin_file"]:
-                        tooltip_lines.append(f"Input: {entry['bin_file']}")
-                    existing_item.setToolTip("\n".join(tooltip_lines))
-                target_row = existing_index
+            target_row = self._upsert_completed_entry(entry)
             self.list_completed.setCurrentRow(target_row)
             self._persist_completed_history()
+            self._refresh_job_list_view()
         self._active_run_context = None
         self._refresh_queue_summary()
         self._run_next()
@@ -1569,6 +1873,12 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self.ed_json.setText(str(json_root))
             self.ck_mirror_raw_hierarchy_output.setChecked(
                 bool(self.settings.value("preproc/mirror_raw_hierarchy_output", False, type=bool))
+            )
+            queue_filter = str(self.settings.value("preproc/raw_run_filter", "non_processed"))
+            queue_filter_index = max(0, self.cb_queue_filter.findData(queue_filter))
+            self.cb_queue_filter.setCurrentIndex(queue_filter_index)
+            self.ck_save_catgt_ap_bin.setChecked(
+                bool(self.settings.value("preproc/save_catgt_ap_bin", False, type=bool))
             )
             self.cb_ks_ver.setCurrentText(str(self.settings.value("preproc/ks_ver", self.cb_ks_ver.currentText())))
             self.ed_gate.setText(str(self.settings.value("preproc/gate_string", self.ed_gate.text())))
@@ -1625,6 +1935,8 @@ class PreprocessingTab(QtWidgets.QWidget):
             "preproc/mirror_raw_hierarchy_output",
             self.ck_mirror_raw_hierarchy_output.isChecked(),
         )
+        self.settings.setValue("preproc/raw_run_filter", self._queue_filter_mode())
+        self.settings.setValue("preproc/save_catgt_ap_bin", self.ck_save_catgt_ap_bin.isChecked())
         self.settings.setValue("preproc/ks_ver", self.cb_ks_ver.currentText())
         self.settings.setValue("preproc/gate_string", self.ed_gate.text().strip())
         self.settings.setValue("preproc/trigger_string", self.ed_trigger.text().strip())
