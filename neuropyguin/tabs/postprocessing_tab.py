@@ -4,15 +4,26 @@ import json
 import math
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
+from ..postproc_events import inspect_event_csv, load_event_times
 from ..postproc_engine import NeuropixelsDataset, export_units_h5
 from ..npyx_corr_bridge import PAIRWISE_ONLY_METHODS, method_metadata, method_options, run_method
+
+
+def _is_bombcell_good_label(value: object) -> bool:
+    text = str(value).strip().lower()
+    if not text or text == "nan":
+        return False
+    normalized = text.replace("-", "_").replace(" ", "_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized in {"good", "non_soma", "non_soma_good", "nonsoma", "nonsomagood"}
 
 
 class PostProcessingTab(QtWidgets.QWidget):
@@ -228,8 +239,16 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.analysis_tabs.addTab(t_corr, "Correlogram")
         t_psth = QtWidgets.QWidget()
         v_psth = QtWidgets.QVBoxLayout(t_psth)
-        self.tbl_conditions = QtWidgets.QTableWidget(0, 2)
-        self.tbl_conditions.setHorizontalHeaderLabels(["Condition", "Events CSV"])
+        self.lbl_psth_hint = QtWidgets.QLabel(
+            "Single unit: the heatmap shows one row per trial and the PSTH shows mean \u00b1 SEM across the selected trials. "
+            "Multiple units: the heatmap shows one row per unit (trial-averaged) and the PSTH shows the mean across units."
+        )
+        self.lbl_psth_hint.setWordWrap(True)
+        self.lbl_psth_hint.setObjectName("psthHintLabel")
+        self.tbl_conditions = QtWidgets.QTableWidget(0, 3)
+        self.tbl_conditions.setHorizontalHeaderLabels(["Condition", "Event label", "Events CSV"])
+        self.tbl_conditions.setColumnWidth(0, 160)
+        self.tbl_conditions.setColumnWidth(1, 180)
         self.tbl_conditions.horizontalHeader().setStretchLastSection(True)
         self.tbl_conditions.verticalHeader().setVisible(False)
         b_cond = QtWidgets.QHBoxLayout()
@@ -254,19 +273,46 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.sp_psth_bin.setRange(0.5, 50.0)
         self.sp_psth_bin.setValue(5.0)
         self.sp_psth_bin.setSuffix(" ms")
+        self.sp_psth_trial_from = QtWidgets.QSpinBox()
+        self.sp_psth_trial_from.setRange(1, 1_000_000)
+        self.sp_psth_trial_from.setValue(1)
+        self.sp_psth_trial_to = QtWidgets.QSpinBox()
+        self.sp_psth_trial_to.setRange(0, 1_000_000)
+        self.sp_psth_trial_to.setSpecialValueText("last")
+        self.sp_psth_trial_to.setValue(0)
+        self.btn_psth_all_trials = QtWidgets.QPushButton("All trials")
+        self.btn_psth_all_trials.setProperty("role", "ghost")
+        trial_row = QtWidgets.QWidget()
+        trial_row_l = QtWidgets.QHBoxLayout(trial_row)
+        trial_row_l.setContentsMargins(0, 0, 0, 0)
+        trial_row_l.setSpacing(8)
+        trial_row_l.addWidget(QtWidgets.QLabel("from"))
+        trial_row_l.addWidget(self.sp_psth_trial_from)
+        trial_row_l.addWidget(QtWidgets.QLabel("to"))
+        trial_row_l.addWidget(self.sp_psth_trial_to)
+        trial_row_l.addWidget(self.btn_psth_all_trials)
+        trial_row_l.addStretch(1)
+        self.lbl_psth_trial_status = QtWidgets.QLabel("Using all matching trials in each condition.")
+        self.lbl_psth_trial_status.setWordWrap(True)
+        self.lbl_psth_trial_status.setObjectName("psthMetaLabel")
         self.btn_psth_compute = QtWidgets.QPushButton("Compute")
         self.btn_psth_show = QtWidgets.QPushButton("Show")
+        self.btn_psth_compute.setProperty("role", "primary")
+        self.btn_psth_show.setProperty("role", "secondary")
         psth_btn_row = QtWidgets.QHBoxLayout()
         psth_btn_row.addWidget(self.btn_psth_compute)
         psth_btn_row.addWidget(self.btn_psth_show)
         f_psth.addRow("Pre window", with_help(self.sp_psth_pre, "Seconds before event for PSTH window."))
         f_psth.addRow("Post window", with_help(self.sp_psth_post, "Seconds after event for PSTH window."))
         f_psth.addRow("Bin", with_help(self.sp_psth_bin, "PSTH bin size (ms)."))
+        f_psth.addRow("Trial range", with_help(trial_row, "1-based inclusive trial range within each selected event label. 'last' uses the final available trial."))
         f_psth.addRow(psth_btn_row)
 
+        v_psth.addWidget(self.lbl_psth_hint)
         v_psth.addWidget(self.tbl_conditions)
         v_psth.addLayout(b_cond)
         v_psth.addLayout(f_psth)
+        v_psth.addWidget(self.lbl_psth_trial_status)
         self.analysis_tabs.addTab(t_psth, "Condition PSTH")
 
         t_net = QtWidgets.QWidget()
@@ -376,10 +422,30 @@ class PostProcessingTab(QtWidgets.QWidget):
 
         psth_view = QtWidgets.QWidget()
         psth_v = QtWidgets.QVBoxLayout(psth_view)
+        self.psth_summary_card = QtWidgets.QFrame()
+        self.psth_summary_card.setObjectName("psthSummaryCard")
+        psth_summary_l = QtWidgets.QVBoxLayout(self.psth_summary_card)
+        psth_summary_l.setContentsMargins(14, 12, 14, 12)
+        psth_summary_l.setSpacing(4)
+        self.lbl_psth_summary = QtWidgets.QLabel("Condition PSTH is ready after you compute it.")
+        self.lbl_psth_summary.setWordWrap(True)
+        self.lbl_psth_summary.setObjectName("psthSummaryTitle")
+        self.lbl_psth_summary_meta = QtWidgets.QLabel(
+            "Select units, choose an event label, then use Compute. Trial-range changes are applied on the displayed heatmap and averages."
+        )
+        self.lbl_psth_summary_meta.setWordWrap(True)
+        self.lbl_psth_summary_meta.setObjectName("psthSummaryMeta")
+        psth_summary_l.addWidget(self.lbl_psth_summary)
+        psth_summary_l.addWidget(self.lbl_psth_summary_meta)
         self.plot_psth_lines = pg.PlotWidget(title="Condition PSTH lines")
         self.plot_psth_heat = pg.PlotWidget(title="Condition PSTH heatmap")
-        psth_v.addWidget(self.plot_psth_lines, 1)
-        psth_v.addWidget(self.plot_psth_heat, 1)
+        self.psth_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.psth_splitter.addWidget(self.plot_psth_lines)
+        self.psth_splitter.addWidget(self.plot_psth_heat)
+        self.psth_splitter.setStretchFactor(0, 3)
+        self.psth_splitter.setStretchFactor(1, 4)
+        psth_v.addWidget(self.psth_summary_card, 0)
+        psth_v.addWidget(self.psth_splitter, 1)
 
         net_view = QtWidgets.QWidget()
         net_v = QtWidgets.QVBoxLayout(net_view)
@@ -437,6 +503,9 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_cond_add.clicked.connect(self._add_condition_row)
         self.btn_cond_remove.clicked.connect(self._remove_condition_row)
         self.btn_cond_browse.clicked.connect(self._browse_condition_csv)
+        self.sp_psth_trial_from.valueChanged.connect(self._on_psth_trial_range_changed)
+        self.sp_psth_trial_to.valueChanged.connect(self._on_psth_trial_range_changed)
+        self.btn_psth_all_trials.clicked.connect(self._reset_psth_trial_range)
         self.btn_psth_compute.clicked.connect(self._compute_psth)
         self.btn_psth_show.clicked.connect(self._show_psth)
         self.btn_net_compute.clicked.connect(self._compute_network)
@@ -466,6 +535,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.tbl_conditions.itemChanged.connect(self._on_conditions_changed)
         self._apply_plot_style()
         self._update_basic_plot_ratio()
+        self._update_psth_trial_status()
         self._update_npyx_method_ui()
     def set_plot_preferences(self, theme: str, show_grid: bool) -> None:
         self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
@@ -476,6 +546,9 @@ class PostProcessingTab(QtWidgets.QWidget):
         bg = "#0b0f14" if self._plot_theme == "Dark" else "#ffffff"
         fg = "#e8eef7" if self._plot_theme == "Dark" else "#1a1f29"
         grid_alpha = 0.25 if self._show_grid else 0.0
+        card_bg = "rgba(90, 128, 255, 0.14)" if self._plot_theme == "Dark" else "rgba(67, 128, 255, 0.08)"
+        card_border = "rgba(142, 170, 255, 0.34)" if self._plot_theme == "Dark" else "rgba(67, 128, 255, 0.22)"
+        meta_fg = "#aab6ca" if self._plot_theme == "Dark" else "#5b6778"
         plots = [
             self.plot_basic_spikes, self.plot_basic_acg, self.plot_basic_isi, self.plot_raw,
             self.plot_psth_lines, self.plot_psth_heat,
@@ -491,6 +564,24 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.gl_basic_wvf.setBackground(bg)
         self.gl_corr.setBackground(bg)
         self.gl_npyx.setBackground(bg)
+        self.psth_summary_card.setStyleSheet(
+            "QFrame#psthSummaryCard {"
+            f"background: {card_bg};"
+            f"border: 1px solid {card_border};"
+            "border-radius: 14px;"
+            "}"
+            "QLabel#psthSummaryTitle {"
+            f"color: {fg};"
+            "font-size: 13px;"
+            "font-weight: 700;"
+            "}"
+            "QLabel#psthSummaryMeta {"
+            f"color: {meta_fg};"
+            "font-size: 11px;"
+            "}"
+        )
+        self.lbl_psth_hint.setStyleSheet(f"color: {meta_fg}; font-size: 11px;")
+        self.lbl_psth_trial_status.setStyleSheet(f"color: {meta_fg}; font-size: 11px;")
 
     def _subplot_shape(self, n: int) -> tuple[int, int]:
         if n <= 1:
@@ -511,6 +602,80 @@ class PostProcessingTab(QtWidgets.QWidget):
             plot.setLabel("left", left)
         if bottom:
             plot.setLabel("bottom", bottom)
+
+    def _psth_palette(self, count: int) -> list[tuple[int, int, int]]:
+        if self._plot_theme == "Dark":
+            base = [
+                (107, 174, 255),
+                (255, 122, 156),
+                (104, 218, 193),
+                (255, 210, 112),
+                (182, 148, 255),
+                (255, 164, 103),
+            ]
+        else:
+            base = [
+                (45, 128, 216),
+                (222, 78, 121),
+                (19, 165, 137),
+                (220, 162, 47),
+                (126, 95, 228),
+                (230, 126, 34),
+            ]
+        if count <= len(base):
+            return base[:count]
+        return [base[i % len(base)] for i in range(count)]
+
+    def _update_psth_trial_status(self) -> None:
+        start = int(self.sp_psth_trial_from.value())
+        stop = int(self.sp_psth_trial_to.value())
+        if stop <= 0:
+            text = f"Trial filter: using trials {start}\u2013last within each condition."
+        else:
+            lo, hi = sorted((start, stop))
+            text = f"Trial filter: using trials {lo}\u2013{hi} within each condition."
+        self.lbl_psth_trial_status.setText(text)
+
+    def _reset_psth_trial_range(self) -> None:
+        blockers = [QtCore.QSignalBlocker(self.sp_psth_trial_from), QtCore.QSignalBlocker(self.sp_psth_trial_to)]
+        self.sp_psth_trial_from.setValue(1)
+        self.sp_psth_trial_to.setValue(0)
+        del blockers
+        self._on_psth_trial_range_changed()
+
+    def _on_psth_trial_range_changed(self) -> None:
+        self._update_psth_trial_status()
+        if self.analysis_tabs.currentIndex() == 3 and "psth" in self.results:
+            self._show_psth()
+
+    def _condition_trial_slice(self, total_trials: int) -> tuple[slice, dict]:
+        total = max(0, int(total_trials))
+        requested_start = max(1, int(self.sp_psth_trial_from.value()))
+        requested_stop_raw = int(self.sp_psth_trial_to.value())
+        if total == 0:
+            return slice(0, 0), {
+                "total_trials": 0,
+                "requested_start": requested_start,
+                "requested_stop": None if requested_stop_raw <= 0 else requested_stop_raw,
+                "actual_start": 0,
+                "actual_stop": 0,
+                "used_trials": 0,
+            }
+        stop_value = total if requested_stop_raw <= 0 else max(1, requested_stop_raw)
+        start_value = requested_start
+        if stop_value < start_value:
+            start_value, stop_value = stop_value, start_value
+        start_value = min(start_value, total)
+        stop_value = min(stop_value, total)
+        used = max(0, stop_value - start_value + 1)
+        return slice(start_value - 1, stop_value), {
+            "total_trials": total,
+            "requested_start": requested_start,
+            "requested_stop": None if requested_stop_raw <= 0 else requested_stop_raw,
+            "actual_start": start_value,
+            "actual_stop": stop_value,
+            "used_trials": used,
+        }
 
     def _best_channel_index(self, unit: int, waveform: Optional[np.ndarray] = None) -> Optional[int]:
         if self.dataset is None:
@@ -1005,7 +1170,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         if src == "Bombcell":
             for key in ["bombcell_label", "label", "group", "kslabel"]:
                 if key in row.index:
-                    return str(row[key]).strip().lower() == "good"
+                    return _is_bombcell_good_label(row[key])
             return False
         if src == "Phy":
             return "group" in row and str(row["group"]).lower() in {"good", "single", "singleunit"}
@@ -1156,28 +1321,65 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._log("Computing condition PSTH...")
         self._set_progress(10)
         try:
-            cond: Dict[str, np.ndarray] = {}
+            condition_entries: List[dict] = []
+            t_ref = np.array([], dtype=float)
             for r in range(self.tbl_conditions.rowCount()):
-                name_item = self.tbl_conditions.item(r, 0)
-                file_item = self.tbl_conditions.item(r, 1)
-                name = (name_item.text().strip() if name_item else "")
-                fpath = (file_item.text().strip() if file_item else "")
-                if not name or not fpath:
+                name = self._condition_name_for_row(r)
+                fpath = self._condition_path_for_row(r)
+                selected_label = self._condition_selected_label(r)
+                if not fpath:
                     continue
                 p = Path(fpath)
                 if not p.exists():
+                    self._log(f"PSTH compute: missing CSV for row {r + 1}: {fpath}")
                     continue
-                ev = self._load_event_csv(fpath)
-                if ev.size:
-                    cond[name] = ev
-            if not cond:
+                ev = self._load_event_csv(fpath, selected_label=selected_label)
+                if ev.size == 0:
+                    label_desc = f" [{selected_label}]" if selected_label else ""
+                    self._log(f"PSTH compute: no valid events in {p.name}{label_desc}.")
+                    continue
+                condition_unit_ids: List[int] = []
+                condition_trial_mats: List[np.ndarray] = []
+                for unit in units:
+                    t_ms, trial_mat = self.dataset.psth_trials(
+                        int(unit),
+                        ev,
+                        float(self.sp_psth_pre.value()),
+                        float(self.sp_psth_post.value()),
+                        float(self.sp_psth_bin.value()),
+                    )
+                    if t_ms.size == 0 or trial_mat.size == 0:
+                        continue
+                    if t_ref.size == 0:
+                        t_ref = np.asarray(t_ms, dtype=float)
+                    condition_unit_ids.append(int(unit))
+                    condition_trial_mats.append(np.asarray(trial_mat, dtype=float))
+                if t_ref.size == 0 or not condition_trial_mats:
+                    label_desc = f" [{selected_label}]" if selected_label else ""
+                    self._log(f"PSTH compute: unable to build PSTH for {name}{label_desc}.")
+                    continue
+                condition_entries.append(
+                    {
+                        "condition": str(name),
+                        "selected_label": str(selected_label),
+                        "source_csv": str(p),
+                        "unit_ids": list(condition_unit_ids),
+                        "unit_trial_mats": list(condition_trial_mats),
+                        "trial_count": int(ev.size),
+                    }
+                )
+            if not condition_entries or t_ref.size == 0:
                 self._log("PSTH compute: no valid conditions.")
                 self._set_progress(0)
                 return
-            t_ms, labels, mat = self.dataset.psth_conditions(
-                units, cond, float(self.sp_psth_pre.value()), float(self.sp_psth_post.value()), float(self.sp_psth_bin.value())
-            )
-            self.results["psth"] = {"t_ms": t_ms, "labels": labels, "mat": mat}
+            self.results["psth"] = {
+                "t_ms": np.asarray(t_ref, dtype=float),
+                "conditions": list(condition_entries),
+                "units": [int(u) for u in units],
+                "pre_s": float(self.sp_psth_pre.value()),
+                "post_s": float(self.sp_psth_post.value()),
+                "bin_ms": float(self.sp_psth_bin.value()),
+            }
             self._set_progress(100)
             self._log("Condition PSTH computed.")
             self._show_psth()
@@ -1529,7 +1731,8 @@ class PostProcessingTab(QtWidgets.QWidget):
         r = self.tbl_conditions.rowCount()
         self.tbl_conditions.insertRow(r)
         self.tbl_conditions.setItem(r, 0, QtWidgets.QTableWidgetItem(f"cond_{r+1}"))
-        self.tbl_conditions.setItem(r, 1, QtWidgets.QTableWidgetItem(""))
+        self._set_condition_label_options(r, [], "")
+        self.tbl_conditions.setItem(r, 2, QtWidgets.QTableWidgetItem(""))
 
     def _remove_condition_row(self) -> None:
         rows = sorted({i.row() for i in self.tbl_conditions.selectedIndexes()}, reverse=True)
@@ -1546,42 +1749,386 @@ class PostProcessingTab(QtWidgets.QWidget):
         start = self.settings.value("paths/last_folder", str(Path.cwd()))
         fp, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select condition events CSV", str(start), "CSV files (*.csv)")
         if fp:
-            self.tbl_conditions.setItem(row, 1, QtWidgets.QTableWidgetItem(fp))
+            self.settings.setValue("paths/last_folder", str(Path(fp).parent))
+            self._apply_condition_csv_to_row(row, fp)
             self._refresh_current_page()
 
     def _on_conditions_changed(self, _item: QtWidgets.QTableWidgetItem) -> None:
+        if _item is not None and _item.column() == 2:
+            path = self._condition_path_for_row(_item.row())
+            if path:
+                self._apply_condition_csv_to_row(_item.row(), path, preserve_name=True, announce=False)
         if self.analysis_tabs.currentIndex() == 3:
             self._refresh_current_page()
 
-    def _load_event_csv(self, path: str) -> np.ndarray:
-        df = pd.read_csv(path)
-        for c in ["time_s", "time", "event_time_s"]:
-            if c in df.columns:
-                return pd.to_numeric(df[c], errors="coerce").dropna().to_numpy(dtype=float)
-        if df.shape[1] > 0:
-            return pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna().to_numpy(dtype=float)
-        return np.array([], dtype=float)
+    def _condition_label_combo(self, row: int) -> Optional[QtWidgets.QComboBox]:
+        widget = self.tbl_conditions.cellWidget(row, 1)
+        return widget if isinstance(widget, QtWidgets.QComboBox) else None
+
+    def _set_condition_label_options(self, row: int, labels: List[str], selected_label: str = "") -> None:
+        combo = self._condition_label_combo(row)
+        if combo is None:
+            combo = QtWidgets.QComboBox(self.tbl_conditions)
+            combo.currentIndexChanged.connect(self._on_condition_label_selection_changed)
+            self.tbl_conditions.setCellWidget(row, 1, combo)
+        current = str(selected_label or combo.currentData() or "").strip()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("All events", "")
+        for label in labels:
+            combo.addItem(str(label), str(label))
+        if current:
+            idx = combo.findData(current)
+            if idx < 0:
+                idx = combo.findText(current)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            elif combo.count() > 1:
+                combo.setCurrentIndex(1)
+            else:
+                combo.setCurrentIndex(0)
+        else:
+            combo.setCurrentIndex(1 if combo.count() > 1 else 0)
+        combo.setEnabled(combo.count() > 1)
+        combo.blockSignals(False)
+
+    def _condition_selected_label(self, row: int) -> str:
+        combo = self._condition_label_combo(row)
+        if combo is None:
+            return ""
+        value = combo.currentData()
+        if value is None:
+            value = combo.currentText()
+        return str(value or "").strip()
+
+    def _condition_name_for_row(self, row: int) -> str:
+        name_item = self.tbl_conditions.item(row, 0)
+        name = name_item.text().strip() if name_item else ""
+        if name:
+            return name
+        label = self._condition_selected_label(row)
+        if label:
+            return label
+        path = self._condition_path_for_row(row)
+        return Path(path).stem if path else f"cond_{row + 1}"
+
+    def _condition_path_for_row(self, row: int) -> str:
+        file_item = self.tbl_conditions.item(row, 2)
+        return file_item.text().strip() if file_item else ""
+
+    def _apply_condition_csv_to_row(
+        self,
+        row: int,
+        path: str,
+        *,
+        preserve_name: bool = False,
+        announce: bool = True,
+    ) -> None:
+        csv_path = str(path).strip()
+        if not csv_path:
+            self._set_condition_label_options(row, [], "")
+            return
+        try:
+            info = inspect_event_csv(csv_path)
+        except Exception as exc:
+            self._log(f"Events CSV read failed: {exc}")
+            return
+        labels = [str(v) for v in info.get("labels", [])]
+        current_selected_label = self._condition_selected_label(row)
+        if current_selected_label and current_selected_label in labels:
+            selected_label = current_selected_label
+        else:
+            selected_label = labels[0] if labels else ""
+        blocker = QtCore.QSignalBlocker(self.tbl_conditions)
+        self.tbl_conditions.setItem(row, 2, QtWidgets.QTableWidgetItem(csv_path))
+        name_item = self.tbl_conditions.item(row, 0)
+        current_name = name_item.text().strip() if name_item else ""
+        auto_name = selected_label or Path(csv_path).stem
+        if (not preserve_name) or (not current_name) or current_name.startswith("cond_"):
+            self.tbl_conditions.setItem(row, 0, QtWidgets.QTableWidgetItem(auto_name))
+        del blocker
+        self._set_condition_label_options(row, labels, selected_label)
+        time_column = str(info.get("time_column") or "")
+        label_column = str(info.get("label_column") or "")
+        if announce:
+            if time_column and label_column:
+                self._log(
+                    f"Events CSV loaded: {Path(csv_path).name} | time='{time_column}' | "
+                    f"label='{label_column}' ({len(labels)} labels)"
+                )
+            elif time_column:
+                self._log(f"Events CSV loaded: {Path(csv_path).name} | time='{time_column}' | all rows")
+            else:
+                self._log(f"Events CSV loaded but no numeric event-time column was detected: {Path(csv_path).name}")
+
+    def _on_condition_label_selection_changed(self, _index: int) -> None:
+        combo = self.sender()
+        if isinstance(combo, QtWidgets.QComboBox):
+            for row in range(self.tbl_conditions.rowCount()):
+                if self.tbl_conditions.cellWidget(row, 1) is combo:
+                    name_item = self.tbl_conditions.item(row, 0)
+                    current_name = name_item.text().strip() if name_item else ""
+                    if (not current_name) or current_name.startswith("cond_"):
+                        auto_name = self._condition_selected_label(row) or Path(self._condition_path_for_row(row) or "").stem or f"cond_{row + 1}"
+                        blocker = QtCore.QSignalBlocker(self.tbl_conditions)
+                        self.tbl_conditions.setItem(row, 0, QtWidgets.QTableWidgetItem(auto_name))
+                        del blocker
+                    break
+        if self.analysis_tabs.currentIndex() == 3:
+            self._refresh_current_page()
+
+    def _load_event_csv(self, path: str, selected_label: str = "") -> np.ndarray:
+        return load_event_times(path, selected_label=selected_label).to_numpy(dtype=float)
 
     def _visualize_condition_psth(self, r: Dict[str, object]) -> None:
         self.plot_psth_lines.clear()
         self.plot_psth_heat.clear()
         t_ms = np.asarray(r.get("t_ms", []), dtype=float)
-        labels = list(r.get("labels", []))
-        mat = np.asarray(r.get("mat", []), dtype=float)
-        if t_ms.size == 0 or mat.size == 0:
+        conditions = list(r.get("conditions", []))
+        units = [int(v) for v in r.get("units", [])]
+        if t_ms.size == 0 or not conditions:
+            self.lbl_psth_summary.setText("Condition PSTH is ready after you compute it.")
+            self.lbl_psth_summary_meta.setText(
+                "Select units, choose an event label, then use Compute. Trial-range changes are applied on the displayed heatmap and averages."
+            )
             return
-        for i, lab in enumerate(labels):
-            self.plot_psth_lines.plot(t_ms, mat[i], pen=pg.mkPen(pg.intColor(i), width=1.5), name=lab)
-        img = pg.ImageItem(mat)
-        cm = pg.colormap.get("CET-L9" if self._plot_theme == "Dark" else "CET-L4")
-        if cm is not None:
-            img.setLookupTable(cm.getLookupTable(nPts=256))
-        self.plot_psth_heat.addItem(img)
-        self.plot_psth_heat.getViewBox().invertY(True)
-        psth_rows: list[dict] = []
-        for i, lab in enumerate(labels):
-            psth_rows.extend([{"condition": str(lab), "time_ms": float(tv), "rate_hz": float(rv)} for tv, rv in zip(t_ms, mat[i])])
-        self._export_payloads["psth"] = [("condition_psth.csv", pd.DataFrame(psth_rows))]
+
+        single_unit = len(units) == 1
+        fg = "#e8eef7" if self._plot_theme == "Dark" else "#1a1f29"
+        title_color = fg
+        zero_pen = pg.mkPen((120, 120, 120), width=1, style=QtCore.Qt.DashLine)
+        pre_ms = float(r.get("pre_s", self.sp_psth_pre.value())) * 1000.0
+        pre_region_brush = pg.mkBrush(91, 155, 255, 20) if self._plot_theme == "Dark" else pg.mkBrush(67, 128, 255, 16)
+        palette = self._psth_palette(len(conditions))
+
+        plot_item = self.plot_psth_lines.getPlotItem()
+        if plot_item.legend is not None:
+            plot_item.legend.scene().removeItem(plot_item.legend)
+            plot_item.legend = None
+        plot_item.addLegend(offset=(12, 12))
+        self._style_plot_item(plot_item, left="Rate (Hz)", bottom="Time (ms) relative to event")
+        self.plot_psth_lines.setTitle(
+            "Condition PSTH | mean \u00b1 SEM across trials" if single_unit else "Condition PSTH | mean across units",
+            color=title_color,
+            size="11pt",
+        )
+        if pre_ms > 0:
+            self.plot_psth_lines.addItem(
+                pg.LinearRegionItem(
+                    values=(-pre_ms, 0.0),
+                    orientation="vertical",
+                    brush=pre_region_brush,
+                    pen=pg.mkPen((0, 0, 0, 0)),
+                    movable=False,
+                )
+            )
+        self.plot_psth_lines.addItem(pg.InfiniteLine(pos=0.0, angle=90, movable=False, pen=zero_pen))
+
+        heat_rows: list[np.ndarray] = []
+        heat_labels: list[str] = []
+        heat_meta: list[dict] = []
+        heat_boundaries: list[int] = []
+        mean_rows: list[dict] = []
+        summary_parts: list[str] = []
+        valid_conditions = 0
+
+        for i, entry in enumerate(conditions):
+            condition_name = str(entry.get("condition", f"cond_{i + 1}"))
+            unit_ids = [int(v) for v in entry.get("unit_ids", units)]
+            unit_trial_mats = [np.asarray(v, dtype=float) for v in entry.get("unit_trial_mats", [])]
+            if not unit_trial_mats:
+                continue
+            trial_slice, trial_info = self._condition_trial_slice(int(entry.get("trial_count", 0)))
+            used_trials = int(trial_info.get("used_trials", 0))
+            if used_trials <= 0:
+                continue
+
+            color = palette[valid_conditions % len(palette)]
+            valid_conditions += 1
+            if single_unit:
+                trial_mat = unit_trial_mats[0][trial_slice]
+                if trial_mat.size == 0:
+                    continue
+                line_mean = np.nanmean(trial_mat, axis=0)
+                line_sem = (
+                    np.nanstd(trial_mat, axis=0, ddof=1) / math.sqrt(float(trial_mat.shape[0]))
+                    if trial_mat.shape[0] > 1
+                    else np.zeros(trial_mat.shape[1], dtype=float)
+                )
+                upper = pg.PlotCurveItem(t_ms, line_mean + line_sem, pen=pg.mkPen(color[0], color[1], color[2], 0))
+                lower = pg.PlotCurveItem(
+                    t_ms,
+                    np.maximum(0.0, line_mean - line_sem),
+                    pen=pg.mkPen(color[0], color[1], color[2], 0),
+                )
+                plot_item.addItem(upper)
+                plot_item.addItem(lower)
+                plot_item.addItem(
+                    pg.FillBetweenItem(
+                        upper,
+                        lower,
+                        brush=pg.mkBrush(color[0], color[1], color[2], 48 if self._plot_theme == "Dark" else 36),
+                    )
+                )
+                legend_name = f"{condition_name} (n={trial_mat.shape[0]} trials)"
+                for offset, row_values in enumerate(trial_mat):
+                    actual_trial = int(trial_info["actual_start"]) + offset
+                    display_label = f"T{actual_trial}" if len(conditions) == 1 else f"{condition_name} \u00b7 T{actual_trial}"
+                    heat_rows.append(np.asarray(row_values, dtype=float))
+                    heat_labels.append(display_label)
+                    heat_meta.append(
+                        {
+                            "condition": condition_name,
+                            "row_kind": "trial",
+                            "unit_id": int(unit_ids[0]),
+                            "trial_index": actual_trial,
+                            "n_trials_averaged": 1,
+                            "display_label": display_label,
+                        }
+                    )
+                aggregate_count = int(trial_mat.shape[0])
+                aggregate_mode = "trial_mean_sem"
+            else:
+                unit_rows: list[np.ndarray] = []
+                for unit_id, unit_trial_mat in zip(unit_ids, unit_trial_mats):
+                    visible_trials = np.asarray(unit_trial_mat[trial_slice], dtype=float)
+                    if visible_trials.size == 0:
+                        continue
+                    unit_mean = np.nanmean(visible_trials, axis=0)
+                    unit_rows.append(unit_mean)
+                    display_label = str(int(unit_id)) if len(conditions) == 1 else f"{condition_name} \u00b7 {int(unit_id)}"
+                    heat_rows.append(np.asarray(unit_mean, dtype=float))
+                    heat_labels.append(display_label)
+                    heat_meta.append(
+                        {
+                            "condition": condition_name,
+                            "row_kind": "unit_average",
+                            "unit_id": int(unit_id),
+                            "trial_index": -1,
+                            "n_trials_averaged": int(visible_trials.shape[0]),
+                            "display_label": display_label,
+                        }
+                    )
+                if not unit_rows:
+                    continue
+                unit_mat = np.vstack(unit_rows)
+                line_mean = np.nanmean(unit_mat, axis=0)
+                line_sem = None
+                legend_name = f"{condition_name} (n={unit_mat.shape[0]} units)"
+                aggregate_count = int(unit_mat.shape[0])
+                aggregate_mode = "unit_mean"
+
+            self.plot_psth_lines.plot(
+                t_ms,
+                line_mean,
+                pen=pg.mkPen(color, width=2.4),
+                name=legend_name,
+            )
+            mean_rows.extend(
+                [
+                    {
+                        "condition": condition_name,
+                        "time_ms": float(tv),
+                        "mean_rate_hz": float(rv),
+                        "sem_rate_hz": float(line_sem[idx]) if line_sem is not None else np.nan,
+                        "aggregation": aggregate_mode,
+                        "n_rows": aggregate_count,
+                        "trial_start": int(trial_info["actual_start"]),
+                        "trial_stop": int(trial_info["actual_stop"]),
+                        "total_trials": int(trial_info["total_trials"]),
+                    }
+                    for idx, (tv, rv) in enumerate(zip(t_ms, line_mean))
+                ]
+            )
+            heat_boundaries.append(len(heat_rows))
+            summary_parts.append(
+                f"{condition_name}: {int(trial_info['used_trials'])}/{int(trial_info['total_trials'])} trials"
+            )
+
+        if valid_conditions == 0:
+            self.lbl_psth_summary.setText("Condition PSTH is ready after you compute it.")
+            self.lbl_psth_summary_meta.setText("No conditions matched the selected trial range.")
+            self._export_payloads["psth"] = []
+            return
+
+        heat_mat = np.vstack(heat_rows) if heat_rows else np.zeros((0, t_ms.size), dtype=float)
+        heat_plot_item = self.plot_psth_heat.getPlotItem()
+        self._style_plot_item(
+            heat_plot_item,
+            left="Trial" if single_unit else "Unit average",
+            bottom="Time (ms) relative to event",
+        )
+        self.plot_psth_heat.setTitle(
+            "Condition PSTH heatmap | trial rows" if single_unit else "Condition PSTH heatmap | unit-average rows",
+            color=title_color,
+            size="11pt",
+        )
+        if pre_ms > 0:
+            self.plot_psth_heat.addItem(
+                pg.LinearRegionItem(
+                    values=(-pre_ms, 0.0),
+                    orientation="vertical",
+                    brush=pre_region_brush,
+                    pen=pg.mkPen((0, 0, 0, 0)),
+                    movable=False,
+                )
+            )
+        if heat_mat.size:
+            img = pg.ImageItem(heat_mat)
+            cm = (
+                pg.colormap.get("CET-L17")
+                or pg.colormap.get("CET-L9" if self._plot_theme == "Dark" else "CET-L4")
+            )
+            if cm is not None:
+                img.setLookupTable(cm.getLookupTable(nPts=256))
+            vmax = float(np.nanpercentile(heat_mat, 99.0)) if np.isfinite(np.nanmax(heat_mat)) else 1.0
+            img.setLevels((0.0, max(vmax, 1.0)))
+            dt = float(np.median(np.diff(t_ms))) if t_ms.size > 1 else 1.0
+            x0 = float(t_ms[0] - 0.5 * dt)
+            img.setRect(QtCore.QRectF(x0, 0.0, float(dt * heat_mat.shape[1]), float(heat_mat.shape[0])))
+            self.plot_psth_heat.addItem(img)
+            self.plot_psth_heat.addItem(pg.InfiniteLine(pos=0.0, angle=90, movable=False, pen=zero_pen))
+            for boundary in heat_boundaries[:-1]:
+                self.plot_psth_heat.addItem(pg.InfiniteLine(pos=float(boundary), angle=0, movable=False, pen=zero_pen))
+            self.plot_psth_heat.getViewBox().invertY(True)
+            if heat_labels:
+                stride = max(1, int(math.ceil(len(heat_labels) / 18.0)))
+                ticks = [(float(i) + 0.5, heat_labels[i]) for i in range(0, len(heat_labels), stride)]
+                self.plot_psth_heat.getAxis("left").setTicks([ticks])
+        heat_export_rows: list[dict] = []
+        for row_index, (row_meta, row_values) in enumerate(zip(heat_meta, heat_mat), start=1):
+            heat_export_rows.extend(
+                [
+                    {
+                        "row_index": int(row_index),
+                        "condition": str(row_meta.get("condition", "")),
+                        "row_kind": str(row_meta.get("row_kind", "")),
+                        "display_label": str(row_meta.get("display_label", "")),
+                        "unit_id": int(row_meta.get("unit_id", -1)),
+                        "trial_index": int(row_meta.get("trial_index", -1)),
+                        "n_trials_averaged": int(row_meta.get("n_trials_averaged", 0)),
+                        "time_ms": float(tv),
+                        "rate_hz": float(rv),
+                    }
+                    for tv, rv in zip(t_ms, row_values)
+                ]
+            )
+        trial_mode_text = (
+            "Heatmap rows show trials; lines show mean \u00b1 SEM across the selected trials."
+            if single_unit
+            else "Heatmap rows show unit averages across the selected trials; lines show the mean across units."
+        )
+        requested_range_text = self.lbl_psth_trial_status.text().replace("Trial filter: ", "").strip()
+        self.lbl_psth_summary.setText(
+            f"Condition PSTH \u00b7 {len(units)} selected unit{'s' if len(units) != 1 else ''} \u00b7 {requested_range_text}"
+        )
+        self.lbl_psth_summary_meta.setText(
+            f"{trial_mode_text}  {'  |  '.join(summary_parts)}"
+        )
+        self._export_payloads["psth"] = [
+            ("condition_psth_average.csv", pd.DataFrame(mean_rows)),
+            ("condition_psth_heatmap.csv", pd.DataFrame(heat_export_rows)),
+        ]
         self.view_tabs.setCurrentIndex(3)
 
     def _visualize_network(self, r: Dict[str, object]) -> None:

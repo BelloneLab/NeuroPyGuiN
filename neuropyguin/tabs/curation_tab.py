@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 from scipy import signal as sps
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from ..bombcell_core import (
@@ -24,7 +24,16 @@ from ..bombcell_core import (
 from ..ecephys_runtime import ecephys_subprocess_env
 from ..ks_output_resolver import find_kilosort_output_dir, find_metrics_file
 from ..phy_integration import ensure_phy_short_isi_plugin
-from ..pybombcell_integration import run_pybombcell_on_folder
+from ..preprocessing import infer_completed_run_name
+from ..pybombcell_integration import (
+    PYBOMBCELL_SETTINGS_SCHEMA,
+    launch_pybombcell_gui,
+    normalize_pybombcell_settings,
+    pybombcell_default_settings,
+    run_pybombcell_on_folder,
+    run_pybombcell_on_folders,
+    summarize_saved_pybombcell_results,
+)
 from ..side_nav import SideNavStack
 from ..workers import FunctionWorker
 
@@ -159,6 +168,128 @@ def _repair_phy_params_path(ks_folder: Path) -> Optional[str]:
     return f"Repaired params.py dat_path -> {absolute_path}"
 
 
+def _preferred_metrics_file(ks_folder: Path) -> Optional[Path]:
+    bombcell_metrics = ks_folder / "bombcell" / "templates._bc_qMetrics.csv"
+    if bombcell_metrics.exists():
+        return bombcell_metrics
+    return find_metrics_file(ks_folder, max_depth=4)
+
+
+class PyBombcellSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, settings: Dict[str, object], parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._values = normalize_pybombcell_settings(settings)
+        self.setWindowTitle("py_bombcell Defaults")
+        self.resize(840, 760)
+        self._build_ui()
+
+    @staticmethod
+    def _format_value(value: object) -> str:
+        try:
+            if np.isnan(value):
+                return "NaN"
+        except Exception:
+            pass
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
+    @staticmethod
+    def _type_label(value: object) -> str:
+        try:
+            if np.isnan(value):
+                return "float"
+        except Exception:
+            pass
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int) and not isinstance(value, bool):
+            return "int"
+        if isinstance(value, float):
+            return "float"
+        return "str"
+
+    @staticmethod
+    def _parse_value(text: str, default: object) -> object:
+        raw = (text or "").strip()
+        if isinstance(default, bool):
+            lowered = raw.lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+            raise ValueError("Expected a boolean value")
+        if isinstance(default, int) and not isinstance(default, bool):
+            return int(float(raw))
+        if isinstance(default, float):
+            if raw.lower() == "nan":
+                return float("nan")
+            return float(raw)
+        return raw
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel(
+            "These values are merged into py_bombcell's bundled defaults for every run. "
+            "Use `true`/`false` for booleans and `NaN` for undefined float thresholds."
+        )
+        hint.setObjectName("SectionHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setAlternatingRowColors(True)
+        self.table.setHorizontalHeaderLabels(["Parameter", "Value", "Type"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        layout.addWidget(self.table, 1)
+
+        self._populate(self._values)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        btn_reset = buttons.addButton("Reset bundled defaults", QtWidgets.QDialogButtonBox.ResetRole)
+        btn_reset.clicked.connect(lambda: self._populate(pybombcell_default_settings()))
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _populate(self, values: Dict[str, object]) -> None:
+        self.table.setRowCount(0)
+        for key, default in PYBOMBCELL_SETTINGS_SCHEMA:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            value = values.get(key, default)
+            key_item = QtWidgets.QTableWidgetItem(str(key))
+            key_item.setFlags(key_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            type_item = QtWidgets.QTableWidgetItem(self._type_label(default))
+            type_item.setFlags(type_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table.setItem(row, 0, key_item)
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(self._format_value(value)))
+            self.table.setItem(row, 2, type_item)
+        self.table.resizeColumnsToContents()
+
+    def _accept(self) -> None:
+        values: Dict[str, object] = {}
+        for row, (key, default) in enumerate(PYBOMBCELL_SETTINGS_SCHEMA):
+            item = self.table.item(row, 1)
+            raw = item.text() if item is not None else ""
+            try:
+                values[key] = self._parse_value(raw, default)
+            except Exception as exc:
+                self.table.setCurrentCell(row, 1)
+                QtWidgets.QMessageBox.warning(self, "Invalid py_bombcell Value", f"{key}: {exc}")
+                return
+        self._values = normalize_pybombcell_settings(values)
+        self.accept()
+
+    def values(self) -> Dict[str, object]:
+        return dict(self._values)
+
+
 class CurationTab(QtWidgets.QWidget):
     def __init__(self, thread_pool: QtCore.QThreadPool) -> None:
         super().__init__()
@@ -166,6 +297,8 @@ class CurationTab(QtWidgets.QWidget):
         self.settings = QtCore.QSettings("NeuroPyGuiN", "NeuroPyGuiN")
         self.metrics_df = pd.DataFrame()
         self.preview_labels = pd.DataFrame()
+        self.ks_folders: List[str] = []
+        self._pybombcell_settings = pybombcell_default_settings()
         self._updating_table = False
         self._plot_lines: List[pg.PlotDataItem] = []
         self._metric_plots: List[pg.PlotItem] = []
@@ -181,6 +314,9 @@ class CurationTab(QtWidgets.QWidget):
         self._right_metrics: Optional[QtWidgets.QWidget] = None
         self._right_metrics_l: Optional[QtWidgets.QVBoxLayout] = None
         self._body_sizes_before_detach: List[int] = []
+        self._plot_theme = "Light"
+        self._show_grid = True
+        self._updating_pybomb_table = False
 
         self.phy_process = QtCore.QProcess(self)
         self.phy_process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
@@ -195,8 +331,6 @@ class CurationTab(QtWidgets.QWidget):
         self._build_ui()
         self._reset_thresholds()
         self._restore_settings()
-        self._plot_theme = "Light"
-        self._show_grid = True
 
     def _build_ui(self) -> None:
         main = QtWidgets.QVBoxLayout(self)
@@ -218,23 +352,57 @@ class CurationTab(QtWidgets.QWidget):
         phy_layout = QtWidgets.QVBoxLayout(grp_phy)
         phy_layout.setSpacing(10)
         phy_hint = QtWidgets.QLabel(
-            "Launch Phy for manual template review. This section stays minimal because it does not need the metric visualisation panel."
+            "Keep a working list of Kilosort folders here. Select one folder to open it in Phy or review its py_bombcell outputs."
         )
         phy_hint.setObjectName("SectionHint")
         phy_hint.setWordWrap(True)
         phy_layout.addWidget(phy_hint)
+        self.ed_phy_folder = QtWidgets.QLineEdit()
+        self.ed_phy_folder.setReadOnly(True)
+        self.ed_bomb_folder = QtWidgets.QLineEdit()
+        self.ed_bomb_folder.setReadOnly(True)
+        self.list_ks_folders = QtWidgets.QListWidget()
+        self.list_ks_folders.setAlternatingRowColors(True)
+        self.list_ks_folders.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.list_ks_folders.setMinimumHeight(420)
+        self.list_ks_folders.setSpacing(6)
+        self.list_ks_folders.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.list_ks_folders.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        phy_layout.addWidget(self.list_ks_folders, 1)
+
+        folder_actions = QtWidgets.QHBoxLayout()
+        self.btn_add_ks_folder = QtWidgets.QPushButton("Add folder")
+        self.btn_remove_ks_folder = QtWidgets.QPushButton("Remove selected")
+        self.btn_clear_ks_folders = QtWidgets.QPushButton("Clear list")
+        self.btn_run_selected_pybomb = QtWidgets.QPushButton("Run py_bombcell on selected runs")
+        self.btn_open_selected_folder = QtWidgets.QPushButton("Open in Explorer")
+        self.btn_open_figures = QtWidgets.QPushButton("Open py_bombcell figures")
+        self.btn_open_bombcell_gui = QtWidgets.QPushButton("Open BombCell GUI")
+        self.btn_add_ks_folder.setProperty("role", "secondary")
+        self.btn_remove_ks_folder.setProperty("role", "ghost")
+        self.btn_clear_ks_folders.setProperty("role", "ghost")
+        self.btn_run_selected_pybomb.setProperty("role", "primary")
+        self.btn_open_selected_folder.setProperty("role", "ghost")
+        self.btn_open_figures.setProperty("role", "ghost")
+        self.btn_open_bombcell_gui.setProperty("role", "secondary")
+        folder_actions.addWidget(self.btn_add_ks_folder)
+        folder_actions.addWidget(self.btn_remove_ks_folder)
+        folder_actions.addWidget(self.btn_clear_ks_folders)
+        folder_actions.addWidget(self.btn_run_selected_pybomb)
+        folder_actions.addStretch(1)
+        phy_layout.addLayout(folder_actions)
+
         phy_row = QtWidgets.QHBoxLayout()
         phy_row.setSpacing(10)
-
-        self.ed_phy_folder = QtWidgets.QLineEdit()
-        btn_phy_folder = QtWidgets.QPushButton("Browse")
         self.btn_launch_phy = QtWidgets.QPushButton("Open in Phy")
         self.btn_stop_phy = QtWidgets.QPushButton("Stop")
         self.btn_launch_phy.setProperty("role", "primary")
         self.btn_stop_phy.setProperty("role", "ghost")
-        phy_row.addWidget(QtWidgets.QLabel("Curated folder"))
+        phy_row.addWidget(QtWidgets.QLabel("Current folder"))
         phy_row.addWidget(self.ed_phy_folder, 1)
-        phy_row.addWidget(btn_phy_folder)
+        phy_row.addWidget(self.btn_open_selected_folder)
+        phy_row.addWidget(self.btn_open_figures)
+        phy_row.addWidget(self.btn_open_bombcell_gui)
         phy_row.addWidget(self.btn_launch_phy)
         phy_row.addWidget(self.btn_stop_phy)
         phy_layout.addLayout(phy_row)
@@ -245,16 +413,17 @@ class CurationTab(QtWidgets.QWidget):
         bomb_layout.setSpacing(10)
 
         bomb_top = QtWidgets.QHBoxLayout()
-        self.ed_bomb_folder = QtWidgets.QLineEdit()
-        btn_bomb_folder = QtWidgets.QPushButton("Browse")
-        self.btn_load_metrics = QtWidgets.QPushButton("Load metrics.csv")
-        self.btn_run_pybomb = QtWidgets.QPushButton("Run py_bombcell")
+        self.btn_load_metrics = QtWidgets.QPushButton("Load active metrics")
+        self.btn_run_pybomb = QtWidgets.QPushButton("Run py_bombcell on active folder")
         self.btn_load_metrics.setProperty("role", "secondary")
         self.btn_run_pybomb.setProperty("role", "primary")
-        bomb_top.addWidget(self.ed_bomb_folder, 1)
-        bomb_top.addWidget(btn_bomb_folder)
         bomb_top.addWidget(self.btn_load_metrics)
         bomb_top.addWidget(self.btn_run_pybomb)
+
+        review_folder_row = QtWidgets.QHBoxLayout()
+        review_folder_row.setSpacing(10)
+        review_folder_row.addWidget(QtWidgets.QLabel("Active folder"))
+        review_folder_row.addWidget(self.ed_bomb_folder, 1)
 
         self.tbl_thresh = QtWidgets.QTableWidget(0, 5)
         self.tbl_thresh.setAlternatingRowColors(True)
@@ -291,6 +460,31 @@ class CurationTab(QtWidgets.QWidget):
         threshold_box.setProperty("settingsSection", True)
         threshold_l = QtWidgets.QVBoxLayout(threshold_box)
         threshold_l.addWidget(self.tbl_thresh, 1)
+
+        defaults_box = QtWidgets.QGroupBox("py_bombcell default parameters")
+        defaults_box.setProperty("settingsSection", True)
+        defaults_l = QtWidgets.QVBoxLayout(defaults_box)
+        defaults_hint = QtWidgets.QLabel(
+            "These are the default py_bombcell parameters used for reruns. They are separate from the live review thresholds."
+        )
+        defaults_hint.setObjectName("SectionHint")
+        defaults_hint.setWordWrap(True)
+        defaults_l.addWidget(defaults_hint)
+        self.tbl_pybomb_defaults = QtWidgets.QTableWidget(0, 3)
+        self.tbl_pybomb_defaults.setAlternatingRowColors(True)
+        self.tbl_pybomb_defaults.setHorizontalHeaderLabels(["Parameter", "Value", "Type"])
+        self.tbl_pybomb_defaults.horizontalHeader().setStretchLastSection(True)
+        self.tbl_pybomb_defaults.verticalHeader().setVisible(False)
+        defaults_l.addWidget(self.tbl_pybomb_defaults, 1)
+        defaults_actions = QtWidgets.QHBoxLayout()
+        self.btn_reset_pybomb_defaults = QtWidgets.QPushButton("Reset bundled defaults")
+        self.btn_apply_pybomb_defaults = QtWidgets.QPushButton("Apply default parameters")
+        self.btn_reset_pybomb_defaults.setProperty("role", "ghost")
+        self.btn_apply_pybomb_defaults.setProperty("role", "secondary")
+        defaults_actions.addStretch(1)
+        defaults_actions.addWidget(self.btn_reset_pybomb_defaults)
+        defaults_actions.addWidget(self.btn_apply_pybomb_defaults)
+        defaults_l.addLayout(defaults_actions)
         metric_box = QtWidgets.QGroupBox("Metric selection")
         metric_box.setProperty("settingsSection", True)
         metric_box_l = QtWidgets.QVBoxLayout(metric_box)
@@ -315,6 +509,12 @@ class CurationTab(QtWidgets.QWidget):
         self.lbl_noise = QtWidgets.QLabel("noise: 0")
         self.lbl_mua = QtWidgets.QLabel("mua: 0")
         self.lbl_non_soma = QtWidgets.QLabel("non_soma: 0")
+        self.report_plot = pg.PlotWidget()
+        self.report_plot.setMinimumHeight(180)
+        self.report_plot.hideAxis("left")
+        self.report_plot.showGrid(x=False, y=False)
+        self.report_plot.setMouseEnabled(x=False, y=False)
+        self.report_plot.setMenuEnabled(False)
         status_row = QtWidgets.QHBoxLayout()
         for w in [self.lbl_good, self.lbl_noise, self.lbl_mua, self.lbl_non_soma]:
             status_row.addWidget(w)
@@ -374,8 +574,10 @@ class CurationTab(QtWidgets.QWidget):
         review_hint.setObjectName("SectionHint")
         review_hint.setWordWrap(True)
         review_box_l.addWidget(review_hint)
+        review_box_l.addLayout(review_folder_row)
         review_box_l.addLayout(bomb_top)
         review_box_l.addLayout(status_row)
+        review_box_l.addWidget(self.report_plot)
         review_box_l.addLayout(action_row)
 
         units_box = QtWidgets.QGroupBox("Units")
@@ -396,6 +598,7 @@ class CurationTab(QtWidgets.QWidget):
         bomb_subsections.add_page("Review", _wrap_page(review_box, stretch=False))
         bomb_subsections.add_page("Units", _wrap_page(units_box, stretch=True))
         bomb_subsections.add_page("Thresholds", _wrap_page(threshold_box, stretch=True))
+        bomb_subsections.add_page("Defaults", _wrap_page(defaults_box, stretch=True))
         bomb_subsections.add_page("Metrics", _wrap_page(metric_box, stretch=True))
         bomb_subsections.setCurrentIndex(0)
 
@@ -457,20 +660,28 @@ class CurationTab(QtWidgets.QWidget):
             vertical_labels=True,
             compact_rail=True,
         )
-        main_sections.add_page("Phy", _wrap_page(grp_phy, stretch=False))
+        main_sections.add_page("Phy", _wrap_page(grp_phy, stretch=True))
         main_sections.add_page("Bombcell", _wrap_page(grp_bomb, stretch=True))
         main_sections.add_page("Log", _wrap_page(log_box, stretch=True))
         main_sections.setCurrentIndex(1)
         self._main_sections = main_sections
         main.addWidget(main_sections, 1)
 
-        btn_phy_folder.clicked.connect(lambda: self._pick_folder(self.ed_phy_folder))
-        btn_bomb_folder.clicked.connect(lambda: self._pick_folder(self.ed_bomb_folder))
+        self.btn_add_ks_folder.clicked.connect(self._add_ks_folder)
+        self.btn_remove_ks_folder.clicked.connect(self._remove_selected_ks_folders)
+        self.btn_clear_ks_folders.clicked.connect(self._clear_ks_folders)
+        self.btn_run_selected_pybomb.clicked.connect(self._run_pybombcell_on_selected_folders)
+        self.btn_open_selected_folder.clicked.connect(self._open_selected_folder_in_explorer)
+        self.btn_open_figures.clicked.connect(self._open_selected_figures_in_explorer)
+        self.btn_open_bombcell_gui.clicked.connect(self._open_selected_bombcell_gui)
+        self.list_ks_folders.itemSelectionChanged.connect(self._on_folder_selection_changed)
         self.btn_launch_phy.clicked.connect(self._launch_phy)
         self.btn_stop_phy.clicked.connect(self._stop_phy)
 
         self.btn_load_metrics.clicked.connect(self._load_metrics)
         self.btn_run_pybomb.clicked.connect(self._run_pybombcell)
+        self.btn_reset_pybomb_defaults.clicked.connect(self._reset_pybombcell_defaults_table)
+        self.btn_apply_pybomb_defaults.clicked.connect(self._apply_pybombcell_defaults)
         self.btn_copy_log.clicked.connect(self._copy_log)
         self.btn_reset.clicked.connect(self._reset_thresholds)
         self.btn_apply.clicked.connect(self._apply_settings)
@@ -490,16 +701,278 @@ class CurationTab(QtWidgets.QWidget):
         unit_split.splitterMoved.connect(lambda _pos, _idx: self._persist_splitter_sizes())
         bomb_subsections.currentChanged.connect(lambda _idx: self._persist_splitter_sizes())
 
-    def _pick_folder(self, target: QtWidgets.QLineEdit) -> None:
+    def show_phy_page(self) -> None:
+        if hasattr(self, "_main_sections"):
+            self._main_sections.setCurrentIndex(0)
+
+    def _populate_pybomb_defaults_table(self, values: Dict[str, object]) -> None:
+        if not hasattr(self, "tbl_pybomb_defaults"):
+            return
+        self._updating_pybomb_table = True
+        self.tbl_pybomb_defaults.setRowCount(0)
+        for key, default in PYBOMBCELL_SETTINGS_SCHEMA:
+            row = self.tbl_pybomb_defaults.rowCount()
+            self.tbl_pybomb_defaults.insertRow(row)
+            key_item = QtWidgets.QTableWidgetItem(str(key))
+            key_item.setFlags(key_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            type_item = QtWidgets.QTableWidgetItem(PyBombcellSettingsDialog._type_label(default))
+            type_item.setFlags(type_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            value_item = QtWidgets.QTableWidgetItem(
+                PyBombcellSettingsDialog._format_value(values.get(key, default))
+            )
+            self.tbl_pybomb_defaults.setItem(row, 0, key_item)
+            self.tbl_pybomb_defaults.setItem(row, 1, value_item)
+            self.tbl_pybomb_defaults.setItem(row, 2, type_item)
+        self.tbl_pybomb_defaults.resizeColumnsToContents()
+        self._updating_pybomb_table = False
+
+    def _current_pybombcell_settings_from_table(self) -> Dict[str, object]:
+        if not hasattr(self, "tbl_pybomb_defaults"):
+            return dict(self._pybombcell_settings)
+        values: Dict[str, object] = {}
+        for row, (key, default) in enumerate(PYBOMBCELL_SETTINGS_SCHEMA):
+            item = self.tbl_pybomb_defaults.item(row, 1)
+            raw = item.text() if item is not None else ""
+            values[key] = PyBombcellSettingsDialog._parse_value(raw, default)
+        return normalize_pybombcell_settings(values)
+
+    def _apply_pybombcell_defaults(self, *, announce: bool = True) -> bool:
+        try:
+            self._pybombcell_settings = self._current_pybombcell_settings_from_table()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Invalid py_bombcell default", str(exc))
+            return False
+        self.settings.setValue("curation/pybombcell_settings_json", json.dumps(self._pybombcell_settings))
+        self._refresh_folder_item_texts()
+        if announce:
+            self._log("Applied py_bombcell default parameters.")
+        return True
+
+    def _reset_pybombcell_defaults_table(self) -> None:
+        self._pybombcell_settings = pybombcell_default_settings()
+        self._populate_pybomb_defaults_table(self._pybombcell_settings)
+        self.settings.setValue("curation/pybombcell_settings_json", json.dumps(self._pybombcell_settings))
+        self._refresh_folder_item_texts()
+        self._log("Restored bundled py_bombcell defaults.")
+
+    def _persist_folder_list(self) -> None:
+        self.settings.setValue("curation/ks_folders_json", json.dumps(self.ks_folders))
+        current = self.ed_phy_folder.text().strip()
+        self.settings.setValue("curation/phy_folder", current)
+        self.settings.setValue("curation/bomb_folder", current)
+
+    def _folder_summary(self, folder: str | Path) -> Dict[str, object]:
+        return summarize_saved_pybombcell_results(folder, settings=self._pybombcell_settings)
+
+    def _folder_run_name(self, folder: str | Path) -> str:
+        try:
+            name = infer_completed_run_name(folder)
+        except Exception:
+            name = ""
+        return str(name or Path(folder).name)
+
+    def _folder_item_text(self, folder: str | Path) -> str:
+        path = Path(folder)
+        run_name = self._folder_run_name(path)
+        summary = self._folder_summary(path)
+        counts = summary.get("counts", {})
+        if counts:
+            return (
+                f"{run_name}\n{path.name}  |  good {counts.get('good', 0)}  "
+                f"noise {counts.get('noise', 0)}  mua {counts.get('mua', 0)}  "
+                f"non_soma {counts.get('non_soma', 0)}"
+            )
+        if summary.get("has_metrics"):
+            return f"{run_name}\n{path.name}  |  metrics ready"
+        return f"{run_name}\n{path.name}  |  no py_bombcell results"
+
+    def _selected_ks_folders(self) -> List[str]:
+        items = self.list_ks_folders.selectedItems()
+        if not items:
+            current = self.list_ks_folders.currentItem()
+            if current is not None:
+                items = [current]
+        out: List[str] = []
+        seen: set[str] = set()
+        for item in items:
+            folder = str(item.data(QtCore.Qt.UserRole) or "").strip()
+            if not folder:
+                continue
+            key = folder.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(folder)
+        return out
+
+    def _selected_ks_folder(self) -> Optional[str]:
+        item = self.list_ks_folders.currentItem()
+        if item is None and self.list_ks_folders.count():
+            item = self.list_ks_folders.item(0)
+            self.list_ks_folders.setCurrentItem(item)
+        if item is None:
+            return None
+        folder = str(item.data(QtCore.Qt.UserRole) or "").strip()
+        return folder or None
+
+    def _refresh_folder_list(self, select_folder: str | None = None) -> None:
+        current = str(select_folder or self.ed_phy_folder.text().strip() or "")
+        selected_folders = {folder.lower() for folder in self._selected_ks_folders()}
+        self.list_ks_folders.blockSignals(True)
+        self.list_ks_folders.clear()
+        target_row = -1
+        for row, folder in enumerate(self.ks_folders):
+            item = QtWidgets.QListWidgetItem(self._folder_item_text(folder))
+            item.setData(QtCore.Qt.UserRole, folder)
+            item.setToolTip(str(folder))
+            item.setSizeHint(QtCore.QSize(item.sizeHint().width(), 46))
+            self.list_ks_folders.addItem(item)
+            if folder.lower() in selected_folders:
+                item.setSelected(True)
+            if folder == current:
+                target_row = row
+        if self.list_ks_folders.count():
+            self.list_ks_folders.setCurrentRow(target_row if target_row >= 0 else 0)
+        else:
+            self.ed_phy_folder.clear()
+            self.ed_bomb_folder.clear()
+            self._clear_metrics_state()
+        self.list_ks_folders.blockSignals(False)
+        self._sync_selected_folder_fields(clear_metrics=False)
+
+    def _refresh_folder_item_texts(self) -> None:
+        current = self._selected_ks_folder()
+        self._refresh_folder_list(select_folder=current)
+
+    def _coerce_ks_folder(self, folder: str | Path) -> Optional[str]:
+        raw = str(folder).strip()
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        if candidate.is_file():
+            candidate = candidate.parent
+        resolved = find_kilosort_output_dir(candidate, max_depth=4) or candidate
+        if not resolved.exists():
+            return None
+        return str(resolved.resolve())
+
+    def set_ks_folders(self, folders: List[str], *, preserve_existing: bool = False) -> None:
+        base = list(self.ks_folders) if preserve_existing else []
+        seen = {folder.lower() for folder in base}
+        selected_folder: Optional[str] = None
+        for folder in folders:
+            normalized = self._coerce_ks_folder(folder)
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                selected_folder = normalized
+                continue
+            seen.add(key)
+            base.append(normalized)
+            selected_folder = normalized
+        self.ks_folders = base
+        self._refresh_folder_list(select_folder=selected_folder or (base[0] if base else None))
+
+    def _add_ks_folder(self) -> None:
         start = self.settings.value("paths/last_folder", str(Path.cwd()))
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder", str(start))
-        if folder:
-            target.setText(folder)
-            self.settings.setValue("paths/last_folder", folder)
-            if target is self.ed_phy_folder:
-                self.settings.setValue("curation/phy_folder", folder)
-            elif target is self.ed_bomb_folder:
-                self.settings.setValue("curation/bomb_folder", folder)
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Kilosort folder", str(start))
+        if not folder:
+            return
+        self.settings.setValue("paths/last_folder", folder)
+        before = len(self.ks_folders)
+        self.set_ks_folders([folder], preserve_existing=True)
+        if len(self.ks_folders) != before:
+            self.show_phy_page()
+
+    def _remove_selected_ks_folders(self) -> None:
+        selected = set(folder.lower() for folder in self._selected_ks_folders())
+        if not selected:
+            return
+        rows = sorted(
+            (idx for idx, folder in enumerate(self.ks_folders) if folder.lower() in selected),
+            reverse=True,
+        )
+        if not rows:
+            current = self.list_ks_folders.currentRow()
+            if current >= 0:
+                rows = [current]
+        for row in rows:
+            if 0 <= row < len(self.ks_folders):
+                self.ks_folders.pop(row)
+        self._refresh_folder_list()
+
+    def _clear_ks_folders(self) -> None:
+        self.ks_folders.clear()
+        self._refresh_folder_list()
+
+    def _open_selected_folder_in_explorer(self) -> None:
+        folder = self._selected_ks_folder()
+        if not folder:
+            self._log("Select a Kilosort folder first.")
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
+
+    def _open_selected_figures_in_explorer(self) -> None:
+        folder = self._selected_ks_folder()
+        if not folder:
+            self._log("Select a Kilosort folder first.")
+            return
+        summary = self._folder_summary(folder)
+        plots_dir = Path(str(summary.get("plots_dir") or ""))
+        if not plots_dir.exists():
+            self._log(f"No py_bombcell figures found for {folder}")
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(plots_dir)))
+
+    def _open_selected_bombcell_gui(self) -> None:
+        folder = self._selected_ks_folder()
+        if not folder:
+            self._log("Select a Kilosort folder first.")
+            return
+        try:
+            payload = launch_pybombcell_gui(folder)
+        except Exception as exc:
+            self._log(f"BombCell GUI launch failed: {exc}")
+            return
+        self._log(
+            f"Opened BombCell GUI notebook via {payload.get('launcher', 'Jupyter')} | "
+            f"{payload.get('notebook_path', '')}"
+        )
+
+    def _run_pybombcell_on_selected_folders(self) -> None:
+        folders = self._selected_ks_folders()
+        if not folders:
+            self._log("Select one or more Kilosort folders first.")
+            return
+        if not self._apply_pybombcell_defaults(announce=False):
+            return
+        if hasattr(self, "_main_sections"):
+            self._main_sections.setCurrentIndex(0)
+        self._busy_count += 1
+        self._set_pybombcell_buttons_enabled(False)
+        self._log(f"Running py_bombcell across {len(folders)} selected folder(s)...")
+        worker = FunctionWorker(
+            run_pybombcell_on_folders,
+            folders,
+            save_plots=True,
+            force_recompute=False,
+            settings=self._pybombcell_settings,
+        )
+        worker.signals.error.connect(self._log)
+        worker.signals.finished.connect(self._on_run_pybombcell_list_finished)
+        self.pool.start(worker)
+
+    def _sync_selected_folder_fields(self, *, clear_metrics: bool) -> None:
+        folder = self._selected_ks_folder()
+        self.ed_phy_folder.setText(folder or "")
+        self.ed_bomb_folder.setText(folder or "")
+        self._persist_folder_list()
+        if clear_metrics:
+            self._clear_metrics_state()
+
+    def _on_folder_selection_changed(self) -> None:
+        self._sync_selected_folder_fields(clear_metrics=True)
 
     def _resolve_folder(self, target: QtWidgets.QLineEdit) -> Path:
         folder = Path(target.text().strip())
@@ -509,6 +982,45 @@ class CurationTab(QtWidgets.QWidget):
             target.setText(str(resolved))
             return resolved
         return folder
+
+    def _refresh_report_plot(self, counts: Dict[str, int]) -> None:
+        self.report_plot.clear()
+        labels = ["good", "noise", "mua", "non_soma"]
+        values = [int(counts.get(label, 0)) for label in labels]
+        x = np.arange(len(labels), dtype=float)
+        colors = ["#5cb85c", "#d9534f", "#f0ad4e", "#5bc0de"]
+        self.report_plot.addItem(
+            pg.BarGraphItem(
+                x=x,
+                height=np.asarray(values, dtype=float),
+                width=0.65,
+                brushes=[pg.mkBrush(color) for color in colors],
+            )
+        )
+        axis = self.report_plot.getAxis("bottom")
+        axis.setTicks([list(zip(x, labels))])
+        top = max(values) if values else 0
+        self.report_plot.setYRange(0, max(1, top) * 1.2, padding=0.0)
+
+    def _clear_metrics_state(self) -> None:
+        self.metrics_df = pd.DataFrame()
+        self.preview_labels = pd.DataFrame()
+        self._selected_unit_id = None
+        self.metrics_grid.clear()
+        self._plot_lines.clear()
+        self._metric_plots.clear()
+        self._min_line = None
+        self._max_line = None
+        for label in [self.lbl_good, self.lbl_noise, self.lbl_mua, self.lbl_non_soma]:
+            name = label.text().split(":")[0]
+            label.setText(f"{name}: 0")
+        for lst in [self.list_good, self.list_noise, self.list_mua, self.list_non_soma]:
+            lst.clear()
+        self.list_metrics.clear()
+        self.tbl_unit_metrics.setRowCount(0)
+        self.lbl_selected_unit.setText("Selected unit: -")
+        self.lbl_selected_label.setText("Label: -")
+        self._refresh_report_plot({})
 
     def _launch_phy(self) -> None:
         folder_text = self.ed_phy_folder.text().strip()
@@ -553,8 +1065,7 @@ class CurationTab(QtWidgets.QWidget):
             self._log("Failed to start phy: " + self.phy_process.errorString())
 
     def set_ks_folder(self, folder: str) -> None:
-        self.ed_phy_folder.setText(folder)
-        self.ed_bomb_folder.setText(folder)
+        self.set_ks_folders([folder])
         if hasattr(self, "_main_sections"):
             self._main_sections.setCurrentIndex(1)
 
@@ -601,12 +1112,29 @@ class CurationTab(QtWidgets.QWidget):
         self._recompute_preview()
 
     def _restore_settings(self) -> None:
-        phy_folder = self.settings.value("curation/phy_folder", "")
-        bomb_folder = self.settings.value("curation/bomb_folder", "")
-        if phy_folder:
-            self.ed_phy_folder.setText(str(phy_folder))
-        if bomb_folder:
-            self.ed_bomb_folder.setText(str(bomb_folder))
+        raw_settings = str(self.settings.value("curation/pybombcell_settings_json", "{}") or "{}")
+        try:
+            parsed_settings = json.loads(raw_settings)
+        except Exception:
+            parsed_settings = {}
+        if isinstance(parsed_settings, dict):
+            self._pybombcell_settings = normalize_pybombcell_settings(parsed_settings)
+        self._populate_pybomb_defaults_table(self._pybombcell_settings)
+
+        raw_folders = str(self.settings.value("curation/ks_folders_json", "[]") or "[]")
+        try:
+            parsed_folders = json.loads(raw_folders)
+        except Exception:
+            parsed_folders = []
+        if isinstance(parsed_folders, list) and parsed_folders:
+            self.set_ks_folders([str(folder) for folder in parsed_folders if str(folder).strip()])
+        else:
+            phy_folder = str(self.settings.value("curation/phy_folder", "") or "").strip()
+            bomb_folder = str(self.settings.value("curation/bomb_folder", "") or "").strip()
+            fallback_folder = phy_folder or bomb_folder
+            if fallback_folder:
+                self.set_ks_folders([fallback_folder])
+
         bomb_index = int(self.settings.value("curation/bomb_subsection_index", 0))
         if hasattr(self, "_bomb_subsections"):
             self._bomb_subsections.setCurrentIndex(bomb_index)
@@ -685,7 +1213,7 @@ class CurationTab(QtWidgets.QWidget):
             self._log(f"Invalid folder: {folder}")
             return
         folder = self._resolve_folder(self.ed_bomb_folder)
-        metrics_path = find_metrics_file(folder, max_depth=4)
+        metrics_path = _preferred_metrics_file(folder)
         if metrics_path is None or not metrics_path.exists():
             if allow_compute:
                 self._log(f"metrics.csv not found in {folder}; computing quality metrics...")
@@ -697,7 +1225,7 @@ class CurationTab(QtWidgets.QWidget):
                 worker.signals.finished.connect(lambda result: self._on_compute_metrics_finished(result, folder))
                 self.pool.start(worker)
             else:
-                self._log(f"metrics.csv not found in {folder}")
+                self._log(f"No metrics file found in {folder}")
             return
 
         df = pd.read_csv(metrics_path)
@@ -720,7 +1248,8 @@ class CurationTab(QtWidgets.QWidget):
         self.metrics_df = df
         if self._selected_unit_id is not None and self._selected_unit_id not in self.metrics_df.index:
             self._selected_unit_id = None
-        self._log(f"Loaded metrics: {metrics_path} ({len(df)} units)")
+        source_name = "py_bombcell metrics" if "templates._bc_qMetrics.csv" in str(metrics_path) else "metrics.csv"
+        self._log(f"Loaded {source_name}: {metrics_path} ({len(df)} units)")
 
         paths = self.watcher.files()
         if paths:
@@ -841,6 +1370,14 @@ class CurationTab(QtWidgets.QWidget):
         psd_df.index.name = "cluster_id"
         return psd_df
 
+    def _set_pybombcell_buttons_enabled(self, enabled: bool) -> None:
+        self.btn_load_metrics.setEnabled(enabled)
+        self.btn_run_pybomb.setEnabled(enabled)
+        self.btn_run_selected_pybomb.setEnabled(enabled)
+        self.btn_apply_pybomb_defaults.setEnabled(enabled)
+        self.btn_reset_pybomb_defaults.setEnabled(enabled)
+        self.btn_open_bombcell_gui.setEnabled(enabled)
+
     def _run_pybombcell(self) -> None:
         if hasattr(self, "_main_sections"):
             self._main_sections.setCurrentIndex(1)
@@ -848,26 +1385,39 @@ class CurationTab(QtWidgets.QWidget):
         if not folder.exists():
             self._log(f"Invalid folder: {folder}")
             return
+        if not self._apply_pybombcell_defaults(announce=False):
+            return
         folder = self._resolve_folder(self.ed_bomb_folder)
         self._busy_count += 1
-        self.btn_run_pybomb.setEnabled(False)
+        self._set_pybombcell_buttons_enabled(False)
         self._log("Running py_bombcell (metrics + plots)...")
-        worker = FunctionWorker(run_pybombcell_on_folder, str(folder), True)
+        worker = FunctionWorker(
+            run_pybombcell_on_folder,
+            str(folder),
+            True,
+            False,
+            self._pybombcell_settings,
+        )
         worker.signals.error.connect(self._log)
         worker.signals.finished.connect(self._on_run_pybombcell_finished)
         self.pool.start(worker)
 
     def _on_run_pybombcell_finished(self, result: Dict) -> None:
         self._busy_count = max(0, self._busy_count - 1)
-        self.btn_run_pybomb.setEnabled(True)
+        self._set_pybombcell_buttons_enabled(True)
         if not result.get("ok"):
             self._log("py_bombcell run failed.")
             return
         payload = result.get("result", {})
         if payload.get("cached", False):
             self._log(
-                f"py_bombcell skipped (cached metrics found) | units={payload.get('n_units', 'NA')} | "
+                f"py_bombcell skipped ({payload.get('cache_reason', 'cached')}) | units={payload.get('n_units', 'NA')} | "
                 f"metrics={payload.get('metrics_csv', '')}"
+            )
+        elif payload.get("metrics_reused", False):
+            self._log(
+                f"py_bombcell refreshed from saved metrics | units={payload.get('n_units', 'NA')} | "
+                f"plots={payload.get('plots_dir', '')}"
             )
         else:
             self._log(f"py_bombcell completed | units={payload.get('n_units', 'NA')} | plots={payload.get('plots_dir', '')}")
@@ -877,7 +1427,41 @@ class CurationTab(QtWidgets.QWidget):
                 f"Updated cluster_group.tsv from {sync_result.get('source', 'labels')} "
                 f"({sync_result.get('n_units', 0)} units)"
             )
+        self._refresh_folder_item_texts()
         self._load_metrics(allow_compute=False)
+
+    def _on_run_pybombcell_list_finished(self, result: Dict) -> None:
+        self._busy_count = max(0, self._busy_count - 1)
+        self._set_pybombcell_buttons_enabled(True)
+        if not result.get("ok"):
+            self._log("py_bombcell batch run failed.")
+            return
+        payload = result.get("result", {})
+        for item in payload.get("results", []):
+            folder = str(item.get("folder") or "")
+            if item.get("ok"):
+                run_result = item.get("result", {})
+                counts = run_result.get("counts", {})
+                if run_result.get("cached", False):
+                    mode = "cached"
+                elif run_result.get("metrics_reused", False):
+                    mode = "reused_metrics"
+                else:
+                    mode = "reran"
+                self._log(
+                    f"[py_bombcell] {folder} | {mode} | good={counts.get('good', 0)} "
+                    f"noise={counts.get('noise', 0)} mua={counts.get('mua', 0)} "
+                    f"non_soma={counts.get('non_soma', 0)}"
+                )
+            else:
+                self._log(f"[py_bombcell] {folder} | failed | {item.get('error', 'unknown error')}")
+        summary = payload.get("summary", {})
+        self._log(
+            f"py_bombcell batch finished | total={summary.get('total', 0)} reran={summary.get('reran', 0)} "
+            f"reused_metrics={summary.get('reused_metrics', 0)} cached={summary.get('cached', 0)} "
+            f"failed={summary.get('failed', 0)}"
+        )
+        self._refresh_folder_item_texts()
 
     def _on_compute_metrics_finished(self, result: Dict, folder: Path) -> None:
         self._busy_count = max(0, self._busy_count - 1)
@@ -1136,6 +1720,7 @@ class CurationTab(QtWidgets.QWidget):
         self.lbl_noise.setText(f"noise: {counts.get('noise', 0)}")
         self.lbl_mua.setText(f"mua: {counts.get('mua', 0)}")
         self.lbl_non_soma.setText(f"non_soma: {counts.get('non_soma', 0)}")
+        self._refresh_report_plot({str(key): int(value) for key, value in counts.items()})
 
         self._fill_list(self.list_good, labels, "good")
         self._fill_list(self.list_noise, labels, "noise")
@@ -1240,6 +1825,7 @@ class CurationTab(QtWidgets.QWidget):
                 f"Updated cluster_group.tsv from {sync_result.get('source', 'labels')} "
                 f"({sync_result.get('n_units', 0)} units)"
             )
+        self._refresh_folder_item_texts()
         self._recompute_preview()
 
     def _log(self, line: str) -> None:
@@ -1254,7 +1840,11 @@ class CurationTab(QtWidgets.QWidget):
         self._show_grid = bool(show_grid)
         bg = "#0b0f14" if self._plot_theme == "Dark" else "#ffffff"
         self.metrics_grid.setBackground(bg)
+        self.report_plot.setBackground(bg)
         self._refresh_metric_plot()
+        if not self.preview_labels.empty:
+            counts = self.preview_labels["bombcell_label"].value_counts().to_dict()
+            self._refresh_report_plot({str(key): int(value) for key, value in counts.items()})
 
     def _export_plotted_data(self) -> None:
         if self.metrics_df.empty:

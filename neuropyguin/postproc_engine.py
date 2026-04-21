@@ -218,6 +218,35 @@ class NeuropixelsDataset:
         self._cache_set("sync", payload, {"t_ms": centers_ms, "counts": out})
         return centers_ms, out
 
+    def psth_trials(
+        self,
+        unit: int,
+        event_times_s: np.ndarray,
+        pre_s: float,
+        post_s: float,
+        bin_ms: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        ev = np.asarray(event_times_s, dtype=float)
+        ev = ev[np.isfinite(ev)]
+        if ev.size == 0:
+            return np.array([]), np.zeros((0, 0), dtype=float)
+
+        bin_s = max(bin_ms, 0.5) / 1000.0
+        edges = np.arange(-pre_s, post_s + bin_s, bin_s)
+        centers_ms = 1000.0 * (0.5 * (edges[:-1] + edges[1:]))
+        trial_mat = np.zeros((ev.size, edges.size - 1), dtype=float)
+        st = self.unit_spike_times_s(int(unit))
+        if st.size == 0:
+            return centers_ms, trial_mat
+
+        for row, e in enumerate(ev):
+            rel = st - e
+            m = (rel >= -pre_s) & (rel <= post_s)
+            if np.any(m):
+                h, _ = np.histogram(rel[m], bins=edges)
+                trial_mat[row] = h.astype(float) / bin_s
+        return centers_ms, trial_mat
+
     def psth(self, units: Iterable[int], event_times_s: np.ndarray, pre_s: float, post_s: float, bin_ms: float) -> Tuple[np.ndarray, np.ndarray]:
         units = list(units)
         ev = np.asarray(event_times_s, dtype=float)
@@ -228,23 +257,51 @@ class NeuropixelsDataset:
         bin_s = max(bin_ms, 0.5) / 1000.0
         edges = np.arange(-pre_s, post_s + bin_s, bin_s)
         total = np.zeros(edges.size - 1, dtype=float)
-        n_trials = 0
+        n_trials = int(len(units) * ev.size)
         for u in units:
             st = self.unit_spike_times_s(int(u))
-            if st.size == 0:
-                continue
             for e in ev:
                 rel = st - e
                 m = (rel >= -pre_s) & (rel <= post_s)
                 if np.any(m):
                     h, _ = np.histogram(rel[m], bins=edges)
                     total += h
-                    n_trials += 1
         if n_trials == 0:
             return np.array([]), np.array([])
         rate = total / (n_trials * bin_s)
         centers_ms = 1000.0 * (0.5 * (edges[:-1] + edges[1:]))
         return centers_ms, rate
+
+    def psth_by_unit(
+        self,
+        units: Iterable[int],
+        event_times_s: np.ndarray,
+        pre_s: float,
+        post_s: float,
+        bin_ms: float,
+    ) -> Tuple[np.ndarray, List[int], np.ndarray]:
+        unit_ids = [int(u) for u in units]
+        ev = np.asarray(event_times_s, dtype=float)
+        ev = ev[np.isfinite(ev)]
+        if len(unit_ids) == 0 or ev.size == 0:
+            return np.array([]), [], np.zeros((0, 0), dtype=float)
+
+        centers_ms = np.array([], dtype=float)
+        mat: Optional[np.ndarray] = None
+
+        for row, unit in enumerate(unit_ids):
+            unit_centers_ms, trial_mat = self.psth_trials(unit, ev, pre_s=pre_s, post_s=post_s, bin_ms=bin_ms)
+            if centers_ms.size == 0:
+                centers_ms = np.asarray(unit_centers_ms, dtype=float)
+                mat = np.zeros((len(unit_ids), centers_ms.size), dtype=float)
+            if mat is None:
+                return np.array([]), [], np.zeros((0, 0), dtype=float)
+            if trial_mat.size == 0:
+                continue
+            mat[row] = np.nanmean(trial_mat, axis=0)
+        if mat is None:
+            return np.array([]), [], np.zeros((0, 0), dtype=float)
+        return centers_ms, unit_ids, mat
 
     def load_raw_chunk_uv(
         self,

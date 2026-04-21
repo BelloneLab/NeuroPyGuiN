@@ -61,7 +61,7 @@ def get_default_parameters(
         # '1' for 1.0 (3Bs) and '2' for 2.0 (single or 4-shanks)
 
         ## Refractory period parameters
-        "tauR_valuesMin": 2 / 1000,  # refractory period time (s), usually 0.002 s
+        "tauR_valuesMin": 1 / 1000,  # refractory period time (s), usually 0.002 s
         "tauR_valuesMax": 2 / 1000,  # refractory period time (s)
         "tauR_valuesStep": 0.5 / 1000,  # if tauR_valuesMin and tauR_valuesMax are different
         # bombcell will estimate values in between using
@@ -107,12 +107,12 @@ def get_default_parameters(
         "nChannelsIsoDist": 4,  # Number of nearby channels to use in distance metric computation
 
         # Quality metric classification parameters
-        "splitGoodAndMua_NonSomatic": False,  # whether to classify non-somatic units
+        "splitGoodAndMua_NonSomatic": True,  # whether to classify non-somatic units
         ## Waveform-based
         "maxNPeaks": 2,  # maximum number of peaks
         "maxNTroughs": 1,  # maximum number of troughs
         "minWvDuration": 100,  # in us
-        "maxWvDuration": 1150,  # in us
+        "maxWvDuration": 1250,  # in us
         "minSpatialDecaySlope": -0.008,
         "minSpatialDecaySlopeExp": 0.01,  # in a.u / um
         "maxSpatialDecaySlopeExp": 0.1,  # in a.u / um
@@ -132,12 +132,12 @@ def get_default_parameters(
         
         ## Other classification parameters
         "minAmplitude": 40,  # in uV
-        "maxRPVviolations": 0.1,  # max fraction of refractory period violations
-        "maxPercSpikesMissing": 20,  # max percentage of missing spikes
+        "maxRPVviolations": 0.25,  # max fraction of refractory period violations
+        "maxPercSpikesMissing": 25,  # max percentage of missing spikes
         "minNumSpikes": 300,  # minimum number of total spikes recorded
         "maxDrift": 100,  # in um
         "minPresenceRatio": 0.7,  # minimum fraction of time chunks unit must be present for
-        "minSNR": 5,  # min SNR for a good unit
+        "minSNR": 2,  # min SNR for a good unit
     }
 
 

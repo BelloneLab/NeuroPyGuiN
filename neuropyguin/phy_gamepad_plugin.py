@@ -24,14 +24,25 @@ Controller layout (Xbox-style, remappable):
 # This function is called from phy_integration.py; its return value is
 # written verbatim into ~/.phy/plugins/neuropyguin_gamepad_controller.py
 
+from pathlib import Path
+
+
+_ASSET_DIR = Path(__file__).resolve().parent / "assets"
+
 
 def _gamepad_plugin_source() -> str:
     """Return the full plugin source as a string (phy discovers .py files)."""
-    return r'''
+    xbox_image = repr(str((_ASSET_DIR / "xbox.png").resolve()))
+    switch_image = repr(str((_ASSET_DIR / "switch.png").resolve()))
+    source = r'''
 import json
 import logging
 import math
+import ctypes
+import sys
 import time
+from collections import deque
+from ctypes import wintypes
 from enum import Enum, auto
 from functools import partial
 
@@ -50,11 +61,12 @@ try:
     )
     # Additional PyQt5 imports not re-exported by phy.gui.qt
     from PyQt5.QtWidgets import (
-        QProgressBar, QDialog, QTableWidget, QTableWidgetItem,
+        QFrame, QProgressBar, QDialog, QScrollArea,
+        QTableWidget, QTableWidgetItem, QComboBox,
         QHeaderView, QGroupBox, QSizePolicy,
     )
-    from PyQt5.QtGui import QFont, QPainter, QPainterPath, QPen, QLinearGradient, QRadialGradient
-    from PyQt5.QtCore import QPointF, QRect, QRectF, QSettings
+    from PyQt5.QtGui import QFont, QImage, QPainter, QPen, QPixmap
+    from PyQt5.QtCore import QRect, QRectF, QSettings
     _HAS_QT = True
 except ImportError:
     _HAS_QT = False
@@ -65,6 +77,43 @@ try:
     _HAS_PYGAME = True
 except ImportError:
     _HAS_PYGAME = False
+
+_IS_WINDOWS = sys.platform.startswith("win")
+_XINPUT_DLL = None
+if _IS_WINDOWS:
+    for _dll_name in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinput1_2.dll", "xinput1_1.dll"):
+        try:
+            _XINPUT_DLL = ctypes.WinDLL(_dll_name)
+            break
+        except Exception:
+            continue
+_HAS_XINPUT = _XINPUT_DLL is not None
+
+if _HAS_XINPUT:
+    class _XINPUT_GAMEPAD(ctypes.Structure):
+        _fields_ = [
+            ("wButtons", wintypes.WORD),
+            ("bLeftTrigger", wintypes.BYTE),
+            ("bRightTrigger", wintypes.BYTE),
+            ("sThumbLX", ctypes.c_short),
+            ("sThumbLY", ctypes.c_short),
+            ("sThumbRX", ctypes.c_short),
+            ("sThumbRY", ctypes.c_short),
+        ]
+
+
+    class _XINPUT_STATE(ctypes.Structure):
+        _fields_ = [
+            ("dwPacketNumber", wintypes.DWORD),
+            ("Gamepad", _XINPUT_GAMEPAD),
+        ]
+
+
+    _XINPUT_GET_STATE = _XINPUT_DLL.XInputGetState
+    _XINPUT_GET_STATE.argtypes = [wintypes.DWORD, ctypes.POINTER(_XINPUT_STATE)]
+    _XINPUT_GET_STATE.restype = wintypes.DWORD
+else:
+    _XINPUT_GET_STATE = None
 
 
 # =========================================================================
@@ -116,11 +165,18 @@ _ACTION_LABELS = {
 }
 
 
+LAYOUT_XBOX = "xbox"
+LAYOUT_SWITCH = "switch"
+
+XBOX_LAYOUT_IMAGE = __XBOX_LAYOUT_IMAGE__
+SWITCH_LAYOUT_IMAGE = __SWITCH_LAYOUT_IMAGE__
+
+
 # =========================================================================
-# Default mapping (Xbox layout — SDL button IDs)
+# Default mappings and layout metadata
 # =========================================================================
 
-DEFAULT_BUTTON_MAP = {
+DEFAULT_XBOX_BUTTON_MAP = {
     0: GamepadAction.MARK_GOOD,      # A
     1: GamepadAction.MARK_NOISE,     # B
     2: GamepadAction.MARK_MUA,       # X
@@ -132,6 +188,18 @@ DEFAULT_BUTTON_MAP = {
     9: GamepadAction.UNSELECT_SIM,   # R3
 }
 
+DEFAULT_SWITCH_BUTTON_MAP = {
+    0: GamepadAction.MARK_GOOD,      # B
+    1: GamepadAction.MARK_NOISE,     # A
+    2: GamepadAction.MARK_MUA,       # Y
+    3: GamepadAction.MERGE,          # X
+    4: GamepadAction.UNDO,           # L
+    5: GamepadAction.REDO,           # R
+    6: GamepadAction.TOGGLE_HUD,     # Minus
+    7: GamepadAction.SAVE,           # Plus
+    9: GamepadAction.UNSELECT_SIM,   # R3
+}
+
 DEFAULT_HAT_MAP = {
     (0,  1): GamepadAction.PREV_BEST,
     (0, -1): GamepadAction.NEXT_BEST,
@@ -139,108 +207,54 @@ DEFAULT_HAT_MAP = {
     ( 1, 0): GamepadAction.NEXT_SIMILAR,
 }
 
-_BUTTON_MAP_SETTINGS_KEY = "gamepad/button_map_v2"
+_LAYOUT_SETTINGS_KEY = "gamepad/layout_v1"
+_BUTTON_MAP_SETTINGS_KEY_TEMPLATE = "gamepad/button_map_{layout}_v1"
+_LEGACY_BUTTON_MAP_SETTINGS_KEY = "gamepad/button_map_v2"
 
-_BUTTON_SPECS = {
-    0: {
-        "label": "A",
-        "short": "A",
-        "shape": "round",
-        "size": 0.092,
-        "color": "#59d16f",
-        "pos": (0.74, 0.69),
-        "callout": (0.93, 0.82),
-        "align": "left",
+_LAYOUTS = {
+    LAYOUT_XBOX: {
+        "title": "Xbox",
+        "image_path": XBOX_LAYOUT_IMAGE,
+        "control_column": "Xbox control",
+        "default_button_map": DEFAULT_XBOX_BUTTON_MAP,
+        "button_labels": {
+            0: "A", 1: "B", 2: "X", 3: "Y", 4: "LB",
+            5: "RB", 6: "View", 7: "Menu", 8: "L3", 9: "R3",
+        },
+        "hotspots": {
+            0: {"center": (0.730, 0.555), "size": (0.088, 0.088), "shape": "round", "text": "", "accent": "#59d16f"},
+            1: {"center": (0.788, 0.490), "size": (0.085, 0.085), "shape": "round", "text": "", "accent": "#ff6464"},
+            2: {"center": (0.670, 0.490), "size": (0.085, 0.085), "shape": "round", "text": "", "accent": "#46b6ff"},
+            3: {"center": (0.728, 0.424), "size": (0.085, 0.085), "shape": "round", "text": "", "accent": "#f4d957"},
+            4: {"center": (0.235, 0.172), "size": (0.150, 0.055), "shape": "pill", "text": "LB", "accent": "#d6dbe4"},
+            5: {"center": (0.762, 0.172), "size": (0.150, 0.055), "shape": "pill", "text": "RB", "accent": "#d6dbe4"},
+            6: {"center": (0.442, 0.382), "size": (0.060, 0.060), "shape": "round", "text": "View", "accent": "#cbd5e1"},
+            7: {"center": (0.560, 0.382), "size": (0.060, 0.060), "shape": "round", "text": "Menu", "accent": "#cbd5e1"},
+            8: {"center": (0.245, 0.385), "size": (0.110, 0.110), "shape": "round", "text": "L3", "accent": "#94a3b8"},
+            9: {"center": (0.630, 0.588), "size": (0.108, 0.108), "shape": "round", "text": "R3", "accent": "#94a3b8"},
+        },
     },
-    1: {
-        "label": "B",
-        "short": "B",
-        "shape": "round",
-        "size": 0.092,
-        "color": "#ff6464",
-        "pos": (0.83, 0.58),
-        "callout": (0.95, 0.60),
-        "align": "left",
-    },
-    2: {
-        "label": "X",
-        "short": "X",
-        "shape": "round",
-        "size": 0.092,
-        "color": "#46b6ff",
-        "pos": (0.65, 0.58),
-        "callout": (0.07, 0.57),
-        "align": "right",
-    },
-    3: {
-        "label": "Y",
-        "short": "Y",
-        "shape": "round",
-        "size": 0.092,
-        "color": "#f4d957",
-        "pos": (0.74, 0.47),
-        "callout": (0.93, 0.34),
-        "align": "left",
-    },
-    4: {
-        "label": "LB",
-        "short": "LB",
-        "shape": "pill",
-        "size": 0.088,
-        "color": "#d6dbe4",
-        "pos": (0.26, 0.15),
-        "callout": (0.07, 0.20),
-        "align": "right",
-    },
-    5: {
-        "label": "RB",
-        "short": "RB",
-        "shape": "pill",
-        "size": 0.088,
-        "color": "#d6dbe4",
-        "pos": (0.74, 0.15),
-        "callout": (0.93, 0.20),
-        "align": "left",
-    },
-    6: {
-        "label": "View",
-        "short": "View",
-        "shape": "small",
-        "size": 0.070,
-        "color": "#bac2d0",
-        "pos": (0.44, 0.43),
-        "callout": (0.38, 0.08),
-        "align": "center",
-    },
-    7: {
-        "label": "Menu",
-        "short": "Menu",
-        "shape": "small",
-        "size": 0.070,
-        "color": "#bac2d0",
-        "pos": (0.56, 0.43),
-        "callout": (0.62, 0.08),
-        "align": "center",
-    },
-    8: {
-        "label": "L3",
-        "short": "L3",
-        "shape": "small",
-        "size": 0.072,
-        "color": "#94a3b8",
-        "pos": (0.26, 0.42),
-        "callout": (0.08, 0.82),
-        "align": "right",
-    },
-    9: {
-        "label": "R3",
-        "short": "R3",
-        "shape": "small",
-        "size": 0.072,
-        "color": "#94a3b8",
-        "pos": (0.60, 0.69),
-        "callout": (0.93, 0.92),
-        "align": "left",
+    LAYOUT_SWITCH: {
+        "title": "Nintendo Switch",
+        "image_path": SWITCH_LAYOUT_IMAGE,
+        "control_column": "Switch control",
+        "default_button_map": DEFAULT_SWITCH_BUTTON_MAP,
+        "button_labels": {
+            0: "B", 1: "A", 2: "Y", 3: "X", 4: "L",
+            5: "R", 6: "-", 7: "+", 8: "L3", 9: "R3",
+        },
+        "hotspots": {
+            0: {"center": (0.744, 0.466), "size": (0.088, 0.088), "shape": "round", "text": "", "accent": "#ff8a8a"},
+            1: {"center": (0.826, 0.381), "size": (0.088, 0.088), "shape": "round", "text": "", "accent": "#9fdf8d"},
+            2: {"center": (0.659, 0.381), "size": (0.088, 0.088), "shape": "round", "text": "", "accent": "#d8d266"},
+            3: {"center": (0.744, 0.294), "size": (0.088, 0.088), "shape": "round", "text": "", "accent": "#80c7ff"},
+            4: {"center": (0.200, 0.155), "size": (0.132, 0.055), "shape": "pill", "text": "L", "accent": "#d6dbe4"},
+            5: {"center": (0.793, 0.155), "size": (0.132, 0.055), "shape": "pill", "text": "R", "accent": "#d6dbe4"},
+            6: {"center": (0.395, 0.246), "size": (0.062, 0.062), "shape": "round", "text": "-", "accent": "#cbd5e1"},
+            7: {"center": (0.590, 0.246), "size": (0.062, 0.062), "shape": "round", "text": "+", "accent": "#cbd5e1"},
+            8: {"center": (0.152, 0.327), "size": (0.118, 0.118), "shape": "round", "text": "L3", "accent": "#94a3b8"},
+            9: {"center": (0.584, 0.528), "size": (0.118, 0.118), "shape": "round", "text": "R3", "accent": "#94a3b8"},
+        },
     },
 }
 
@@ -250,17 +264,166 @@ _FIXED_CONTROL_HINTS = (
     "LT -> Split (always active)",
 )
 
+_ACTION_SECTIONS = (
+    ("Curation", (
+        GamepadAction.MARK_GOOD,
+        GamepadAction.MARK_NOISE,
+        GamepadAction.MARK_MUA,
+        GamepadAction.MERGE,
+        GamepadAction.MARK_GOOD_NEXT,
+        GamepadAction.MARK_NOISE_NEXT,
+    )),
+    ("Splitting", (
+        GamepadAction.SPLIT,
+        GamepadAction.SPLIT_KMEANS,
+        GamepadAction.SPLIT_ISI,
+    )),
+    ("Navigation", (
+        GamepadAction.NEXT_BEST,
+        GamepadAction.PREV_BEST,
+        GamepadAction.NEXT_SIMILAR,
+        GamepadAction.PREV_SIMILAR,
+        GamepadAction.SELECT_SIMILAR,
+        GamepadAction.UNSELECT_SIM,
+    )),
+    ("Editing", (
+        GamepadAction.UNDO,
+        GamepadAction.REDO,
+        GamepadAction.SAVE,
+        GamepadAction.TOGGLE_HUD,
+    )),
+)
+
+_CONTROLLER_IMAGE_CACHE = {}
+
 # Axis IDs
 _LEFT_STICK_Y   = 1
 _RIGHT_STICK_X  = 2   # often axis 3 on some pads — auto-detected
 _LEFT_TRIGGER   = 4
 
+_PYGAME_BACKEND = "pygame"
+_XINPUT_BACKEND = "xinput"
 
-def _button_display_name(btn_id):
+_XINPUT_ERROR_SUCCESS = 0
+_XINPUT_GAMEPAD_DPAD_UP = 0x0001
+_XINPUT_GAMEPAD_DPAD_DOWN = 0x0002
+_XINPUT_GAMEPAD_DPAD_LEFT = 0x0004
+_XINPUT_GAMEPAD_DPAD_RIGHT = 0x0008
+_XINPUT_GAMEPAD_START = 0x0010
+_XINPUT_GAMEPAD_BACK = 0x0020
+_XINPUT_GAMEPAD_LEFT_THUMB = 0x0040
+_XINPUT_GAMEPAD_RIGHT_THUMB = 0x0080
+_XINPUT_GAMEPAD_LEFT_SHOULDER = 0x0100
+_XINPUT_GAMEPAD_RIGHT_SHOULDER = 0x0200
+_XINPUT_GAMEPAD_A = 0x1000
+_XINPUT_GAMEPAD_B = 0x2000
+_XINPUT_GAMEPAD_X = 0x4000
+_XINPUT_GAMEPAD_Y = 0x8000
+
+_XINPUT_BUTTON_BITS = {
+    0: _XINPUT_GAMEPAD_A,
+    1: _XINPUT_GAMEPAD_B,
+    2: _XINPUT_GAMEPAD_X,
+    3: _XINPUT_GAMEPAD_Y,
+    4: _XINPUT_GAMEPAD_LEFT_SHOULDER,
+    5: _XINPUT_GAMEPAD_RIGHT_SHOULDER,
+    6: _XINPUT_GAMEPAD_BACK,
+    7: _XINPUT_GAMEPAD_START,
+    8: _XINPUT_GAMEPAD_LEFT_THUMB,
+    9: _XINPUT_GAMEPAD_RIGHT_THUMB,
+}
+
+
+def _normalize_thumb(value):
+    if value >= 0:
+        return min(1.0, float(value) / 32767.0)
+    return max(-1.0, float(value) / 32768.0)
+
+
+def _normalize_trigger(value):
+    return max(0.0, min(1.0, float(value) / 255.0))
+
+
+class _XInputController:
+    """Thin XInput wrapper that mimics the pygame joystick interface we use."""
+
+    def __init__(self, user_index):
+        self._user_index = int(user_index)
+        self._state = _XINPUT_STATE()
+        self._name = f"XInput Controller {self._user_index + 1}"
+
+    def refresh_state(self):
+        if not _HAS_XINPUT or _XINPUT_GET_STATE is None:
+            return False
+        state = _XINPUT_STATE()
+        result = _XINPUT_GET_STATE(self._user_index, ctypes.byref(state))
+        if result != _XINPUT_ERROR_SUCCESS:
+            return False
+        self._state = state
+        return True
+
+    def init(self):
+        return self.refresh_state()
+
+    def get_name(self):
+        return self._name
+
+    def get_numaxes(self):
+        return 5
+
+    def get_numbuttons(self):
+        return len(_XINPUT_BUTTON_BITS)
+
+    def get_numhats(self):
+        return 1
+
+    def get_button(self, button_id):
+        bit = _XINPUT_BUTTON_BITS.get(int(button_id))
+        if bit is None:
+            return 0
+        return 1 if (self._state.Gamepad.wButtons & bit) else 0
+
+    def get_hat(self, hat_id):
+        if int(hat_id) != 0:
+            return (0, 0)
+        buttons = self._state.Gamepad.wButtons
+        x = int(bool(buttons & _XINPUT_GAMEPAD_DPAD_RIGHT)) - int(bool(buttons & _XINPUT_GAMEPAD_DPAD_LEFT))
+        y = int(bool(buttons & _XINPUT_GAMEPAD_DPAD_UP)) - int(bool(buttons & _XINPUT_GAMEPAD_DPAD_DOWN))
+        return (x, y)
+
+    def get_axis(self, axis_id):
+        axis_id = int(axis_id)
+        pad = self._state.Gamepad
+        if axis_id == 0:
+            return _normalize_thumb(pad.sThumbLX)
+        if axis_id == 1:
+            return -_normalize_thumb(pad.sThumbLY)
+        if axis_id == 2:
+            return _normalize_thumb(pad.sThumbRX)
+        if axis_id == 3:
+            return -_normalize_thumb(pad.sThumbRY)
+        if axis_id == 4:
+            return _normalize_trigger(pad.bLeftTrigger)
+        return 0.0
+
+
+def _layout_config(layout_key):
+    return _LAYOUTS.get(layout_key, _LAYOUTS[LAYOUT_XBOX])
+
+
+def _button_map_settings_key(layout_key):
+    return _BUTTON_MAP_SETTINGS_KEY_TEMPLATE.format(layout=layout_key)
+
+
+def _default_button_map(layout_key):
+    return dict(_layout_config(layout_key).get("default_button_map", DEFAULT_XBOX_BUTTON_MAP))
+
+
+def _button_display_name(btn_id, layout_key=LAYOUT_XBOX):
     if btn_id is None:
         return "(unassigned)"
-    spec = _BUTTON_SPECS.get(int(btn_id))
-    return spec["label"] if spec else f"Button {int(btn_id)}"
+    label = _layout_config(layout_key).get("button_labels", {}).get(int(btn_id))
+    return label or f"Button {int(btn_id)}"
 
 
 def _serialize_button_map(button_map):
@@ -268,15 +431,15 @@ def _serialize_button_map(button_map):
     return json.dumps(payload, sort_keys=True)
 
 
-def _deserialize_button_map(raw_value):
+def _deserialize_button_map(raw_value, default_button_map):
     if not raw_value:
-        return dict(DEFAULT_BUTTON_MAP)
+        return dict(default_button_map)
     try:
         data = json.loads(str(raw_value))
     except Exception:
-        return dict(DEFAULT_BUTTON_MAP)
+        return dict(default_button_map)
     if not isinstance(data, dict):
-        return dict(DEFAULT_BUTTON_MAP)
+        return dict(default_button_map)
 
     out = {}
     seen_actions = set()
@@ -290,7 +453,103 @@ def _deserialize_button_map(raw_value):
             continue
         out[button_id] = action
         seen_actions.add(action)
-    return out or dict(DEFAULT_BUTTON_MAP)
+    return out or dict(default_button_map)
+
+
+def _is_background_candidate(color):
+    if color.alpha() <= 0:
+        return False
+    rgb_min = min(color.red(), color.green(), color.blue())
+    rgb_max = max(color.red(), color.green(), color.blue())
+    return rgb_max >= 185 and (rgb_max - rgb_min) <= 26
+
+
+def _processed_controller_asset(image_path):
+    cached = _CONTROLLER_IMAGE_CACHE.get(image_path)
+    if cached is not None:
+        return cached
+    if not _HAS_QT:
+        result = (QPixmap(), QRect())
+        _CONTROLLER_IMAGE_CACHE[image_path] = result
+        return result
+
+    pixmap = QPixmap(image_path)
+    if pixmap.isNull():
+        result = (pixmap, QRect())
+        _CONTROLLER_IMAGE_CACHE[image_path] = result
+        return result
+
+    image = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+    width = image.width()
+    height = image.height()
+    visited = bytearray(width * height)
+    queue = deque()
+
+    def _visit(x, y):
+        if x < 0 or x >= width or y < 0 or y >= height:
+            return
+        index = y * width + x
+        if visited[index]:
+            return
+        visited[index] = 1
+        color = image.pixelColor(x, y)
+        if _is_background_candidate(color):
+            queue.append((x, y))
+
+    for x in range(width):
+        _visit(x, 0)
+        _visit(x, height - 1)
+    for y in range(height):
+        _visit(0, y)
+        _visit(width - 1, y)
+
+    while queue:
+        x, y = queue.popleft()
+        color = image.pixelColor(x, y)
+        if _is_background_candidate(color):
+            color.setAlpha(0)
+            image.setPixelColor(x, y, color)
+            _visit(x - 1, y)
+            _visit(x + 1, y)
+            _visit(x, y - 1)
+            _visit(x, y + 1)
+
+    left = width
+    top = height
+    right = -1
+    bottom = -1
+    for y in range(height):
+        for x in range(width):
+            if image.pixelColor(x, y).alpha() <= 0:
+                continue
+            if x < left:
+                left = x
+            if y < top:
+                top = y
+            if x > right:
+                right = x
+            if y > bottom:
+                bottom = y
+
+    if right < left or bottom < top:
+        source_rect = QRect(0, 0, width, height)
+    else:
+        pad_x = max(8, int((right - left + 1) * 0.04))
+        pad_y = max(8, int((bottom - top + 1) * 0.04))
+        rect_x = max(0, left - pad_x)
+        rect_y = max(0, top - pad_y)
+        rect_right = min(width - 1, right + pad_x)
+        rect_bottom = min(height - 1, bottom + pad_y)
+        source_rect = QRect(
+            rect_x,
+            rect_y,
+            rect_right - rect_x + 1,
+            rect_bottom - rect_y + 1,
+        )
+
+    result = (QPixmap.fromImage(image), source_rect)
+    _CONTROLLER_IMAGE_CACHE[image_path] = result
+    return result
 
 
 # =========================================================================
@@ -570,7 +829,7 @@ if _HAS_QT:
             self._fade_timer.setInterval(50)
             self._fade_timer.timeout.connect(self._tick_fade)
 
-            self.set_button_map({})
+            self.set_button_profile(LAYOUT_XBOX, {})
 
         # ── Gamification callbacks ────────────────────────────────────
 
@@ -616,16 +875,20 @@ if _HAS_QT:
             self._lbl_controller.setText("Controller: not connected")
             self._lbl_controller.setStyleSheet("color: #f38ba8; font-size: 10px;")
 
-        def set_button_map(self, button_map):
-            inverse = {action: _button_display_name(btn_id) for btn_id, action in (button_map or {}).items()}
+        def set_button_profile(self, layout_key, button_map):
+            layout = _layout_config(layout_key)
+            inverse = {
+                action: _button_display_name(btn_id, layout_key)
+                for btn_id, action in (button_map or {}).items()
+            }
             parts = [
-                f"<span style='color:#59d16f;'>{inverse.get(GamepadAction.MARK_GOOD, 'A')}</span> Good",
-                f"<span style='color:#ff6464;'>{inverse.get(GamepadAction.MARK_NOISE, 'B')}</span> Noise",
-                f"<span style='color:#46b6ff;'>{inverse.get(GamepadAction.MARK_MUA, 'X')}</span> MUA",
-                f"<span style='color:#f4d957;'>{inverse.get(GamepadAction.MERGE, 'Y')}</span> Merge",
-                f"<span style='color:#cbd5e1;'>{inverse.get(GamepadAction.SAVE, 'Menu')}</span> Save",
+                f"<span style='color:#59d16f;'>{inverse.get(GamepadAction.MARK_GOOD, _button_display_name(0, layout_key))}</span> Good",
+                f"<span style='color:#ff6464;'>{inverse.get(GamepadAction.MARK_NOISE, _button_display_name(1, layout_key))}</span> Noise",
+                f"<span style='color:#46b6ff;'>{inverse.get(GamepadAction.MARK_MUA, _button_display_name(2, layout_key))}</span> MUA",
+                f"<span style='color:#f4d957;'>{inverse.get(GamepadAction.MERGE, _button_display_name(3, layout_key))}</span> Merge",
+                f"<span style='color:#cbd5e1;'>{inverse.get(GamepadAction.SAVE, _button_display_name(7, layout_key))}</span> Save",
             ]
-            self._lbl_mapping.setText("  |  ".join(parts))
+            self._lbl_mapping.setText(f"{layout.get('title', 'Xbox')} layout  |  " + "  |  ".join(parts))
 
         # ── Floating text animation ───────────────────────────────────
 
@@ -729,11 +992,12 @@ if _HAS_QT:
             grp_lay = QVBoxLayout(grp)
             grp_lay.setSpacing(4)
             self._lbl_pygame  = QLabel()
+            self._lbl_backend = QLabel()
             self._lbl_name    = QLabel()
             self._lbl_axes    = QLabel()
             self._lbl_buttons = QLabel()
             self._lbl_hats    = QLabel()
-            for lbl in (self._lbl_pygame, self._lbl_name,
+            for lbl in (self._lbl_pygame, self._lbl_backend, self._lbl_name,
                         self._lbl_axes, self._lbl_buttons, self._lbl_hats):
                 grp_lay.addWidget(lbl)
             lay.addWidget(grp)
@@ -752,25 +1016,44 @@ if _HAS_QT:
 
         def _refresh(self):
             plugin = self._plugin
-            if not _HAS_PYGAME:
-                self._lbl_pygame.setText("pygame: NOT installed  (pip install pygame)")
+            if _HAS_PYGAME:
+                self._lbl_pygame.setText(f"pygame {pygame.version.ver}  \u2713")
+                self._lbl_pygame.setStyleSheet("color: #a6e3a1;")
+            else:
+                self._lbl_pygame.setText("pygame: not installed")
                 self._lbl_pygame.setStyleSheet("color: #f38ba8;")
-                for lbl in (self._lbl_name, self._lbl_axes,
-                             self._lbl_buttons, self._lbl_hats):
+
+            if not (_HAS_PYGAME or _HAS_XINPUT):
+                self._lbl_backend.setText("Backends: none available")
+                self._lbl_backend.setStyleSheet("color: #f38ba8;")
+                for lbl in (self._lbl_name, self._lbl_axes, self._lbl_buttons, self._lbl_hats):
                     lbl.setText("")
                 return
-
-            self._lbl_pygame.setText(f"pygame {pygame.version.ver}  \u2713")
-            self._lbl_pygame.setStyleSheet("color: #a6e3a1;")
 
             plugin._detect_controller()
             js = plugin._joystick
             if js is None:
                 self._lbl_name.setText("Status:  not connected")
                 self._lbl_name.setStyleSheet("color: #f38ba8;")
+                backends = []
+                if _HAS_PYGAME:
+                    backends.append("pygame joystick")
+                if _HAS_XINPUT:
+                    backends.append("Windows XInput")
+                self._lbl_backend.setText("Backends: " + (", ".join(backends) if backends else "none"))
+                self._lbl_backend.setStyleSheet("color: #a6adc8;")
                 for lbl in (self._lbl_axes, self._lbl_buttons, self._lbl_hats):
                     lbl.setText("")
             else:
+                backend = getattr(plugin, "_controller_backend", "")
+                if backend == _XINPUT_BACKEND:
+                    backend_label = "Windows XInput"
+                elif backend == _PYGAME_BACKEND:
+                    backend_label = "pygame joystick"
+                else:
+                    backend_label = "unknown"
+                self._lbl_backend.setText(f"Backend: {backend_label}")
+                self._lbl_backend.setStyleSheet("color: #cdd6f4;")
                 self._lbl_name.setText(f"Name:    {js.get_name()}")
                 self._lbl_name.setStyleSheet("color: #a6e3a1;")
                 self._lbl_axes.setText(f"Axes:    {js.get_numaxes()}")
@@ -786,34 +1069,147 @@ if _HAS_QT:
 
 if _HAS_QT:
 
+    class _AssignmentRow(QFrame):
+        """Compact row showing an action, its current control, and a learn button."""
+
+        def __init__(self, action, parent=None):
+            super().__init__(parent)
+            self._action = action
+            self._selected = False
+            self._learning = False
+            self.on_selected = None
+            self.on_learn_clicked = None
+
+            self.setObjectName("assignmentRow")
+            self.setCursor(Qt.PointingHandCursor)
+
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(12, 10, 12, 10)
+            layout.setSpacing(10)
+
+            self._name_lbl = QLabel(_ACTION_LABELS.get(action, str(action)))
+            self._name_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self._name_lbl.setStyleSheet("font-size: 12px; font-weight: 600;")
+            layout.addWidget(self._name_lbl, 1)
+
+            self._control_chip = QLabel("(unassigned)")
+            self._control_chip.setAlignment(Qt.AlignCenter)
+            self._control_chip.setMinimumWidth(92)
+            self._control_chip.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            layout.addWidget(self._control_chip)
+
+            self._learn_btn = QPushButton("Learn")
+            self._learn_btn.setObjectName("learnBtn")
+            self._learn_btn.clicked.connect(self._emit_learn_clicked)
+            layout.addWidget(self._learn_btn)
+
+            self._refresh_style()
+
+        @property
+        def action(self):
+            return self._action
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.LeftButton and callable(self.on_selected):
+                self.on_selected(self._action)
+            super().mousePressEvent(event)
+
+        def _emit_learn_clicked(self):
+            if callable(self.on_learn_clicked):
+                self.on_learn_clicked(self._action)
+
+        def set_control(self, text, assigned):
+            self._control_chip.setText(text)
+            if assigned:
+                self._control_chip.setStyleSheet(
+                    "background: rgba(137, 180, 250, 0.16);"
+                    "color: #dce9ff;"
+                    "border: 1px solid rgba(137, 180, 250, 0.50);"
+                    "border-radius: 10px;"
+                    "padding: 4px 10px;"
+                    "font-size: 11px; font-weight: 700;"
+                )
+            else:
+                self._control_chip.setStyleSheet(
+                    "background: rgba(148, 163, 184, 0.10);"
+                    "color: #7f8ba3;"
+                    "border: 1px solid rgba(148, 163, 184, 0.24);"
+                    "border-radius: 10px;"
+                    "padding: 4px 10px;"
+                    "font-size: 11px; font-weight: 600;"
+                )
+
+        def set_selected(self, selected):
+            self._selected = bool(selected)
+            self._refresh_style()
+
+        def set_learning(self, learning):
+            self._learning = bool(learning)
+            self._learn_btn.setText("Cancel" if self._learning else "Learn")
+            self._learn_btn.setProperty("active", "true" if self._learning else "false")
+            self._learn_btn.style().unpolish(self._learn_btn)
+            self._learn_btn.style().polish(self._learn_btn)
+            self._refresh_style()
+
+        def _refresh_style(self):
+            if self._learning:
+                background = "rgba(243, 139, 168, 0.14)"
+                border = "rgba(243, 139, 168, 0.42)"
+            elif self._selected:
+                background = "rgba(137, 180, 250, 0.13)"
+                border = "rgba(137, 180, 250, 0.34)"
+            else:
+                background = "rgba(255, 255, 255, 0.03)"
+                border = "rgba(148, 163, 184, 0.14)"
+            self.setStyleSheet(
+                "QFrame#assignmentRow {"
+                f"background: {background};"
+                f"border: 1px solid {border};"
+                "border-radius: 12px;"
+                "}"
+            )
+
     class _ControllerMapWidget(QWidget):
-        """Stylized Xbox controller view with clickable hotspots and live callouts."""
+        """Controller image view with cleaned artwork and low-noise hotspots."""
 
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setObjectName("controllerCanvas")
-            self.setMinimumSize(560, 360)
+            self.setMinimumSize(540, 380)
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.setAttribute(Qt.WA_StyledBackground, True)
 
+            self._layout_key = LAYOUT_XBOX
             self._mapping = {}
             self._focused_action = None
             self._learning_action = None
-            self._button_positions = {}
+            self._pixmap = QPixmap()
+            self._source_rect = QRect()
+            self._display_rect = QRect()
             self.on_button_clicked = None
 
             self._buttons = {}
-            for button_id, spec in _BUTTON_SPECS.items():
-                btn = QPushButton(spec["short"], self)
+            for button_id in range(10):
+                btn = QPushButton(self)
                 btn.setFocusPolicy(Qt.NoFocus)
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.clicked.connect(partial(self._emit_button_clicked, button_id))
                 self._buttons[button_id] = btn
 
+            self.set_layout_key(LAYOUT_XBOX)
             self._refresh_button_styles()
 
         def _emit_button_clicked(self, button_id):
             if callable(self.on_button_clicked):
                 self.on_button_clicked(button_id)
+
+        def set_layout_key(self, layout_key):
+            self._layout_key = layout_key if layout_key in _LAYOUTS else LAYOUT_XBOX
+            image_path = _layout_config(self._layout_key).get("image_path", "")
+            self._pixmap, self._source_rect = _processed_controller_asset(image_path)
+            self._update_button_labels()
+            self._update_overlay_geometry()
+            self.update()
 
         def set_mapping(self, mapping):
             self._mapping = dict(mapping or {})
@@ -832,157 +1228,149 @@ if _HAS_QT:
 
         def resizeEvent(self, event):
             super().resizeEvent(event)
-            base = max(26, int(min(self.width(), self.height()) * 0.11))
+            self._update_overlay_geometry()
+
+        def _update_button_labels(self):
+            layout = _layout_config(self._layout_key)
+            labels = layout.get("button_labels", {})
+            hotspots = layout.get("hotspots", {})
             for button_id, btn in self._buttons.items():
-                spec = _BUTTON_SPECS[button_id]
-                cx = int(self.width() * spec["pos"][0])
-                cy = int(self.height() * spec["pos"][1])
-                size = max(18, int(min(self.width(), self.height()) * spec.get("size", 0.09)))
-                shape = spec.get("shape", "round")
-                if shape == "pill":
-                    width = int(size * 1.9)
-                    height = int(size * 0.78)
-                elif shape == "small":
-                    width = int(size * 0.95)
-                    height = int(size * 0.95)
-                else:
-                    width = height = size
+                spec = hotspots.get(button_id)
+                if spec is None:
+                    btn.hide()
+                    continue
+                btn.setText(spec.get("text") or labels.get(button_id, ""))
+                btn.show()
+
+        def _update_overlay_geometry(self):
+            margin = 18
+            canvas = QRect(
+                margin,
+                margin,
+                max(1, self.width() - margin * 2),
+                max(1, self.height() - margin * 2),
+            )
+            source_rect = self._source_rect if self._source_rect.isValid() else QRect(0, 0, max(1, self._pixmap.width()), max(1, self._pixmap.height()))
+            if self._pixmap.isNull() or source_rect.width() <= 0 or source_rect.height() <= 0:
+                self._display_rect = canvas
+            else:
+                scale = min(canvas.width() / float(source_rect.width()), canvas.height() / float(source_rect.height()))
+                draw_w = max(1, int(source_rect.width() * scale))
+                draw_h = max(1, int(source_rect.height() * scale))
+                self._display_rect = QRect(
+                    canvas.x() + (canvas.width() - draw_w) // 2,
+                    canvas.y() + (canvas.height() - draw_h) // 2,
+                    draw_w,
+                    draw_h,
+                )
+
+            hotspots = _layout_config(self._layout_key).get("hotspots", {})
+            for button_id, btn in self._buttons.items():
+                spec = hotspots.get(button_id)
+                if spec is None:
+                    btn.hide()
+                    continue
+                cx, cy = self._hotspot_center(spec)
+                width, height = self._hotspot_size(spec)
                 btn.setGeometry(cx - width // 2, cy - height // 2, width, height)
-                self._button_positions[button_id] = QPointF(cx, cy)
+                btn.show()
             self._refresh_button_styles()
 
+        def _hotspot_center(self, spec):
+            if self._pixmap.isNull() or not self._display_rect.isValid():
+                return self.width() // 2, self.height() // 2
+            source_rect = self._source_rect if self._source_rect.isValid() else QRect(0, 0, max(1, self._pixmap.width()), max(1, self._pixmap.height()))
+            source_w = max(1, source_rect.width())
+            source_h = max(1, source_rect.height())
+            orig_x = self._pixmap.width() * float(spec["center"][0])
+            orig_y = self._pixmap.height() * float(spec["center"][1])
+            norm_x = max(0.0, min(1.0, (orig_x - source_rect.x()) / source_w))
+            norm_y = max(0.0, min(1.0, (orig_y - source_rect.y()) / source_h))
+            cx = self._display_rect.x() + int(self._display_rect.width() * norm_x)
+            cy = self._display_rect.y() + int(self._display_rect.height() * norm_y)
+            return cx, cy
+
+        def _hotspot_size(self, spec):
+            display_w = max(1, self._display_rect.width())
+            display_h = max(1, self._display_rect.height())
+            shape = spec.get("shape", "round")
+            if shape == "pill":
+                width = max(34, int(display_w * spec["size"][0] * 0.62))
+                height = max(18, int(display_h * spec["size"][1] * 0.56))
+            else:
+                width = max(24, int(display_w * spec["size"][0] * 0.58))
+                height = max(24, int(display_h * spec["size"][1] * 0.58))
+            return width, height
+
         def _refresh_button_styles(self):
+            hotspots = _layout_config(self._layout_key).get("hotspots", {})
             for button_id, btn in self._buttons.items():
-                spec = _BUTTON_SPECS[button_id]
+                spec = hotspots.get(button_id)
+                if spec is None:
+                    continue
                 mapped_action = self._mapping.get(button_id)
-                active = mapped_action is not None and mapped_action == self._focused_action
+                focused = mapped_action is not None and mapped_action == self._focused_action
                 learning = mapped_action is not None and mapped_action == self._learning_action
-                accent = QColor(spec["color"])
-                border = accent.name() if (active or learning) else "#c7d2e0"
-                background = accent.darker(140).name() if mapped_action is not None else "#2a3142"
-                text_color = "#f8fafc" if mapped_action is not None else "#d7dce5"
-                shadow = accent.lighter(135).name() if active else accent.name()
+                accent = QColor(spec.get("accent", "#cbd5e1"))
+                border = accent.name() if mapped_action is not None else "rgba(148, 163, 184, 0.45)"
+                border_width = 3 if (focused or learning) else 2 if mapped_action is not None else 1
+                fill_alpha = 126 if (focused or learning) else 28 if mapped_action is not None else 10
+                if focused or learning:
+                    border = accent.lighter(130).name()
+                background = f"rgba({accent.red()}, {accent.green()}, {accent.blue()}, {fill_alpha})"
+                hover_alpha = min(190, fill_alpha + 26)
+                hover = f"rgba({accent.red()}, {accent.green()}, {accent.blue()}, {hover_alpha})"
+                if btn.text().strip():
+                    text_alpha = 255 if (focused or learning) else 205 if mapped_action is not None else 170
+                    text_color = f"rgba(248, 250, 252, {text_alpha})"
+                else:
+                    text_color = "transparent"
+                shadow = accent.lighter(118).name()
                 radius = max(10, btn.height() // 2)
                 btn.setStyleSheet(
                     "QPushButton {"
                     f"background: {background};"
                     f"color: {text_color};"
-                    f"border: 2px solid {border};"
+                    f"border: {border_width}px solid {border};"
                     f"border-radius: {radius}px;"
                     "font-weight: 700;"
-                    f"font-size: {max(8, min(btn.width(), btn.height()) // 3)}px;"
+                    f"font-size: {max(9, min(btn.width(), btn.height()) // (6 if len(btn.text()) > 2 else 3))}px;"
                     "padding: 0px 6px;"
                     "}"
                     "QPushButton:hover {"
                     f"border-color: {shadow};"
+                    f"background: {hover};"
                     "}"
                 )
                 if mapped_action is None:
-                    tip = f"{spec['label']} is available for assignment."
+                    tip = f"{_button_display_name(button_id, self._layout_key)} is available for assignment."
                 else:
-                    tip = f"{spec['label']} -> {_ACTION_LABELS.get(mapped_action, str(mapped_action))}"
+                    tip = f"{_button_display_name(button_id, self._layout_key)} -> {_ACTION_LABELS.get(mapped_action, str(mapped_action))}"
                 btn.setToolTip(tip)
-
-        def _draw_stick(self, painter, center, radius):
-            painter.save()
-            painter.setPen(QPen(QColor(255, 255, 255, 40), 1.3))
-            painter.setBrush(QColor(18, 20, 28))
-            painter.drawEllipse(center, radius, radius)
-            painter.setBrush(QColor(30, 33, 45))
-            painter.drawEllipse(center, radius * 0.62, radius * 0.62)
-            painter.restore()
-
-        def _draw_dpad(self, painter, center, size):
-            painter.save()
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(22, 25, 36))
-            arm = QRectF(center.x() - size * 0.14, center.y() - size * 0.5, size * 0.28, size)
-            bar = QRectF(center.x() - size * 0.5, center.y() - size * 0.14, size, size * 0.28)
-            painter.drawRoundedRect(arm, 6, 6)
-            painter.drawRoundedRect(bar, 6, 6)
-            painter.restore()
 
         def paintEvent(self, event):
             super().paintEvent(event)
             painter = QPainter(self)
             painter.setRenderHint(QPainter.Antialiasing)
 
-            background = QLinearGradient(0, 0, self.width(), self.height())
-            background.setColorAt(0, QColor("#10131d"))
-            background.setColorAt(1, QColor("#161c2a"))
-            painter.fillRect(self.rect(), background)
+            painter.fillRect(self.rect(), QColor("#0d1220"))
+            card = QRectF(1, 1, self.width() - 2, self.height() - 2)
+            painter.setPen(QPen(QColor("#2b3346"), 1.0))
+            painter.setBrush(QColor("#101826"))
+            painter.drawRoundedRect(card, 20, 20)
 
-            glow = QRadialGradient(self.width() * 0.5, self.height() * 0.44, self.width() * 0.36)
-            glow.setColorAt(0.0, QColor(255, 255, 255, 20))
-            glow.setColorAt(1.0, QColor(255, 255, 255, 0))
-            painter.fillRect(self.rect(), glow)
-
-            body_path = QPainterPath()
-            body_path.addRoundedRect(QRectF(self.width() * 0.28, self.height() * 0.18, self.width() * 0.44, self.height() * 0.36), 62, 62)
-            body_path.addEllipse(QRectF(self.width() * 0.13, self.height() * 0.25, self.width() * 0.28, self.height() * 0.48))
-            body_path.addEllipse(QRectF(self.width() * 0.59, self.height() * 0.25, self.width() * 0.28, self.height() * 0.48))
-            body_path.addRoundedRect(QRectF(self.width() * 0.31, self.height() * 0.44, self.width() * 0.38, self.height() * 0.18), 54, 54)
-
-            painter.setPen(QPen(QColor(255, 255, 255, 28), 1.2))
-            painter.setBrush(QColor("#0d1018"))
-            painter.drawPath(body_path)
-
-            painter.setBrush(QColor("#141a24"))
-            painter.drawRoundedRect(QRectF(self.width() * 0.17, self.height() * 0.11, self.width() * 0.18, self.height() * 0.07), 18, 18)
-            painter.drawRoundedRect(QRectF(self.width() * 0.65, self.height() * 0.11, self.width() * 0.18, self.height() * 0.07), 18, 18)
-
-            self._draw_stick(painter, QPointF(self.width() * 0.26, self.height() * 0.42), max(18, int(min(self.width(), self.height()) * 0.085)))
-            self._draw_stick(painter, QPointF(self.width() * 0.58, self.height() * 0.68), max(18, int(min(self.width(), self.height()) * 0.085)))
-            self._draw_dpad(painter, QPointF(self.width() * 0.30, self.height() * 0.67), max(34, int(min(self.width(), self.height()) * 0.11)))
-
-            painter.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
-            painter.setBrush(QColor("#1d2430"))
-            painter.drawEllipse(QPointF(self.width() * 0.50, self.height() * 0.29), 18, 18)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#d4d4d8"))
-            painter.drawEllipse(QPointF(self.width() * 0.50, self.height() * 0.29), 8, 8)
+            painter.setBrush(QColor(116, 190, 255, 20))
+            painter.drawEllipse(QRectF(self.width() * 0.16, self.height() * 0.08, self.width() * 0.68, self.height() * 0.72))
+            painter.setBrush(QColor(255, 255, 255, 14))
+            painter.drawEllipse(QRectF(self.width() * 0.28, self.height() * 0.68, self.width() * 0.44, self.height() * 0.10))
 
-            for button_id, spec in _BUTTON_SPECS.items():
-                anchor = self._button_positions.get(button_id)
-                if anchor is None:
-                    continue
-                mapped_action = self._mapping.get(button_id)
-                is_active = mapped_action is not None and mapped_action == self._focused_action
-                accent = QColor(spec["color"]) if mapped_action is not None else QColor("#6b7280")
-                if is_active:
-                    accent = accent.lighter(140)
-                end_point = QPointF(self.width() * spec["callout"][0], self.height() * spec["callout"][1])
-                elbow_x = anchor.x() + (28 if spec["align"] == "left" else -28 if spec["align"] == "right" else 0)
-                elbow = QPointF(elbow_x, end_point.y())
-
-                painter.setPen(QPen(accent, 1.7 if is_active else 1.1, Qt.DotLine))
-                painter.drawLine(anchor, elbow)
-                painter.drawLine(elbow, end_point)
-                painter.setBrush(accent)
-                painter.drawRect(QRectF(anchor.x() - 2.2, anchor.y() - 2.2, 4.4, 4.4))
-
-                box_width = self.width() * (0.19 if spec["align"] != "center" else 0.16)
-                if spec["align"] == "right":
-                    rect = QRectF(end_point.x() - box_width, end_point.y() - 18, box_width - 6, 36)
-                    align = Qt.AlignRight | Qt.AlignVCenter
-                elif spec["align"] == "center":
-                    rect = QRectF(end_point.x() - box_width * 0.5, end_point.y() - 18, box_width, 36)
-                    align = Qt.AlignHCenter | Qt.AlignVCenter
-                else:
-                    rect = QRectF(end_point.x() + 6, end_point.y() - 18, box_width - 6, 36)
-                    align = Qt.AlignLeft | Qt.AlignVCenter
-
-                title = spec["label"]
-                subtitle = _ACTION_LABELS.get(mapped_action, "Unassigned")
-                title_color = accent if mapped_action is not None else QColor("#9ca3af")
-                subtitle_color = QColor("#f8fafc") if mapped_action is not None else QColor("#6b7280")
-
-                painter.setFont(QFont("Segoe UI", 8, QFont.DemiBold))
-                painter.setPen(title_color)
-                painter.drawText(rect, align | Qt.AlignTop, title)
-                painter.setFont(QFont("Segoe UI", 9, QFont.Bold if mapped_action is not None else QFont.DemiBold))
-                painter.setPen(subtitle_color)
-                painter.drawText(rect.adjusted(0, 10, 0, 0), align | Qt.AlignBottom, subtitle)
+            if self._pixmap.isNull():
+                painter.setPen(QColor("#f38ba8"))
+                painter.drawText(self.rect(), Qt.AlignCenter, "Controller image unavailable")
+            else:
+                painter.setRenderHint(QPainter.SmoothPixmapTransform)
+                painter.drawPixmap(self._display_rect, self._pixmap, self._source_rect)
 
             painter.end()
 
@@ -992,32 +1380,64 @@ if _HAS_QT:
         _STYLE = """
             QDialog { background: #1e1e2e; }
             QLabel { color: #cdd6f4; background: transparent; }
+            QFrame#panelCard, QFrame#sectionCard {
+                background: #141b2b;
+                border: 1px solid #2b3346;
+                border-radius: 16px;
+            }
+            QFrame#sectionCard {
+                background: #121928;
+                border-radius: 14px;
+            }
             QWidget#controllerCanvas {
                 border: 1px solid #2b3346;
                 border-radius: 20px;
             }
-            QTableWidget {
-                background: #181825; color: #cdd6f4;
-                gridline-color: #313244; border: 1px solid #45475a;
-                selection-background-color: #45475a;
-                selection-color: #cdd6f4;
+            QScrollArea {
+                border: none;
+                background: transparent;
             }
-            QHeaderView::section {
-                background: #313244; color: #cba6f7;
-                border: none; padding: 4px 8px; font-weight: bold;
-            }
-            QGroupBox {
+            QLabel#eyebrow {
                 color: #cba6f7;
-                font-weight: bold;
-                border: 1px solid #313244;
-                border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 10px;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.06em;
             }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 6px;
+            QLabel#cardTitle {
+                color: #f8fafc;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            QLabel#muted {
+                color: #94a3b8;
+                font-size: 11px;
+            }
+            QLabel#selectedAction {
+                color: #f8fafc;
+                font-size: 20px;
+                font-weight: 700;
+            }
+            QLabel#selectedHelp {
+                color: #a6adc8;
+                font-size: 11px;
+            }
+            QPushButton#layoutButton {
+                background: rgba(255, 255, 255, 0.03);
+                color: #cdd6f4;
+                border: 1px solid #313b52;
+                border-radius: 12px;
+                padding: 8px 16px;
+                min-width: 110px;
+                font-weight: 700;
+            }
+            QPushButton#layoutButton:hover {
+                background: rgba(137, 180, 250, 0.10);
+                border-color: rgba(137, 180, 250, 0.36);
+            }
+            QPushButton#layoutButton:checked {
+                background: rgba(137, 180, 250, 0.16);
+                color: #eff6ff;
+                border: 1px solid rgba(137, 180, 250, 0.56);
             }
             QPushButton {
                 background: #313244; color: #cdd6f4;
@@ -1036,95 +1456,132 @@ if _HAS_QT:
             }
         """
 
-        _ACTIONS = [
-            # ── Curation ──────────────────────────────────────────────
-            GamepadAction.MARK_GOOD,        GamepadAction.MARK_NOISE,
-            GamepadAction.MARK_MUA,         GamepadAction.MERGE,
-            GamepadAction.MARK_GOOD_NEXT,   GamepadAction.MARK_NOISE_NEXT,
-            # ── Splitting ─────────────────────────────────────────────
-            GamepadAction.SPLIT,
-            GamepadAction.SPLIT_KMEANS,
-            GamepadAction.SPLIT_ISI,
-            # ── Navigation ────────────────────────────────────────────
-            GamepadAction.NEXT_BEST,        GamepadAction.PREV_BEST,
-            GamepadAction.NEXT_SIMILAR,     GamepadAction.PREV_SIMILAR,
-            GamepadAction.SELECT_SIMILAR,   GamepadAction.UNSELECT_SIM,
-            # ── Editing ───────────────────────────────────────────────
-            GamepadAction.UNDO,             GamepadAction.REDO,
-            GamepadAction.SAVE,             GamepadAction.TOGGLE_HUD,
-        ]
+        _ACTIONS = [action for _, actions in _ACTION_SECTIONS for action in actions]
 
         def __init__(self, plugin, parent=None):
             super().__init__(parent)
-            self._plugin       = plugin
-            self._learning_row = None
-            self._learn_timer  = None
+            self._plugin = plugin
+            self._learning_action = None
+            self._learn_timer = None
+            self._work_layout_key = plugin._layout_key
+            self._work_maps = {
+                layout_key: dict(plugin._button_maps.get(layout_key, _default_button_map(layout_key)))
+                for layout_key in _LAYOUTS
+            }
+            self._selected_action = self._ACTIONS[0]
+            self._rows = {}
+            self._layout_buttons = {}
 
             self.setWindowTitle("Gamepad \u2014 Configure Buttons")
             self.setStyleSheet(self._STYLE)
-            self.setMinimumSize(980, 620)
+            self.setMinimumSize(1060, 700)
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
             lay = QVBoxLayout(self)
             lay.setSpacing(12)
             lay.setContentsMargins(14, 14, 14, 14)
 
-            tip = QLabel(
-                "Select an action, then click Learn. Press a controller button or click a control on the Xbox layout to assign it."
-            )
-            tip.setStyleSheet("color: #a6adc8; font-size: 11px;")
-            tip.setWordWrap(True)
-            lay.addWidget(tip)
+            header = QFrame(self)
+            header.setObjectName("panelCard")
+            header_lay = QVBoxLayout(header)
+            header_lay.setContentsMargins(16, 14, 16, 14)
+            header_lay.setSpacing(10)
+
+            title = QLabel("Controller Mapping")
+            title.setObjectName("cardTitle")
+            header_lay.addWidget(title)
+
+            self._tip_lbl = QLabel("")
+            self._tip_lbl.setObjectName("muted")
+            self._tip_lbl.setWordWrap(True)
+            header_lay.addWidget(self._tip_lbl)
+
+            toggle_row = QHBoxLayout()
+            toggle_row.setSpacing(8)
+            toggle_row.addWidget(self._eyebrow_label("Layout"))
+            for layout_key in (LAYOUT_XBOX, LAYOUT_SWITCH):
+                button = QPushButton(_layout_config(layout_key).get("title", layout_key.title()))
+                button.setObjectName("layoutButton")
+                button.setCheckable(True)
+                button.clicked.connect(partial(self._choose_layout, layout_key))
+                self._layout_buttons[layout_key] = button
+                toggle_row.addWidget(button)
+            toggle_row.addStretch()
+            header_lay.addLayout(toggle_row)
+            lay.addWidget(header)
 
             content = QHBoxLayout()
             content.setSpacing(14)
             lay.addLayout(content, 1)
 
             left = QVBoxLayout()
-            left.setSpacing(10)
-            content.addLayout(left, 3)
+            left.setSpacing(12)
+            content.addLayout(left, 5)
+
+            preview_card = QFrame(self)
+            preview_card.setObjectName("panelCard")
+            preview_lay = QVBoxLayout(preview_card)
+            preview_lay.setContentsMargins(14, 14, 14, 14)
+            preview_lay.setSpacing(10)
+            preview_lay.addWidget(self._eyebrow_label("Controller Preview"))
 
             self._controller_map = _ControllerMapWidget(self)
             self._controller_map.on_button_clicked = self._controller_button_clicked
-            left.addWidget(self._controller_map, 1)
+            preview_lay.addWidget(self._controller_map, 1)
+            left.addWidget(preview_card, 1)
 
-            fixed_box = QGroupBox("Always-on defaults")
-            fixed_lay = QVBoxLayout(fixed_box)
-            fixed_lay.setContentsMargins(10, 12, 10, 10)
-            fixed_lay.setSpacing(4)
+            lower_left = QHBoxLayout()
+            lower_left.setSpacing(12)
+            left.addLayout(lower_left)
+
+            self._selection_card = QFrame(self)
+            self._selection_card.setObjectName("panelCard")
+            selection_lay = QVBoxLayout(self._selection_card)
+            selection_lay.setContentsMargins(14, 14, 14, 14)
+            selection_lay.setSpacing(8)
+            selection_lay.addWidget(self._eyebrow_label("Selected Assignment"))
+            self._selected_name_lbl = QLabel("")
+            self._selected_name_lbl.setObjectName("selectedAction")
+            selection_lay.addWidget(self._selected_name_lbl)
+            self._selected_control_lbl = QLabel("")
+            selection_lay.addWidget(self._selected_control_lbl)
+            self._selected_help_lbl = QLabel("")
+            self._selected_help_lbl.setObjectName("selectedHelp")
+            self._selected_help_lbl.setWordWrap(True)
+            selection_lay.addWidget(self._selected_help_lbl)
+            lower_left.addWidget(self._selection_card, 1)
+
+            fixed_card = QFrame(self)
+            fixed_card.setObjectName("panelCard")
+            fixed_lay = QVBoxLayout(fixed_card)
+            fixed_lay.setContentsMargins(14, 14, 14, 14)
+            fixed_lay.setSpacing(6)
+            fixed_lay.addWidget(self._eyebrow_label("Always-On Controls"))
             for hint in _FIXED_CONTROL_HINTS:
                 lbl = QLabel(hint)
-                lbl.setStyleSheet("color: #a6adc8; font-size: 10px;")
+                lbl.setObjectName("muted")
+                lbl.setWordWrap(True)
                 fixed_lay.addWidget(lbl)
-            left.addWidget(fixed_box)
+            lower_left.addWidget(fixed_card, 1)
 
-            right = QGroupBox("Action assignments")
-            right_lay = QVBoxLayout(right)
-            right_lay.setContentsMargins(12, 14, 12, 12)
-            right_lay.setSpacing(8)
-            content.addWidget(right, 2)
+            assignment_card = QFrame(self)
+            assignment_card.setObjectName("panelCard")
+            assignment_lay = QVBoxLayout(assignment_card)
+            assignment_lay.setContentsMargins(14, 14, 14, 14)
+            assignment_lay.setSpacing(10)
+            assignment_lay.addWidget(self._eyebrow_label("Assignments"))
+            assignment_hint = QLabel("Pick an action, then click Learn or click a highlighted controller marker.")
+            assignment_hint.setObjectName("muted")
+            assignment_hint.setWordWrap(True)
+            assignment_lay.addWidget(assignment_hint)
 
-            self._tbl = QTableWidget(len(self._ACTIONS), 3)
-            self._tbl.setHorizontalHeaderLabels(["Action", "Xbox control", ""])
-            hdr = self._tbl.horizontalHeader()
-            hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-            hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-            hdr.setSectionResizeMode(2, QHeaderView.Fixed)
-            self._tbl.setColumnWidth(2, 72)
-            self._tbl.verticalHeader().setVisible(False)
-            self._tbl.setSelectionBehavior(QTableWidget.SelectRows)
-            self._tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-            self._tbl.setFocusPolicy(Qt.NoFocus)
-            self._tbl.setAlternatingRowColors(False)
-            self._tbl.currentCellChanged.connect(self._on_row_selected)
-            right_lay.addWidget(self._tbl, 1)
-
-            self._status_lbl = QLabel("")
-            self._status_lbl.setStyleSheet(
-                "color: #f9e2af; font-size: 11px; min-height: 18px;"
-            )
-            self._status_lbl.setAlignment(Qt.AlignCenter)
-            lay.addWidget(self._status_lbl)
+            scroll = QScrollArea(self)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(self._build_assignment_sections())
+            assignment_lay.addWidget(scroll, 1)
+            content.addWidget(assignment_card, 4)
 
             bot = QHBoxLayout()
             btn_defaults = QPushButton("Reset to Defaults")
@@ -1143,72 +1600,108 @@ if _HAS_QT:
             bot.addWidget(btn_cancel)
             lay.addLayout(bot)
 
-            self._work_map = dict(plugin._button_map)
-            self._build_table()
-            self._controller_map.set_mapping(self._work_map)
-            self._tbl.selectRow(0)
-            self._on_row_selected(0, 0, -1, -1)
+            self._apply_layout_state()
+            self._select_action(self._selected_action)
 
         # ── helpers ───────────────────────────────────────────────────
 
+        def _eyebrow_label(self, text):
+            label = QLabel(text)
+            label.setObjectName("eyebrow")
+            return label
+
+        def _control_pill_html(self, text, assigned):
+            if assigned:
+                return (
+                    "<span style=\"display:inline-block; padding:4px 10px; border-radius:10px; "
+                    "background: rgba(137, 180, 250, 0.16); border: 1px solid rgba(137, 180, 250, 0.50); "
+                    "color: #eff6ff; font-weight: 700;\">"
+                    f"{text}</span>"
+                )
+            return (
+                "<span style=\"display:inline-block; padding:4px 10px; border-radius:10px; "
+                "background: rgba(148, 163, 184, 0.10); border: 1px solid rgba(148, 163, 184, 0.24); "
+                "color: #94a3b8; font-weight: 600;\">"
+                f"{text}</span>"
+            )
+
+        def _build_assignment_sections(self):
+            container = QWidget(self)
+            container_lay = QVBoxLayout(container)
+            container_lay.setContentsMargins(0, 0, 0, 0)
+            container_lay.setSpacing(10)
+
+            for section_title, actions in _ACTION_SECTIONS:
+                section = QFrame(container)
+                section.setObjectName("sectionCard")
+                section_lay = QVBoxLayout(section)
+                section_lay.setContentsMargins(12, 12, 12, 12)
+                section_lay.setSpacing(8)
+                section_lay.addWidget(self._eyebrow_label(section_title))
+                for action in actions:
+                    row = _AssignmentRow(action, parent=section)
+                    row.on_selected = self._select_action
+                    row.on_learn_clicked = self._toggle_learn
+                    self._rows[action] = row
+                    section_lay.addWidget(row)
+                container_lay.addWidget(section)
+
+            container_lay.addStretch()
+            return container
+
+        def _current_map(self):
+            return self._work_maps[self._work_layout_key]
+
+        def _choose_layout(self, layout_key, _checked=False):
+            if layout_key != self._work_layout_key:
+                if self._learning_action is not None:
+                    self._stop_learn(cancelled=True)
+                self._work_layout_key = layout_key
+            self._apply_layout_state()
+
+        def _apply_layout_state(self):
+            layout = _layout_config(self._work_layout_key)
+            self._tip_lbl.setText(
+                f"Choose a {layout.get('title', 'Xbox')} layout, then select an action on the right. The controller preview stays readable while its markers remain clickable for direct assignment."
+            )
+            for candidate_key, button in self._layout_buttons.items():
+                button.blockSignals(True)
+                button.setChecked(candidate_key == self._work_layout_key)
+                button.blockSignals(False)
+            self._controller_map.set_layout_key(self._work_layout_key)
+            self._controller_map.set_mapping(self._current_map())
+            self._refresh_all_rows()
+            self._update_selection_card()
+
         def _btn_for_action(self, action):
-            for bid, act in self._work_map.items():
+            for bid, act in self._current_map().items():
                 if act == action:
                     return bid
             return None
 
         def _btn_label(self, bid):
-            return _button_display_name(bid)
-
-        def _build_table(self):
-            for row, action in enumerate(self._ACTIONS):
-                item_name = QTableWidgetItem(_ACTION_LABELS.get(action, str(action)))
-                item_name.setFlags(item_name.flags() & ~Qt.ItemIsEditable)
-                self._tbl.setItem(row, 0, item_name)
-
-                bid = self._btn_for_action(action)
-                item_btn = QTableWidgetItem(self._btn_label(bid))
-                item_btn.setFlags(item_btn.flags() & ~Qt.ItemIsEditable)
-                if bid is None:
-                    item_btn.setForeground(QColor("#585b70"))
-                self._tbl.setItem(row, 1, item_btn)
-
-                learn_btn = QPushButton("Learn")
-                learn_btn.setObjectName("learnBtn")
-                learn_btn.clicked.connect(partial(self._toggle_learn, row))
-                self._tbl.setCellWidget(row, 2, learn_btn)
-
-        def _refresh_row(self, row):
-            action = self._ACTIONS[row]
-            bid = self._btn_for_action(action)
-            item = self._tbl.item(row, 1)
-            if item:
-                item.setText(self._btn_label(bid))
-                item.setForeground(
-                    QColor("#cdd6f4") if bid is not None else QColor("#585b70")
-                )
-            self._controller_map.set_mapping(self._work_map)
-
-        def _set_learn_btn(self, row, active):
-            btn = self._tbl.cellWidget(row, 2)
-            if btn is None:
-                return
-            btn.setText("Cancel" if active else "Learn")
-            btn.setProperty("active", "true" if active else "false")
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+            return _button_display_name(bid, self._work_layout_key)
 
         def _focus_action(self, action):
             self._controller_map.set_focus_action(action)
-            self._controller_map.set_learning_action(self._ACTIONS[self._learning_row] if self._learning_row is not None else None)
+            self._controller_map.set_learning_action(self._learning_action)
 
-        def _action_at_row(self, row):
-            if row < 0 or row >= len(self._ACTIONS):
-                return None
-            return self._ACTIONS[row]
+        def _refresh_action_row(self, action):
+            row = self._rows.get(action)
+            if row is None:
+                return
+            bid = self._btn_for_action(action)
+            row.set_control(self._btn_label(bid), bid is not None)
+            row.set_selected(action == self._selected_action)
+            row.set_learning(action == self._learning_action)
+
+        def _refresh_all_rows(self):
+            for action in self._ACTIONS:
+                self._refresh_action_row(action)
+            self._controller_map.set_mapping(self._current_map())
 
         def _find_row_for_button(self, button_id):
-            action = self._work_map.get(button_id)
+            action = self._current_map().get(button_id)
             if action is None:
                 return None
             try:
@@ -1216,45 +1709,67 @@ if _HAS_QT:
             except ValueError:
                 return None
 
-        def _on_row_selected(self, row, _current_col, _prev_row, _prev_col):
-            action = self._action_at_row(row)
-            self._focus_action(action)
+        def _update_selection_card(self, message=None):
+            action = self._selected_action
+            label = _ACTION_LABELS.get(action, str(action)) if action is not None else "No action selected"
+            bid = self._btn_for_action(action) if action is not None else None
+            control = self._btn_label(bid)
+            self._selected_name_lbl.setText(label)
+            self._selected_control_lbl.setText(self._control_pill_html(control, bid is not None))
+            if message:
+                help_text = message
+            elif self._learning_action is action:
+                help_text = "Press a controller button or click a marker on the preview to finish learning this action."
+            else:
+                help_text = "Select Learn to remap this action, or click one of the controller markers to inspect its current binding."
+            self._selected_help_lbl.setText(help_text)
+
+        def _select_action(self, action):
             if action is None:
                 return
-            control = self._btn_label(self._btn_for_action(action))
-            self._status_lbl.setText(f"Selected {_ACTION_LABELS.get(action, str(action))} -> {control}")
+            self._selected_action = action
+            self._refresh_all_rows()
+            self._focus_action(action)
+            self._update_selection_card()
 
         def _controller_button_clicked(self, button_id):
-            if self._learning_row is not None:
-                self._assign(button_id, self._learning_row)
+            if self._learning_action is not None:
+                self._assign(button_id, self._learning_action)
                 self._stop_learn(cancelled=False)
                 return
 
-            row = self._find_row_for_button(button_id)
-            if row is None:
-                self._status_lbl.setText(f"{_button_display_name(button_id)} is currently unassigned. Select an action and click Learn to map it.")
+            mapped_action = self._current_map().get(button_id)
+            if mapped_action is None:
+                self._update_selection_card(
+                    f"{_button_display_name(button_id, self._work_layout_key)} is currently unassigned. Select an action and click Learn to attach it."
+                )
                 return
 
-            self._tbl.selectRow(row)
-            action = self._ACTIONS[row]
-            self._status_lbl.setText(f"{_button_display_name(button_id)} currently triggers {_ACTION_LABELS.get(action, str(action))}.")
+            self._select_action(mapped_action)
+            self._update_selection_card(
+                f"{_button_display_name(button_id, self._work_layout_key)} currently triggers {_ACTION_LABELS.get(mapped_action, str(mapped_action))}."
+            )
 
         # ── learn mode ────────────────────────────────────────────────
 
-        def _toggle_learn(self, row):
-            if self._learning_row == row:
+        def _toggle_learn(self, action):
+            if self._learning_action == action:
                 self._stop_learn(cancelled=True)
             else:
-                if self._learning_row is not None:
+                if self._learning_action is not None:
                     self._stop_learn(cancelled=True)
-                self._start_learn(row)
+                self._start_learn(action)
 
-        def _start_learn(self, row):
-            self._learning_row = row
-            label = _ACTION_LABELS.get(self._ACTIONS[row], str(self._ACTIONS[row]))
-            self._status_lbl.setText(f"Assign {label}: press a controller button or click a control on the Xbox layout.")
-            self._set_learn_btn(row, active=True)
-            self._focus_action(self._ACTIONS[row])
+        def _start_learn(self, action):
+            self._learning_action = action
+            self._select_action(action)
+            label = _ACTION_LABELS.get(action, str(action))
+            layout_title = _layout_config(self._work_layout_key).get("title", "Xbox")
+            self._refresh_all_rows()
+            self._update_selection_card(
+                f"Assign {label}: press a controller button or click a hotspot on the {layout_title} preview."
+            )
+            self._focus_action(action)
 
             if _HAS_PYGAME and self._plugin._joystick is not None:
                 self._learn_timer = QTimer(self)
@@ -1270,55 +1785,55 @@ if _HAS_QT:
                 pygame.event.pump()
                 for bid in range(js.get_numbuttons()):
                     if js.get_button(bid):
-                        self._assign(bid, self._learning_row)
+                        self._assign(bid, self._learning_action)
                         self._stop_learn(cancelled=False)
                         return
             except Exception:
                 self._stop_learn(cancelled=True)
 
-        def _assign(self, btn_id, row):
-            action = self._ACTIONS[row]
-            # Clear old action for this button (display update)
-            old_act = self._work_map.get(btn_id)
+        def _assign(self, btn_id, action):
+            button_map = self._current_map()
+            old_act = button_map.get(btn_id)
+            for button_id, mapped_action in list(button_map.items()):
+                if mapped_action == action and button_id != btn_id:
+                    del button_map[button_id]
+            button_map[btn_id] = action
+            self._refresh_all_rows()
             if old_act is not None and old_act != action:
-                try:
-                    self._refresh_row(self._ACTIONS.index(old_act))
-                except ValueError:
-                    pass
-            # Remove this action from any previous button
-            for b in list(self._work_map):
-                if self._work_map[b] == action:
-                    del self._work_map[b]
-            self._work_map[btn_id] = action
-            self._refresh_row(row)
+                self._refresh_action_row(old_act)
             label = _ACTION_LABELS.get(action, str(action))
-            self._status_lbl.setText(f"Assigned Button {btn_id} \u2192 {label}")
+            self._select_action(action)
+            self._update_selection_card(f"Assigned {_button_display_name(btn_id, self._work_layout_key)} -> {label}.")
 
         def _stop_learn(self, cancelled=False):
             if self._learn_timer:
                 self._learn_timer.stop()
                 self._learn_timer = None
-            if self._learning_row is not None:
-                self._set_learn_btn(self._learning_row, active=False)
-            self._learning_row = None
+            self._learning_action = None
             self._controller_map.set_learning_action(None)
+            self._refresh_all_rows()
             if cancelled:
-                self._status_lbl.setText("")
-            current_row = self._tbl.currentRow()
-            self._focus_action(self._action_at_row(current_row))
+                self._update_selection_card()
+            self._focus_action(self._selected_action)
 
         def _reset_defaults(self):
             self._stop_learn(cancelled=True)
-            self._work_map = dict(DEFAULT_BUTTON_MAP)
-            for row in range(len(self._ACTIONS)):
-                self._refresh_row(row)
-            self._status_lbl.setText("Reset to default Xbox layout.")
-            self._controller_map.set_mapping(self._work_map)
+            self._work_maps[self._work_layout_key] = _default_button_map(self._work_layout_key)
+            self._refresh_all_rows()
+            layout_title = _layout_config(self._work_layout_key).get("title", "Xbox")
+            self._update_selection_card(f"Reset to the default {layout_title} layout.")
 
         def _apply(self):
             self._stop_learn(cancelled=False)
-            self._plugin._button_map = dict(self._work_map)
-            self._plugin._save_button_map(self._plugin._button_map)
+            self._plugin._layout_key = self._work_layout_key
+            self._plugin._button_maps = {
+                layout_key: dict(button_map)
+                for layout_key, button_map in self._work_maps.items()
+            }
+            self._plugin._button_map = dict(self._plugin._button_maps[self._plugin._layout_key])
+            self._plugin._save_layout_key(self._plugin._layout_key)
+            for layout_key, button_map in self._plugin._button_maps.items():
+                self._plugin._save_button_map(layout_key, button_map)
             self._plugin._update_mapping_surfaces()
 
         def _ok(self):
@@ -1364,7 +1879,13 @@ class NeuroPyGuiNGamepadController(IPlugin):
 
             # ── Gamepad polling ───────────────────────────────────────
             self._joystick = None
-            self._button_map = self._load_button_map()
+            self._controller_backend = None
+            self._layout_key = self._load_layout_key()
+            self._button_maps = {
+                layout_key: self._load_button_map(layout_key)
+                for layout_key in _LAYOUTS
+            }
+            self._button_map = dict(self._button_maps.get(self._layout_key, _default_button_map(self._layout_key)))
             self._button_states = {}
             self._hat_states = {}
             self._trigger_pressed = False
@@ -1378,7 +1899,12 @@ class NeuroPyGuiNGamepadController(IPlugin):
 
             if _HAS_PYGAME:
                 pygame.init()
-                pygame.joystick.init()
+                try:
+                    pygame.joystick.init()
+                except Exception:
+                    logger.exception("Failed to initialize pygame joystick subsystem")
+
+            if _HAS_PYGAME or _HAS_XINPUT:
                 self._detect_controller()
 
                 # Main poll timer (50ms = 20Hz, same as ethoscore)
@@ -1403,17 +1929,17 @@ class NeuroPyGuiNGamepadController(IPlugin):
 
                 logger.info(
                     "Gamepad controller plugin active "
-                    "(poll=50ms, curve=%s, deadzone=%.0f%%)",
-                    self._curve_mode, self._deadzone * 100,
+                    "(poll=50ms, curve=%s, deadzone=%.0f%%, xinput=%s)",
+                    self._curve_mode, self._deadzone * 100, "yes" if _HAS_XINPUT else "no",
                 )
             else:
                 logger.warning(
-                    "pygame not installed — gamepad plugin loaded "
-                    "but controller input disabled. pip install pygame"
+                    "pygame not installed and Windows XInput unavailable — "
+                    "gamepad plugin loaded but controller input disabled"
                 )
                 if self._hud:
                     self._hud.set_controller_name(
-                        "pygame not installed"
+                        "no controller backend"
                     )
 
             # ── Gamepad menu ──────────────────────────────────────────
@@ -1431,51 +1957,95 @@ class NeuroPyGuiNGamepadController(IPlugin):
 
     # ── Controller detection ──────────────────────────────────────────
 
-    def _detect_controller(self):
+    def _detect_pygame_controller(self):
         if not _HAS_PYGAME:
-            return
+            return None
         try:
             pygame.joystick.quit()
             pygame.joystick.init()
+            count = pygame.joystick.get_count()
         except Exception:
-            pass
-        if pygame.joystick.get_count() > 0:
-            js = pygame.joystick.Joystick(0)
-            js.init()
-            self._joystick = js
-            self._button_states.clear()
-            self._hat_states.clear()
-            name = js.get_name()
-            logger.info("Gamepad connected: %s", name)
-            if self._hud:
-                self._hud.set_controller_name(name)
+            logger.exception("Unable to enumerate pygame joysticks")
+            return None
+        for joystick_index in range(count):
+            try:
+                js = pygame.joystick.Joystick(joystick_index)
+                js.init()
+                return js
+            except Exception:
+                logger.exception("Failed to initialize pygame joystick %s", joystick_index)
+        return None
 
-            # Auto-detect right-stick X axis
-            # Some controllers use axis 2, others axis 3
-            global _RIGHT_STICK_X
-            n = js.get_numaxes()
-            if n >= 4:
-                _RIGHT_STICK_X = 3  # common for Xbox on Windows
-            elif n >= 3:
-                _RIGHT_STICK_X = 2
-        else:
+    def _detect_xinput_controller(self):
+        if not _HAS_XINPUT:
+            return None
+        for user_index in range(4):
+            controller = _XInputController(user_index)
+            try:
+                if controller.init():
+                    return controller
+            except Exception:
+                logger.exception("Failed to initialize XInput controller slot %s", user_index)
+        return None
+
+    def _detect_controller(self):
+        js = self._detect_pygame_controller()
+        backend = _PYGAME_BACKEND if js is not None else None
+        if js is None:
+            js = self._detect_xinput_controller()
+            backend = _XINPUT_BACKEND if js is not None else None
+        if js is None:
             if self._joystick is not None:
-                self._joystick = None
+                self._handle_disconnect()
                 logger.info("Gamepad disconnected")
-                if self._hud:
-                    self._hud.set_controller_disconnected()
+            return
+
+        previous_name = self._joystick.get_name() if self._joystick is not None else None
+        previous_backend = getattr(self, "_controller_backend", None)
+        self._joystick = js
+        self._controller_backend = backend
+        self._button_states.clear()
+        self._hat_states.clear()
+
+        name = js.get_name()
+        if previous_name != name or previous_backend != backend:
+            logger.info("Gamepad connected via %s: %s", backend, name)
+        if self._hud:
+            self._hud.set_controller_name(name)
+
+        global _RIGHT_STICK_X
+        n = js.get_numaxes()
+        if backend == _XINPUT_BACKEND:
+            _RIGHT_STICK_X = 2
+        elif n >= 4:
+            _RIGHT_STICK_X = 3
+        elif n >= 3:
+            _RIGHT_STICK_X = 2
 
     # ── Main poll loop ────────────────────────────────────────────────
 
     def _poll_gamepad(self):
-        if not _HAS_PYGAME or self._joystick is None:
-            return
-        try:
-            pygame.event.pump()
-        except Exception:
+        if self._joystick is None:
             return
 
         js = self._joystick
+        backend = getattr(self, "_controller_backend", None)
+        try:
+            if backend == _PYGAME_BACKEND:
+                if not _HAS_PYGAME:
+                    self._handle_disconnect()
+                    return
+                pygame.event.pump()
+            elif backend == _XINPUT_BACKEND:
+                if not js.refresh_state():
+                    self._handle_disconnect()
+                    return
+            else:
+                self._handle_disconnect()
+                return
+        except Exception:
+            self._handle_disconnect()
+            return
 
         # ── Buttons (edge-detect) ─────────────────────────────────
         try:
@@ -1559,6 +2129,7 @@ class NeuroPyGuiNGamepadController(IPlugin):
 
     def _handle_disconnect(self):
         self._joystick = None
+        self._controller_backend = None
         self._button_states.clear()
         self._hat_states.clear()
         if self._hud:
@@ -1572,23 +2143,45 @@ class NeuroPyGuiNGamepadController(IPlugin):
         except Exception:
             return None
 
-    def _load_button_map(self):
+    def _load_layout_key(self):
         settings = self._settings()
         if settings is None:
-            return dict(DEFAULT_BUTTON_MAP)
-        raw_value = settings.value(_BUTTON_MAP_SETTINGS_KEY, "")
-        return _deserialize_button_map(raw_value)
+            return LAYOUT_XBOX
+        raw_value = str(settings.value(_LAYOUT_SETTINGS_KEY, LAYOUT_XBOX) or LAYOUT_XBOX).strip().lower()
+        if raw_value not in _LAYOUTS:
+            return LAYOUT_XBOX
+        return raw_value
 
-    def _save_button_map(self, button_map):
+    def _save_layout_key(self, layout_key):
         settings = self._settings()
         if settings is None:
             return
-        settings.setValue(_BUTTON_MAP_SETTINGS_KEY, _serialize_button_map(button_map))
+        settings.setValue(_LAYOUT_SETTINGS_KEY, layout_key)
+        settings.sync()
+
+    def _load_button_map(self, layout_key):
+        default_button_map = _default_button_map(layout_key)
+        settings = self._settings()
+        if settings is None:
+            return default_button_map
+        raw_value = settings.value(_button_map_settings_key(layout_key), "")
+        if (not raw_value) and layout_key == LAYOUT_XBOX:
+            raw_value = settings.value(_LEGACY_BUTTON_MAP_SETTINGS_KEY, "")
+        return _deserialize_button_map(raw_value, default_button_map)
+
+    def _save_button_map(self, layout_key, button_map):
+        settings = self._settings()
+        if settings is None:
+            return
+        serialized = _serialize_button_map(button_map)
+        settings.setValue(_button_map_settings_key(layout_key), serialized)
+        if layout_key == LAYOUT_XBOX:
+            settings.setValue(_LEGACY_BUTTON_MAP_SETTINGS_KEY, serialized)
         settings.sync()
 
     def _update_mapping_surfaces(self):
         if self._hud:
-            self._hud.set_button_map(self._button_map)
+            self._hud.set_button_profile(self._layout_key, self._button_map)
 
     def _run_actions(self, action_group, *names):
         if action_group is None:
@@ -1843,3 +2436,7 @@ class NeuroPyGuiNGamepadController(IPlugin):
         dlg = _ButtonConfigDialog(self, parent=parent)
         dlg.exec_()
 '''
+    return (
+        source.replace("__XBOX_LAYOUT_IMAGE__", xbox_image)
+        .replace("__SWITCH_LAYOUT_IMAGE__", switch_image)
+    )

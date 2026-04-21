@@ -853,6 +853,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 default_kilosort_output_name,
                 default_pipeline_output_dir,
                 default_pipeline_ks_output_dir,
+                default_pipeline_raw_output_layout,
                 expected_ni_catgt_output_patterns,
                 extractor_label_rename_map,
                 is_catgt_processed_bin,
@@ -981,9 +982,11 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         f"[{self.job['name']}] Input already appears CatGT-processed; skipping CatGT and using local KS area near {bin_file.parent}.",
                     )
             else:
-                extracted_data_root = default_pipeline_output_dir(
+                extracted_data_root, ks_folder = default_pipeline_raw_output_layout(
                     str(bin_file),
                     output_root,
+                    ks_tag,
+                    probe_string,
                     run_name=run_name,
                     mirror_raw_hierarchy=self.cfg.mirror_raw_hierarchy_output,
                 )
@@ -993,13 +996,6 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         self.signals.log,
                         f"[{self.job['name']}] Mirrored raw hierarchy output root: {extracted_data_root}",
                     )
-                ks_folder = default_pipeline_ks_output_dir(
-                    str(bin_file),
-                    ks_tag,
-                    probe_string,
-                    output_root=output_root,
-                    run_name=run_name,
-                )
 
             module_steps: List[Tuple[str, str, str]] = []
             if self.cfg.run_kilosort:

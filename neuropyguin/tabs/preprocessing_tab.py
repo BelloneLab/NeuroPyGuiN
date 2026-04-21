@@ -10,6 +10,7 @@ import math
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..preprocessing import (
+    completed_run_target_folders,
     default_kilosort_output_name,
     discover_completed_runs,
     discover_bin_files,
@@ -312,7 +313,7 @@ class Ks4AdvancedDialog(QtWidgets.QDialog):
 
 
 class PreprocessingTab(QtWidgets.QWidget):
-    openCurationRequested = QtCore.Signal(str)
+    openCurationRequested = QtCore.Signal(list)
     openPostProcessingRequested = QtCore.Signal(str)
     saveSettingsFileRequested = QtCore.Signal()
     loadSettingsFileRequested = QtCore.Signal()
@@ -896,7 +897,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         done_layout.addWidget(done_hint)
         self.list_completed = QtWidgets.QListWidget()
         self.list_completed.setAlternatingRowColors(True)
-        self.list_completed.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.list_completed.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.list_completed.setSpacing(4)
         self.list_completed.setMinimumHeight(220)
         self.list_completed.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
@@ -1045,7 +1046,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_scan_completed_root.clicked.connect(self._scan_completed_root)
         self.list_jobs.filesDropped.connect(self._consume_drop)
         self.list_jobs.customContextMenuRequested.connect(self._open_job_context_menu)
-        self.list_completed.itemDoubleClicked.connect(lambda _item: self._open_selected_curation())
+        self.list_completed.itemDoubleClicked.connect(self._open_selected_curation)
         self.list_completed.customContextMenuRequested.connect(self._open_completed_context_menu)
         btn_output.clicked.connect(lambda: self._pick_folder(self.ed_output))
         btn_json.clicked.connect(lambda: self._pick_folder(self.ed_json))
@@ -1480,6 +1481,29 @@ class PreprocessingTab(QtWidgets.QWidget):
             item = self.list_completed.item(self.list_completed.count() - 1)
         return self._completed_entry_from_item(item)
 
+    def _selected_completed_entries(
+        self,
+        item_override: QtWidgets.QListWidgetItem | None = None,
+    ) -> List[Dict[str, object]]:
+        items = self.list_completed.selectedItems()
+        if not items and item_override is not None:
+            items = [item_override]
+        if not items:
+            current = self.list_completed.currentItem()
+            if current is not None:
+                items = [current]
+        if not items and self.list_completed.count():
+            last_item = self.list_completed.item(self.list_completed.count() - 1)
+            if last_item is not None:
+                items = [last_item]
+
+        out: List[Dict[str, object]] = []
+        for item in items:
+            entry = self._completed_entry_from_item(item)
+            if entry is not None:
+                out.append(entry)
+        return out
+
     def _show_completed_run_parameters(self, entry: Dict[str, object]) -> None:
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle(f"Run Parameters: {entry.get('run_name', '')}")
@@ -1531,20 +1555,96 @@ class PreprocessingTab(QtWidgets.QWidget):
             return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
 
-    def _requeue_completed_entry(self, entry: Dict[str, object]) -> None:
-        bin_file = str(entry.get("bin_file") or "")
+    def _resolve_completed_entry_bin_file(self, entry: Dict[str, object]) -> str:
+        params_file_raw = str(entry.get("params_file") or "").strip()
+        source_root_raw = str(entry.get("source_root") or "").strip()
+        params_file = Path(params_file_raw).expanduser() if params_file_raw else None
+        source_root = Path(source_root_raw).expanduser() if source_root_raw else None
+        snapshot = entry.get("job_snapshot") or {}
+        candidates = [
+            str((snapshot.get("bin_file") or "")).strip(),
+            str(entry.get("bin_file") or "").strip(),
+        ]
+        for raw_path in candidates:
+            if not raw_path:
+                continue
+            path = Path(raw_path).expanduser()
+            search_paths = [path]
+            if not path.is_absolute():
+                if params_file:
+                    search_paths.append(params_file.parent / path)
+                if source_root:
+                    search_paths.append(source_root / path)
+            for candidate in search_paths:
+                try:
+                    resolved = candidate.resolve()
+                except Exception:
+                    resolved = candidate
+                if resolved.exists():
+                    return str(resolved)
+        return ""
+
+    def _job_from_completed_entry(self, entry: Dict[str, object]) -> Dict[str, str] | None:
+        bin_file = self._resolve_completed_entry_bin_file(entry)
         if not bin_file:
-            self._append_log(f"No input bin stored for completed run {entry.get('run_name', '')}.")
+            return None
+        snapshot = entry.get("job_snapshot") or {}
+        parsed = parse_spikeglx_bin_name(bin_file)
+        return {
+            "name": str(snapshot.get("name") or entry.get("run_name") or parsed.get("run_name") or "").strip(),
+            "bin_file": bin_file,
+            "workdir": str(Path(bin_file).parent),
+            "gate_string": str(snapshot.get("gate_string") or parsed.get("gate_string") or "0").strip(),
+            "trigger_string": str(snapshot.get("trigger_string") or parsed.get("trigger_string") or "0,0").strip(),
+            "probe_string": str(snapshot.get("probe_string") or parsed.get("probe_string") or "0").strip(),
+        }
+
+    def _select_job_in_queue(self, bin_file: str) -> None:
+        target = self._normalized_path(bin_file)
+        for row in range(self.list_jobs.count()):
+            item = self.list_jobs.item(row)
+            if item is None:
+                continue
+            payload = item.data(QtCore.Qt.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            item_bin = str(payload.get("bin_file") or "")
+            if self._normalized_path(item_bin) != target:
+                continue
+            self.list_jobs.setCurrentRow(row)
+            self.list_jobs.scrollToItem(item, QtWidgets.QAbstractItemView.PositionAtCenter)
             return
-        if not Path(bin_file).exists():
-            self._append_log(f"Input bin no longer exists: {bin_file}")
+
+    def _requeue_completed_entry(self, entry: Dict[str, object]) -> None:
+        job = self._job_from_completed_entry(entry)
+        if job is None:
+            self._append_log(
+                f"Could not locate the original AP bin for completed run {entry.get('run_name', '')}; "
+                "re-run requires the source raw input."
+            )
             return
-        self._add_paths([bin_file])
+        bin_file = str(job.get("bin_file") or "")
+        ok, reason = validate_spikeglx_ap_bin(bin_file)
+        if not ok:
+            self._append_log(f"Cannot re-queue {entry.get('run_name', '')} from {bin_file}: {reason}")
+            return
+        norm_bin = self._normalized_path(bin_file)
+        self._raw_run_catalog[norm_bin] = dict(job)
+        already_queued = any(self._normalized_path(str(existing.get("bin_file") or "")) == norm_bin for existing in self.jobs)
+        if not already_queued:
+            self.jobs.append(job)
+        queue_filter_index = self.cb_queue_filter.findData("non_processed")
+        if queue_filter_index >= 0:
+            self.cb_queue_filter.setCurrentIndex(queue_filter_index)
+        self._refresh_job_list_view()
+        self._refresh_queue_summary()
         if hasattr(self, "work_sections"):
             self.work_sections.setCurrentIndex(0)
-        self._append_log(
-            f"Re-queued {entry.get('run_name', '')} from {bin_file}. Adjust settings if needed, then run queue."
-        )
+        self._select_job_in_queue(bin_file)
+        if already_queued:
+            self._append_log(f"{entry.get('run_name', '')} is already in the queue.")
+            return
+        self._append_log(f"Re-queued {entry.get('run_name', '')} from {bin_file}. Adjust settings if needed, then run queue.")
 
     def _open_completed_in_postprocessing(self, entry: Dict[str, object]) -> None:
         folder = str(entry.get("ks_folder") or "")
@@ -2026,10 +2126,11 @@ class PreprocessingTab(QtWidgets.QWidget):
                 act.triggered.connect(lambda checked=False, path=p: self._add_paths([path]))
         menu.exec(self.btn_recent_folders.mapToGlobal(self.btn_recent_folders.rect().bottomLeft()))
 
-    def _open_selected_curation(self) -> None:
-        entry = self._selected_completed_entry()
-        if entry:
-            self.openCurationRequested.emit(str(entry.get("ks_folder") or ""))
+    def _open_selected_curation(self, item: QtWidgets.QListWidgetItem | None = None) -> None:
+        entries = self._selected_completed_entries(item)
+        folders = completed_run_target_folders(entries)
+        if folders:
+            self.openCurationRequested.emit(folders)
 
     def clear_completed_history(self) -> None:
         self.completed_runs.clear()

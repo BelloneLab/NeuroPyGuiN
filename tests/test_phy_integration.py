@@ -50,15 +50,51 @@ def test_ensure_phy_short_isi_plugin_replaces_previous_registration_block(tmp_pa
     assert PHY_PLUGIN_CLASS in text
 
 
-def test_gamepad_plugin_source_contains_persistent_xbox_mapping_hooks() -> None:
+def test_phy_plugin_source_contains_scroll_optimizer(tmp_path: Path) -> None:
+    result = ensure_phy_short_isi_plugin(tmp_path)
+    plugin_path = Path(result["plugin_path"])
+    text = plugin_path.read_text(encoding="utf-8")
+
+    assert "class _ClusterScrollOptimizer(QObject):" in text
+    assert "_SCROLL_SELECTION_DEBOUNCE_MS = 120" in text
+    assert "_SCROLL_SETTLE_MS = 250" in text
+    assert "scroll_optimizer.install()" in text
+    assert "scroll_optimizer.note_selected(cluster_ids)" in text
+
+
+def test_gamepad_plugin_source_contains_layout_aware_mapping_hooks() -> None:
     source = _gamepad_plugin_source()
 
-    assert '_BUTTON_MAP_SETTINGS_KEY = "gamepad/button_map_v2"' in source
+    assert '_LAYOUT_SETTINGS_KEY = "gamepad/layout_v1"' in source
+    assert '_BUTTON_MAP_SETTINGS_KEY_TEMPLATE = "gamepad/button_map_{layout}_v1"' in source
+    assert 'LAYOUT_SWITCH = "switch"' in source
+    assert 'def _processed_controller_asset(image_path):' in source
+    assert 'class _AssignmentRow(QFrame):' in source
     assert 'class _ControllerMapWidget(QWidget):' in source
-    assert 'Xbox control' in source
-    assert 'self._button_map = self._load_button_map()' in source
-    assert '_save_button_map(self._plugin._button_map)' in source
+    assert 'QScrollArea' in source
+    assert 'QPushButton#layoutButton' in source
+    assert 'Nintendo Switch' in source
+    assert 'xbox.png' in source
+    assert 'switch.png' in source
+    assert '__XBOX_LAYOUT_IMAGE__' not in source
+    assert '__SWITCH_LAYOUT_IMAGE__' not in source
+    assert 'self._layout_key = self._load_layout_key()' in source
+    assert 'self._button_maps = {' in source
+    assert 'self._plugin._save_layout_key(self._plugin._layout_key)' in source
+    assert 'self._plugin._save_button_map(layout_key, button_map)' in source
     assert '_run_edit_action(' in source
     assert 'split_short_isi' in source
     assert '_run_file_action(' in source
     assert 'save' in source
+
+
+def test_gamepad_plugin_source_contains_xinput_fallback() -> None:
+    source = _gamepad_plugin_source()
+
+    assert "_HAS_XINPUT = _XINPUT_DLL is not None" in source
+    assert "class _XInputController:" in source
+    assert "def _detect_xinput_controller(self):" in source
+    assert 'self._lbl_backend = QLabel()' in source
+    assert 'if _HAS_PYGAME or _HAS_XINPUT:' in source
+    assert 'logger.info("Gamepad connected via %s: %s", backend, name)' in source
+    assert 'backend == _XINPUT_BACKEND' in source

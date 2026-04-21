@@ -8,10 +8,12 @@ from neuropyguin.preprocessing import (
     catgt_extract_only_stream_string,
     catgt_extract_stream_selection,
     catgt_stream_string,
+    completed_run_target_folders,
     default_kilosort_output_name,
     default_local_ks_output_dir,
     default_pipeline_output_dir,
     default_pipeline_ks_output_dir,
+    default_pipeline_raw_output_layout,
     discover_completed_runs,
     expected_ni_catgt_output_patterns,
     extractor_label_rename_map,
@@ -108,6 +110,22 @@ def test_default_pipeline_ks_output_dir_can_mirror_raw_inputs_into_spike_sorting
         )
         == expected
     )
+
+
+def test_default_pipeline_raw_output_layout_keeps_root_and_ks_folder_in_same_mirrored_tree() -> None:
+    bin_file = Path(
+        r"B:\NPX\rawData\VTA_NPX\31102\7\31102_7_NPX_omaze_g0\31102_7_NPX_omaze_g0_imec0\31102_7_NPX_omaze_g0_t0.imec0.ap.bin"
+    )
+    extracted_root, ks_folder = default_pipeline_raw_output_layout(
+        str(bin_file),
+        r"B:\NPX\processedData",
+        "ks4",
+        "0",
+        run_name="31102_7_NPX_omaze",
+        mirror_raw_hierarchy=True,
+    )
+    assert extracted_root == Path(r"B:\NPX\processedData\VTA_NPX\31102\7\spike_sorting")
+    assert ks_folder == Path(r"B:\NPX\processedData\VTA_NPX\31102\7\spike_sorting\imec0_ks4")
 
 
 def test_default_pipeline_ks_output_dir_uses_processed_bin_parent_after_catgt() -> None:
@@ -270,6 +288,18 @@ def test_discover_completed_runs_finds_kilosort_outputs_under_processed_root(tmp
     )
     assert entries[0]["params_file"] == str(params_file.resolve())
     assert entries[0]["source_root"] == str(processed_root.resolve())
+
+
+def test_completed_run_target_folders_dedupes_and_skips_empty_entries() -> None:
+    folders = completed_run_target_folders(
+        [
+            {"ks_folder": r"D:\runs\imec0_ks4"},
+            {"ks_folder": ""},
+            {"ks_folder": r"d:\runs\imec0_ks4"},
+            {"ks_folder": r"D:\runs\imec1_ks4"},
+        ]
+    )
+    assert folders == [r"D:\runs\imec0_ks4", r"D:\runs\imec1_ks4"]
 
 
 def test_resolve_labelled_output_context_falls_back_to_existing_catgt_context_for_raw_input() -> None:

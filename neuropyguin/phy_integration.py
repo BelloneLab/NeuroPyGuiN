@@ -22,11 +22,138 @@ def _plugin_source() -> str:
         """
         from phy import IPlugin, connect
         from phylib.utils import unconnect
-        from phy.gui.qt import QMenu, QPoint
+        from phy.gui.qt import QEvent, QMenu, QObject, QPoint, QTimer, Qt
         import logging
         import numpy as np
 
         logger = logging.getLogger("phy")
+
+
+        _SCROLL_SELECTION_DEBOUNCE_MS = 120
+        _SCROLL_SETTLE_MS = 250
+
+
+        class _ClusterScrollOptimizer(QObject):
+            'Suspend expensive view refreshes while the cluster list is actively scrolled.'
+
+            _NAV_KEYS = {
+                Qt.Key_Up,
+                Qt.Key_Down,
+                Qt.Key_PageUp,
+                Qt.Key_PageDown,
+                Qt.Key_Home,
+                Qt.Key_End,
+            }
+
+            def __init__(self, supervisor, gui):
+                super().__init__(gui)
+                self._supervisor = supervisor
+                self._gui = gui
+                self._suspended_views = []
+                self._last_selected = []
+                self._timer = QTimer(self)
+                self._timer.setSingleShot(True)
+                self._timer.setInterval(_SCROLL_SETTLE_MS)
+                self._timer.timeout.connect(self._flush)
+
+            def install(self):
+                self._set_table_debounce(getattr(self._supervisor, "cluster_view", None))
+                self._set_table_debounce(getattr(self._supervisor, "similarity_view", None))
+                self._install_on_table(getattr(self._supervisor, "cluster_view", None))
+                self._install_on_table(getattr(self._supervisor, "similarity_view", None))
+
+            def note_selected(self, cluster_ids):
+                self._last_selected = [int(cluster_id) for cluster_id in (cluster_ids or [])]
+
+            def eventFilter(self, obj, event):
+                if event is None:
+                    return False
+                if event.type() == QEvent.Wheel:
+                    self._begin_scroll_freeze()
+                elif event.type() == QEvent.KeyPress:
+                    key = event.key()
+                    if key in self._NAV_KEYS:
+                        self._begin_scroll_freeze()
+                return False
+
+            def _set_table_debounce(self, table):
+                if table is None:
+                    return
+                try:
+                    table.debouncer.delay = min(
+                        int(getattr(table.debouncer, "delay", _SCROLL_SELECTION_DEBOUNCE_MS)),
+                        _SCROLL_SELECTION_DEBOUNCE_MS,
+                    )
+                except Exception:
+                    pass
+
+            def _install_on_table(self, table):
+                if table is None:
+                    return
+                seen = set()
+                candidates = [table]
+                for getter_name in ("focusProxy", "page"):
+                    try:
+                        getter = getattr(table, getter_name, None)
+                        obj = getter() if callable(getter) else None
+                    except Exception:
+                        obj = None
+                    if obj is not None:
+                        candidates.append(obj)
+                try:
+                    candidates.extend(list(table.children()))
+                except Exception:
+                    pass
+
+                for obj in candidates:
+                    if obj is None:
+                        continue
+                    key = id(obj)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        obj.installEventFilter(self)
+                    except Exception:
+                        pass
+
+            def _begin_scroll_freeze(self):
+                if not self._suspended_views:
+                    for view in self._gui.list_views():
+                        if getattr(view, "_closed", False):
+                            continue
+                        if not hasattr(view, "auto_update") or not hasattr(view, "on_select_threaded"):
+                            continue
+                        if not getattr(view, "auto_update", False):
+                            continue
+                        self._suspended_views.append(view)
+                        view.auto_update = False
+                self._timer.start()
+
+            def _flush(self):
+                views = [
+                    view for view in self._suspended_views
+                    if view is not None and not getattr(view, "_closed", False)
+                ]
+                self._suspended_views = []
+                for view in views:
+                    view.auto_update = True
+
+                cluster_ids = self._last_selected or list(getattr(self._supervisor, "selected", []) or [])
+                if not cluster_ids:
+                    cluster_ids = list(getattr(self._supervisor, "selected_clusters", []) or [])
+                if not cluster_ids:
+                    return
+
+                for view in views:
+                    try:
+                        view.on_select_threaded(self._supervisor, list(cluster_ids), gui=self._gui)
+                    except Exception as exc:
+                        logger.debug(
+                            "Deferred scroll refresh failed for %s: %s",
+                            getattr(view, "name", view.__class__.__name__),
+                            exc,
+                        )
 
 
         class NeuroPyGuiNSplitShortISIContext(IPlugin):
@@ -34,6 +161,9 @@ def _plugin_source() -> str:
                 @connect
                 def on_gui_ready(sender, gui):
                     supervisor = controller.supervisor
+
+                    scroll_optimizer = _ClusterScrollOptimizer(supervisor, gui)
+                    scroll_optimizer.install()
 
                     @supervisor.actions.add(
                         name="Split short ISI",
@@ -145,6 +275,10 @@ def _plugin_source() -> str:
 
                         point = QPoint(int(obj.get("x", 0) or 0), int(obj.get("y", 0) or 0))
                         menu.exec(supervisor.cluster_view.mapToGlobal(point))
+
+                    @connect(sender=supervisor)
+                    def on_supervisor_select(sender, cluster_ids, **kwargs):
+                        scroll_optimizer.note_selected(cluster_ids)
         """
     ).strip() + "\n"
 

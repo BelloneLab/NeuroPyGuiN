@@ -270,13 +270,18 @@ def parse_kilosort_params_dat_path(params_file: str | Path) -> str:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return ""
-    match = re.search(r"(?m)^\s*dat_path\s*=\s*['\"]([^'\"]+)['\"]", text)
+    match = re.search(r"(?m)^\s*dat_path\s*=\s*(?:r|R)?['\"]([^'\"]+)['\"]", text)
     if not match:
         return ""
     raw = match.group(1).strip()
     if not raw:
         return ""
-    return str(Path(raw.replace("/", "\\")))
+    dat_path = Path(raw.replace("/", "\\")).expanduser()
+    if not dat_path.is_absolute():
+        dat_path = (path.parent / dat_path).resolve()
+    else:
+        dat_path = dat_path.resolve()
+    return str(dat_path)
 
 
 def infer_completed_run_name(ks_folder: str | Path) -> str:
@@ -327,6 +332,21 @@ def discover_completed_runs(root_path: str | Path) -> List[Dict[str, str]]:
     return entries
 
 
+def completed_run_target_folders(entries: Iterable[Dict[str, object]]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        raw = str((entry or {}).get("ks_folder") or "").strip()
+        if not raw:
+            continue
+        key = raw.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(raw)
+    return out
+
+
 def default_kilosort_output_name(ks_tag: str, probe_string: str) -> str:
     probe = str(probe_string).strip()
     tag = str(ks_tag).strip()
@@ -371,6 +391,25 @@ def default_pipeline_output_dir(
     if not relative_session:
         return root / str(run_name).strip()
     return root.joinpath(*relative_session, "spike_sorting")
+
+
+def default_pipeline_raw_output_layout(
+    bin_file: str,
+    output_root: str | Path,
+    ks_tag: str,
+    probe_string: str,
+    *,
+    run_name: str,
+    mirror_raw_hierarchy: bool = False,
+) -> Tuple[Path, Path]:
+    extracted_data_root = default_pipeline_output_dir(
+        bin_file,
+        output_root,
+        run_name=run_name,
+        mirror_raw_hierarchy=mirror_raw_hierarchy,
+    )
+    ks_folder = extracted_data_root / default_kilosort_output_name(ks_tag, probe_string)
+    return extracted_data_root, ks_folder
 
 
 def parse_catgt_processed_bin_context(bin_file: str) -> Dict[str, str]:
@@ -418,15 +457,15 @@ def default_pipeline_ks_output_dir(
 ) -> Path:
     if store_next_to_bin or is_catgt_processed_bin(bin_file):
         return default_local_ks_output_dir(bin_file, ks_tag, probe_string)
-    root = Path(output_root).expanduser()
-    if mirror_raw_hierarchy:
-        return default_pipeline_output_dir(
-            bin_file,
-            root,
-            run_name=run_name,
-            mirror_raw_hierarchy=True,
-        ) / default_kilosort_output_name(ks_tag, probe_string)
-    return root / str(run_name).strip() / default_kilosort_output_name(ks_tag, probe_string)
+    _, ks_folder = default_pipeline_raw_output_layout(
+        bin_file,
+        output_root,
+        ks_tag,
+        probe_string,
+        run_name=run_name,
+        mirror_raw_hierarchy=mirror_raw_hierarchy,
+    )
+    return ks_folder
 
 
 def write_step_json(path: Path, payload: Dict) -> None:

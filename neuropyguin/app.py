@@ -424,8 +424,19 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
             self.settings.remove("ui/geometry")
             self.settings.remove("ui/window_state")
 
-    def _open_curation(self, folder: str) -> None:
-        self.cur_tab.open_ks_folder(folder)
+    def _open_curation(self, folders) -> None:
+        if isinstance(folders, str):
+            targets = [folders]
+        else:
+            targets = [str(folder).strip() for folder in list(folders or []) if str(folder).strip()]
+        if not targets:
+            return
+        if len(targets) == 1:
+            self.cur_tab.open_ks_folder(targets[0])
+        else:
+            self.cur_tab.set_ks_folders(targets)
+            if hasattr(self.cur_tab, "show_phy_page"):
+                self.cur_tab.show_phy_page()
         self.tabs.setCurrentWidget(self.cur_tab)
 
     def _open_postprocessing(self, folder: str) -> None:
@@ -510,7 +521,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
             return
         self.settings.setValue("curation/phy_folder", folder)
         self.settings.setValue("curation/bomb_folder", folder)
-        self.cur_tab.set_ks_folder(folder)
+        self.cur_tab.set_ks_folders([folder])
         self.tabs.setCurrentWidget(self.cur_tab)
 
     def _pick_postprocessing_folder(self) -> None:
