@@ -1446,7 +1446,10 @@ class HistologyTab(QtWidgets.QWidget):
         return {
             "ibl_python": self.ed_pyexe.text().strip() or None,
             "iblapps_path": self.ed_iblapps.text().strip() or None,
-            "log": self._log,
+            # run_bridge streams subprocess output from a worker thread; route it
+            # through the queued signal so the log widget is only touched on the
+            # GUI thread (writing a QPlainTextEdit off-thread crashes Qt natively).
+            "log": self.log_requested.emit,
         }
 
     def _gen_xyz(self) -> None:
