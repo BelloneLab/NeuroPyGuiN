@@ -183,16 +183,16 @@ def propose_alignment(hist_folder, atlas_path=None, brain_atlas=None,
 
 
 def _write_proposals(hist_folder: Path, shanks: List[dict]) -> None:
-    """Write a prev_alignments entry the IBL GUI loads, only for confident shanks.
+    """Write an ``auto_`` prev_alignments entry the IBL GUI lists, for every shank.
 
-    A low-confidence offset is just noise in a flat correlation landscape, so we do
-    not write it: the GUI keeps `original` (the histology track) for those shanks.
+    Confident shanks get the proposed offset; low-confidence shanks get an identity
+    (no-shift) entry so the option is still visible in the GUI drop-down but does
+    not move anything (a low-confidence offset is just noise in a flat correlation
+    landscape, and the histology track is the better estimate there).
     """
     key = "auto_" + datetime.datetime.now().replace(microsecond=0).isoformat()
     multi = len(shanks) > 1
     for s in shanks:
-        if not s["good"]:
-            continue
         name = (f"prev_alignments_shank{s['shank']}.json" if multi else "prev_alignments.json")
         fp = hist_folder / name
         data = {}
@@ -201,7 +201,9 @@ def _write_proposals(hist_folder: Path, shanks: List[dict]) -> None:
                 data = json.loads(fp.read_text())
             except (OSError, ValueError):
                 data = {}
-        data[key] = [s["feature"], s["track"]]
+        off = s["offset_um"] if s["good"] else 0.0
+        feature = np.asarray(s["feature"], float)
+        data[key] = [feature.tolist(), (feature + off * 1e-6).tolist()]
         fp.write_text(json.dumps(data, indent=2))
 
 
@@ -247,8 +249,8 @@ def _write_report(hist_folder: Path, summary: dict) -> Path:
     lines += ["| shank | offset (um) | confidence | verdict | units | depth (um) | regions |",
               "|---|---|---|---|---|---|---|"]
     for s in summary["shanks"]:
-        verdict = "proposal written (review & accept)" if s["good"] \
-            else "kept `original` (low confidence)"
+        verdict = f"auto offset {s['offset_um']:+.0f} um (review & accept)" if s["good"] \
+            else "auto = no shift (low confidence; trust histology)"
         regs = ", ".join(s["regions"][:10])
         lines.append(
             f"| {s['shank']} | {s['offset_um']:+.0f} | "
