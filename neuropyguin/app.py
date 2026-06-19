@@ -55,33 +55,43 @@ def _install_global_excepthook() -> None:
 
     previous_hook = sys.excepthook
 
-    def _hook(exc_type, exc_value, exc_tb):
-        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
-            previous_hook(exc_type, exc_value, exc_tb)
-            return
-        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        print(text, file=sys.stderr)
+    def _show_error_dialog(title: str, detail: str) -> None:
         global _EXCEPTHOOK_BUSY
         app = QtWidgets.QApplication.instance()
         if app is None or _EXCEPTHOOK_BUSY:
             return
-        _EXCEPTHOOK_BUSY = True  # avoid recursive dialogs if painting keeps failing
+        _EXCEPTHOOK_BUSY = True
         try:
             box = QtWidgets.QMessageBox(
-                QtWidgets.QMessageBox.Icon.Critical,
-                "Unexpected error",
-                f"{exc_type.__name__}: {exc_value}",
+                QtWidgets.QMessageBox.Icon.Critical, "Unexpected error", title,
             )
             box.setInformativeText(
                 "The action could not be completed, but the application is still running."
             )
-            box.setDetailedText(text)
+            box.setDetailedText(detail)
             box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
             box.exec()
         except Exception:
             pass
         finally:
             _EXCEPTHOOK_BUSY = False
+
+    def _hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            previous_hook(exc_type, exc_value, exc_tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(text, file=sys.stderr)
+        # Defer the dialog to the next event-loop tick. Showing a modal dialog
+        # synchronously here would run a nested event loop inside the failing
+        # call stack (e.g. a paint event), which can re-enter and crash. A
+        # single-shot timer lets the current stack unwind first.
+        try:
+            QtCore.QTimer.singleShot(
+                0, lambda: _show_error_dialog(f"{exc_type.__name__}: {exc_value}", text)
+            )
+        except Exception:
+            pass
 
     sys.excepthook = _hook
 
@@ -804,6 +814,11 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    try:
+        from neuropyguin._diagnostics import install_crash_logging
+        install_crash_logging()
+    except Exception:
+        pass
     _set_windows_taskbar_app_id()
     app = QtWidgets.QApplication(sys.argv)
     _install_global_excepthook()

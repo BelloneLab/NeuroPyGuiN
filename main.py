@@ -6,6 +6,12 @@ import traceback
 
 def _entry() -> int:
     try:
+        from neuropyguin._diagnostics import install_crash_logging
+        crash_log = install_crash_logging()
+        print(f"NeuroPyGuiN crash log: {crash_log}", file=sys.stderr)
+    except Exception:
+        pass
+    try:
         from neuropyguin.app import main
     except Exception as exc:
         msg = str(exc)

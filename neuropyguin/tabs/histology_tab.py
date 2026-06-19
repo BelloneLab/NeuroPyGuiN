@@ -57,7 +57,16 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         if arr is None:
             self.img.clear()
             return
-        self.img.setImage(np.asarray(arr), autoLevels=(levels is None), levels=levels)
+        a = np.asarray(arr)
+        if a.dtype.kind == "f":
+            # pyqtgraph autoLevels on NaN/Inf data yields NaN levels, which can
+            # corrupt the LUT and crash the GPU/Qt path. Sanitize for display.
+            a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            if levels is None and a.size:
+                lo, hi = float(a.min()), float(a.max())
+                levels = (lo, hi if hi > lo else lo + 1.0)
+        a = np.ascontiguousarray(a)
+        self.img.setImage(a, autoLevels=(levels is None), levels=levels)
         self.view.autoRange()
 
     def _on_click(self, ev) -> None:
@@ -92,9 +101,10 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         return roi
 
     def add_mask_overlay(self, mask: np.ndarray, color=(255, 40, 40)) -> None:
+        mask = np.ascontiguousarray(np.asarray(mask).astype(bool))
         rgba = np.zeros((*mask.shape, 4), dtype=np.ubyte)
-        rgba[mask.astype(bool)] = [*color, 160]
-        item = pg.ImageItem(rgba)
+        rgba[mask] = [*color, 160]
+        item = pg.ImageItem(np.ascontiguousarray(rgba))
         item.setOpts(axisOrder="row-major")
         self.view.addItem(item)
         self._overlays.append(item)
@@ -685,10 +695,13 @@ class HistologyTab(QtWidgets.QWidget):
                 self._log(f"Could not load tforms: {exc}")
         self.slice_specs = [None] * max(len(self.slice_images), len(self.histology_ccf))
         self._load_match_specs()  # restore saved atlas matching for this run
+        self.probe_points = {}
+        self._load_probe_lines()  # restore drawn probe tracks for this run
         self._refresh_status()
         self._preproc_show()
         self._match_show()
         self._align_show()
+        self._trace_show()
         self._trace_show()
         self._log(f"Loaded session: {self.folder}")
 
@@ -937,11 +950,15 @@ class HistologyTab(QtWidgets.QWidget):
         if not self.slice_images:
             return
         idx = min(self._cur_align_slice, len(self.slice_images) - 1)
-        self.canvas_align_hist.set_image(self.slice_images[idx])
         if idx < len(self.histology_ccf):
             self.canvas_align_atlas.set_image(self.histology_ccf[idx]["tv_slices"])
         self.lbl_align.setText(f"slice {idx + 1} / {len(self.slice_images)}")
-        self._align_redraw_points()
+        # A reopened run with a saved transform shows its overlay immediately.
+        if idx < len(self.tforms) and not np.allclose(np.asarray(self.tforms[idx]), np.eye(3)):
+            self._align_overlay(idx)
+        else:
+            self.canvas_align_hist.set_image(self.slice_images[idx])
+            self._align_redraw_points()
 
     def _align_redraw_points(self) -> None:
         idx = self._cur_align_slice
@@ -978,6 +995,7 @@ class HistologyTab(QtWidgets.QWidget):
         self._set_tform(idx, T)
         self._log(f"Applied control-point affine to slice {idx + 1}.")
         self._align_overlay(idx)
+        self._autosave_tforms()
 
     def _align_auto(self) -> None:
         idx = self._cur_align_slice
@@ -1001,6 +1019,7 @@ class HistologyTab(QtWidgets.QWidget):
             self._set_tform(idx, T)
             self._log(f"Slice {idx + 1}: {status}")
             self._align_overlay(idx)
+            self._autosave_tforms()
 
         self._run_bg(job, done,
                      busy_msg="Auto-aligning in an isolated process (intensity registration)...")
@@ -1026,13 +1045,24 @@ class HistologyTab(QtWidgets.QWidget):
         except Exception as exc:
             self._log(f"Could not draw atlas overlay: {exc}")
 
-    def _align_save(self) -> None:
+    def _write_tforms(self) -> bool:
         if self.folder is None or not self.tforms:
-            self._log("Nothing to save.")
-            return
+            return False
         while len(self.tforms) < len(self.slice_images):
             self.tforms.append(np.eye(3))
         io_formats.save_tforms(self.folder / "atlas2histology_tform.mat", self.tforms)
+        return True
+
+    def _autosave_tforms(self) -> None:
+        """Persist alignment immediately after an apply/auto-align."""
+        if self._write_tforms():
+            self._log("Auto-saved atlas2histology_tform.mat.")
+            self._refresh_status()
+
+    def _align_save(self) -> None:
+        if not self._write_tforms():
+            self._log("Nothing to save.")
+            return
         self._log("Saved atlas2histology_tform.mat.")
         self._refresh_status()
 
@@ -1087,6 +1117,53 @@ class HistologyTab(QtWidgets.QWidget):
         pts = self._trace_roi_points()
         if pts is not None:
             self.probe_points[self._trace_key()] = pts
+            self._save_probe_lines()
+
+    _PROBE_LINES_FN = "histology_probe_lines.json"
+
+    def _save_probe_lines(self) -> None:
+        """Persist drawn probe lines so a reopened run shows them immediately."""
+        if self.folder is None:
+            return
+        lines = []
+        for (s, p), pts in self.probe_points.items():
+            arr = np.asarray(pts, dtype=float) if pts is not None else None
+            if arr is None or arr.shape != (2, 2) or not np.isfinite(arr).all():
+                continue
+            lines.append({"slice": int(s), "probe": int(p), "points": arr.tolist()})
+        try:
+            with open(self.folder / self._PROBE_LINES_FN, "w") as f:
+                json.dump({"lines": lines}, f, indent=2)
+        except OSError as exc:
+            self._log(f"Could not save probe lines: {exc}")
+
+    def _load_probe_lines(self) -> None:
+        if self.folder is None:
+            return
+        fp = self.folder / self._PROBE_LINES_FN
+        if not fp.exists():
+            return
+        try:
+            with open(fp) as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            self._log(f"Could not load probe lines: {exc}")
+            return
+        pts_map: Dict[Tuple[int, int], np.ndarray] = {}
+        for ln in data.get("lines", []):
+            try:
+                arr = np.asarray(ln["points"], dtype=float)
+                if arr.shape == (2, 2) and np.isfinite(arr).all():
+                    pts_map[(int(ln["slice"]), int(ln["probe"]))] = arr
+            except (KeyError, ValueError, TypeError):
+                continue
+        if pts_map:
+            self.probe_points = pts_map
+            self._log(f"Restored {len(pts_map)} probe line(s).")
+
+    def _trace_roi_finished(self, *args) -> None:
+        self._trace_roi_changed(*args)
+        self._save_probe_lines()
 
     def _trace_show(self) -> None:
         if not self.slice_images:
@@ -1107,7 +1184,7 @@ class HistologyTab(QtWidgets.QWidget):
             color = PROBE_QCOLORS[(self._active_probe - 1) % len(PROBE_QCOLORS)]
             self._trace_roi = self.canvas_trace.add_line_roi(active_pts, color, 3)
             self._trace_roi.sigRegionChanged.connect(self._trace_roi_changed)
-            self._trace_roi.sigRegionChangeFinished.connect(self._trace_roi_changed)
+            self._trace_roi.sigRegionChangeFinished.connect(self._trace_roi_finished)
             self._trace_update_controls(active_pts)
         else:
             self._trace_update_controls(None)
@@ -1118,6 +1195,7 @@ class HistologyTab(QtWidgets.QWidget):
         if key in self.probe_points:
             return
         self.probe_points[key] = self._trace_default_line((x, y))
+        self._save_probe_lines()
         self._trace_show()
         self._log(f"Created editable probe {self._active_probe} line on slice {key[0] + 1}.")
 
@@ -1126,6 +1204,7 @@ class HistologyTab(QtWidgets.QWidget):
             return
         key = self._trace_key()
         self.probe_points[key] = self._trace_default_line()
+        self._save_probe_lines()
         self._trace_show()
         self._log(f"Created editable probe {self._active_probe} line on slice {key[0] + 1}.")
 
@@ -1169,6 +1248,7 @@ class HistologyTab(QtWidgets.QWidget):
             [self._trace_coord_spins["x2"].value(), self._trace_coord_spins["y2"].value()],
         ], dtype=float)
         self.probe_points[self._trace_key()] = pts
+        self._save_probe_lines()
         if self._trace_roi is None:
             self._trace_show()
             return
@@ -1184,6 +1264,7 @@ class HistologyTab(QtWidgets.QWidget):
     def _trace_clear(self) -> None:
         self.probe_points.pop((self._cur_trace_slice, self._active_probe), None)
         self._pending_click = []
+        self._save_probe_lines()
         self._trace_show()
 
     def _trace_build(self) -> None:
@@ -1243,28 +1324,48 @@ class HistologyTab(QtWidgets.QWidget):
         )
 
     def _draw_trajectory_areas(self, probes) -> None:
-        self.trace_areas.clear()
+        # Defensive: anything that escapes here runs on the GUI thread and would
+        # otherwise reach the excepthook (or, for non-finite coordinates handed to
+        # pyqtgraph, abort the Qt paint engine). Sanitize and contain per probe.
+        try:
+            self.trace_areas.clear()
+        except Exception as exc:
+            self._log(f"Could not reset trajectory chart: {exc}")
+            return
         for i, p in enumerate(probes):
-            ta = p.get("trajectory_areas")
-            plt = self.trace_areas.addPlot(row=0, col=i)
-            plt.setTitle(f"Probe {i + 1}")
-            plt.invertY(True)
-            plt.hideAxis("bottom")
-            if ta is None or len(ta) == 0:
-                continue
-            for j in range(len(ta)):
-                d0 = float(ta.iloc[j].get("depth_start_um", 0))
-                d1 = float(ta.iloc[j].get("depth_end_um", 0))
-                hexc = str(ta.iloc[j].get("color_hex_triplet", "808080"))
-                try:
-                    col = QtGui.QColor(int(hexc[0:2], 16), int(hexc[2:4], 16), int(hexc[4:6], 16))
-                except Exception:
-                    col = QtGui.QColor(128, 128, 128)
-                bar = pg.BarGraphItem(x=[0], y0=[d0], y1=[d1], width=1, brush=col)
-                plt.addItem(bar)
-                txt = pg.TextItem(str(ta.iloc[j].get("acronym", "")), color="k", anchor=(0, 0.5))
-                txt.setPos(0.05, (d0 + d1) / 2)
-                plt.addItem(txt)
+            try:
+                self._draw_one_trajectory(i, p)
+            except Exception as exc:
+                self._log(f"Could not draw trajectory for probe {i + 1}: {exc}")
+
+    def _draw_one_trajectory(self, i: int, p: dict) -> None:
+        ta = p.get("trajectory_areas")
+        plt = self.trace_areas.addPlot(row=0, col=i)
+        plt.setTitle(f"Probe {i + 1}")
+        plt.invertY(True)
+        plt.hideAxis("bottom")
+        if ta is None or len(ta) == 0:
+            return
+        total = 0.0
+        for j in range(len(ta)):
+            d0 = float(ta.iloc[j].get("depth_start_um", 0))
+            d1 = float(ta.iloc[j].get("depth_end_um", 0))
+            if not (np.isfinite(d0) and np.isfinite(d1)) or d1 <= d0:
+                continue  # never hand non-finite/degenerate spans to pyqtgraph
+            total = max(total, d1)
+            hexc = str(ta.iloc[j].get("color_hex_triplet", "808080"))
+            try:
+                col = QtGui.QColor(int(hexc[0:2], 16), int(hexc[2:4], 16), int(hexc[4:6], 16))
+            except (ValueError, IndexError):
+                col = QtGui.QColor(128, 128, 128)
+            plt.addItem(pg.BarGraphItem(x=[0], y0=[d0], y1=[d1], width=1, brush=col))
+            # Only label spans tall enough to read, to keep the item count sane.
+            if (d1 - d0) >= 60.0:
+                acr = str(ta.iloc[j].get("acronym", ""))
+                if acr:
+                    txt = pg.TextItem(acr, color="k", anchor=(0, 0.5))
+                    txt.setPos(0.05, (d0 + d1) / 2.0)
+                    plt.addItem(txt)
 
     # --------------------------------------------------- Channel map / IBL
     def _ibl_kwargs(self) -> dict:
