@@ -24,7 +24,11 @@ from ..bombcell_core import (
 from ..ecephys_runtime import ecephys_subprocess_env
 from ..ks_output_resolver import find_kilosort_output_dir, find_metrics_file
 from ..phy_integration import ensure_phy_short_isi_plugin
-from ..preprocessing import infer_completed_run_name
+from ..preprocessing import (
+    find_concat_splitinfo_for_ks_folder,
+    infer_completed_run_name,
+    split_concatenated_sort,
+)
 from ..pybombcell_integration import (
     PYBOMBCELL_SETTINGS_SCHEMA,
     launch_pybombcell_gui,
@@ -375,6 +379,7 @@ class CurationTab(QtWidgets.QWidget):
         self.btn_remove_ks_folder = QtWidgets.QPushButton("Remove selected")
         self.btn_clear_ks_folders = QtWidgets.QPushButton("Clear list")
         self.btn_run_selected_pybomb = QtWidgets.QPushButton("Run py_bombcell on selected runs")
+        self.btn_split_sessions = QtWidgets.QPushButton("Split concat → sessions")
         self.btn_open_selected_folder = QtWidgets.QPushButton("Open in Explorer")
         self.btn_open_figures = QtWidgets.QPushButton("Open py_bombcell figures")
         self.btn_open_bombcell_gui = QtWidgets.QPushButton("Open BombCell GUI")
@@ -382,6 +387,14 @@ class CurationTab(QtWidgets.QWidget):
         self.btn_remove_ks_folder.setProperty("role", "ghost")
         self.btn_clear_ks_folders.setProperty("role", "ghost")
         self.btn_run_selected_pybomb.setProperty("role", "primary")
+        self.btn_split_sessions.setProperty("role", "secondary")
+        self.btn_split_sessions.setToolTip(
+            "For a joint sort built from a concatenated recording: split the result back into one "
+            "phy folder per session. This cuts the spike trains only (a view on the sort), never the "
+            "binary, so the shared unit identities and templates are preserved. Each session folder "
+            "gets session-local spike times, the same cluster IDs, params.py pointing at the "
+            "original recording, and that session's TPrime-aligned NI event files."
+        )
         self.btn_open_selected_folder.setProperty("role", "ghost")
         self.btn_open_figures.setProperty("role", "ghost")
         self.btn_open_bombcell_gui.setProperty("role", "secondary")
@@ -389,6 +402,7 @@ class CurationTab(QtWidgets.QWidget):
         folder_actions.addWidget(self.btn_remove_ks_folder)
         folder_actions.addWidget(self.btn_clear_ks_folders)
         folder_actions.addWidget(self.btn_run_selected_pybomb)
+        folder_actions.addWidget(self.btn_split_sessions)
         folder_actions.addStretch(1)
         phy_layout.addLayout(folder_actions)
 
@@ -417,8 +431,22 @@ class CurationTab(QtWidgets.QWidget):
         self.btn_run_pybomb = QtWidgets.QPushButton("Run py_bombcell on active folder")
         self.btn_load_metrics.setProperty("role", "secondary")
         self.btn_run_pybomb.setProperty("role", "primary")
+        self.ck_extract_raw = QtWidgets.QCheckBox("Extract raw waveforms (SNR)")
+        self.ck_extract_raw.setToolTip(
+            "Opt-in: extract raw spike waveforms from the recording to compute signal-to-noise "
+            "ratio and raw amplitude. Slower, and it recomputes metrics. Works on a concatenated "
+            "joint sort too (waveforms are pulled from the fused binary). Leave off for the faster "
+            "template-only metrics."
+        )
+        self.ck_extract_raw.setChecked(
+            bool(self.settings.value("curation/pybomb_extract_raw", False, type=bool))
+        )
+        self.ck_extract_raw.toggled.connect(
+            lambda checked: self.settings.setValue("curation/pybomb_extract_raw", bool(checked))
+        )
         bomb_top.addWidget(self.btn_load_metrics)
         bomb_top.addWidget(self.btn_run_pybomb)
+        bomb_top.addWidget(self.ck_extract_raw)
 
         review_folder_row = QtWidgets.QHBoxLayout()
         review_folder_row.setSpacing(10)
@@ -671,6 +699,7 @@ class CurationTab(QtWidgets.QWidget):
         self.btn_remove_ks_folder.clicked.connect(self._remove_selected_ks_folders)
         self.btn_clear_ks_folders.clicked.connect(self._clear_ks_folders)
         self.btn_run_selected_pybomb.clicked.connect(self._run_pybombcell_on_selected_folders)
+        self.btn_split_sessions.clicked.connect(self._split_selected_concatenated_sort)
         self.btn_open_selected_folder.clicked.connect(self._open_selected_folder_in_explorer)
         self.btn_open_figures.clicked.connect(self._open_selected_figures_in_explorer)
         self.btn_open_bombcell_gui.clicked.connect(self._open_selected_bombcell_gui)
@@ -958,10 +987,104 @@ class CurationTab(QtWidgets.QWidget):
             save_plots=True,
             force_recompute=False,
             settings=self._pybombcell_settings,
+            extract_raw=self.ck_extract_raw.isChecked(),
         )
         worker.signals.error.connect(self._log)
         worker.signals.finished.connect(self._on_run_pybombcell_list_finished)
         self.pool.start(worker)
+
+    @staticmethod
+    def _split_folders_job(folders: List[str], event_search_roots: List[str]) -> List[Dict[str, object]]:
+        results: List[Dict[str, object]] = []
+        for folder in folders:
+            try:
+                manifest = split_concatenated_sort(folder, event_search_roots=event_search_roots)
+                results.append({"folder": folder, "ok": True, "manifest": manifest})
+            except Exception as exc:
+                results.append({"folder": folder, "ok": False, "error": str(exc)})
+        return results
+
+    def _split_selected_concatenated_sort(self) -> None:
+        folders = self._selected_ks_folders()
+        if not folders:
+            self._log("Select one or more Kilosort folders first.")
+            return
+        concat_folders = [f for f in folders if find_concat_splitinfo_for_ks_folder(f) is not None]
+        if not concat_folders:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Not a concatenated sort",
+                "None of the selected folders look like a joint sort of a concatenated recording "
+                "(no *.splitinfo.json was found). Splitting into sessions only applies to those.",
+            )
+            return
+        message = (
+            f"Split {len(concat_folders)} joint sort(s) into per-session phy folders?\n\n"
+            "This cuts the spike trains only, as a read-only view on the sort. The binary is never "
+            "re-cut, so the shared unit identities and templates are preserved.\n\n"
+            "Each session folder reuses the same cluster IDs, holds only that session's spikes with "
+            "session-local sample times, points params.py at the original recording, and gathers "
+            "that session's TPrime-aligned NI event files. Output goes under <ks_folder>/sessions/."
+        )
+        if (
+            QtWidgets.QMessageBox.question(
+                self,
+                "Split concatenated sort into sessions",
+                message,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes,
+            )
+            != QtWidgets.QMessageBox.Yes
+        ):
+            return
+        if hasattr(self, "_main_sections"):
+            self._main_sections.setCurrentIndex(0)
+        self._busy_count += 1
+        self.btn_split_sessions.setEnabled(False)
+        self._log(f"Splitting {len(concat_folders)} concatenated sort(s) into sessions...")
+        event_roots: List[str] = []
+        processed_root = str(self.settings.value("preproc/output_root", "") or "").strip()
+        if processed_root:
+            event_roots.append(processed_root)
+        worker = FunctionWorker(self._split_folders_job, list(concat_folders), event_roots)
+        worker.signals.error.connect(self._log)
+        worker.signals.finished.connect(self._on_split_sessions_finished)
+        self.pool.start(worker)
+
+    def _on_split_sessions_finished(self, result: Dict) -> None:
+        self._busy_count = max(0, self._busy_count - 1)
+        self.btn_split_sessions.setEnabled(True)
+        if not result.get("ok"):
+            self._log("Session split failed.")
+            return
+        results = result.get("result", []) or []
+        new_folders: List[str] = []
+        for entry in results:
+            if not entry.get("ok"):
+                self._log(f"Split failed for {entry.get('folder', '')}: {entry.get('error', '')}")
+                continue
+            manifest = entry.get("manifest", {}) or {}
+            sessions = manifest.get("sessions", []) or []
+            self._log(
+                f"Split {entry.get('folder', '')} into {len(sessions)} session(s) under "
+                f"{manifest.get('output_root', '')}"
+            )
+            for sess in sessions:
+                out_dir = str(sess.get("output_dir") or "")
+                events = sess.get("events_copied") or []
+                self._log(
+                    f"  {sess.get('run_name', '')}: {sess.get('n_spikes', 0)} spikes, "
+                    f"{sess.get('n_clusters', 0)} clusters"
+                    + (f", {len(events)} NI event file(s)" if events else ", no NI event files found")
+                )
+                if out_dir:
+                    new_folders.append(out_dir)
+        if new_folders:
+            self.set_ks_folders(new_folders, preserve_existing=True)
+            self._log(
+                f"Added {len(new_folders)} per-session folder(s) to the list. Open any in Phy, or run "
+                "py_bombcell per session for per-session QC."
+            )
 
     def _sync_selected_folder_fields(self, *, clear_metrics: bool) -> None:
         folder = self._selected_ks_folder()
@@ -1397,6 +1520,7 @@ class CurationTab(QtWidgets.QWidget):
             True,
             False,
             self._pybombcell_settings,
+            extract_raw=self.ck_extract_raw.isChecked(),
         )
         worker.signals.error.connect(self._log)
         worker.signals.finished.connect(self._on_run_pybombcell_finished)
@@ -1420,7 +1544,16 @@ class CurationTab(QtWidgets.QWidget):
                 f"plots={payload.get('plots_dir', '')}"
             )
         else:
-            self._log(f"py_bombcell completed | units={payload.get('n_units', 'NA')} | plots={payload.get('plots_dir', '')}")
+            raw_note = " | raw waveforms + SNR" if payload.get("raw_extracted") else ""
+            self._log(
+                f"py_bombcell completed | units={payload.get('n_units', 'NA')}{raw_note} | "
+                f"plots={payload.get('plots_dir', '')}"
+            )
+        if self.ck_extract_raw.isChecked() and not payload.get("raw_extracted"):
+            self._log(
+                "Note: raw extraction was requested but the raw .bin could not be resolved from "
+                "params.py; metrics are template-only."
+            )
         sync_result = payload.get("phy_group_sync", {})
         if isinstance(sync_result, dict) and sync_result.get("updated"):
             self._log(

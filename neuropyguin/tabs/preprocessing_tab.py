@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -10,11 +10,15 @@ import math
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..preprocessing import (
+    build_concat_run_name,
     completed_run_target_folders,
+    default_concat_run_layout,
     default_kilosort_output_name,
     discover_completed_runs,
     discover_bin_files,
+    find_meta_for_bin,
     parse_spikeglx_bin_name,
+    validate_concat_inputs,
     validate_spikeglx_ap_bin,
 )
 from ..side_nav import SideNavStack
@@ -27,7 +31,12 @@ from ..string_builders import (
     merge_bitfields_into_catgt_command,
     merge_extractors_into_catgt_command,
 )
-from ..workers import EcephysPipelineConfig, EcephysPipelineWorker
+from ..workers import (
+    ConcatenationConfig,
+    ConcatenationWorker,
+    EcephysPipelineConfig,
+    EcephysPipelineWorker,
+)
 
 
 class BinDropList(QtWidgets.QListWidget):
@@ -312,6 +321,139 @@ class Ks4AdvancedDialog(QtWidgets.QDialog):
         return out
 
 
+class ConcatenateDialog(QtWidgets.QDialog):
+    """Configure a multi-session concatenation for joint spike sorting."""
+
+    def __init__(
+        self,
+        source_runs: List[str],
+        default_output_dir: str,
+        default_run_name: str,
+        defaults: Dict[str, object],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setProperty("compactDialog", True)
+        self.setWindowTitle("Concatenate recordings for joint spike sorting")
+        self.resize(680, 540)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        intro = QtWidgets.QLabel(
+            "Fuse the selected AP recordings into one binary so Kilosort sorts them together and "
+            "assigns the same unit identities across sessions. The original recordings are left "
+            "untouched, and a split-info map is saved so sorted spikes can be separated back into "
+            "each session afterward. Concatenation follows the order listed below (queue order)."
+        )
+        intro.setObjectName("SectionHint")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        order_label = QtWidgets.QLabel("Concatenation order")
+        order_label.setObjectName("FieldTitle")
+        layout.addWidget(order_label)
+        order_list = QtWidgets.QListWidget()
+        order_list.setAlternatingRowColors(True)
+        order_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        order_list.setMaximumHeight(150)
+        for idx, run in enumerate(source_runs, start=1):
+            order_list.addItem(f"{idx}. {run}")
+        layout.addWidget(order_list)
+
+        form = QtWidgets.QFormLayout()
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+
+        self.ed_run = QtWidgets.QLineEdit(default_run_name)
+        self.ed_dir = QtWidgets.QLineEdit(default_output_dir)
+        btn_browse = QtWidgets.QPushButton("Browse")
+        btn_browse.setProperty("role", "ghost")
+        dir_row = QtWidgets.QHBoxLayout()
+        dir_row.setContentsMargins(0, 0, 0, 0)
+        dir_row.addWidget(self.ed_dir, 1)
+        dir_row.addWidget(btn_browse, 0)
+        dir_wrap = QtWidgets.QWidget()
+        dir_wrap.setLayout(dir_row)
+
+        self.ck_svd = QtWidgets.QCheckBox("Remove shared SVD components (artifact cleaning)")
+        self.ck_svd.setChecked(bool(defaults.get("svd_clean", True)))
+        self.ck_svd.setToolTip(
+            "Removes the leading shared spatial components of the AP channel block batch by batch, "
+            "matching the legacy MATLAB concatenateAndCleanBinaries denoising. Turn off for a plain "
+            "raw concatenation when CatGT filtering will run afterward."
+        )
+        self.sp_comp = QtWidgets.QSpinBox()
+        self.sp_comp.setRange(0, 50)
+        self.sp_comp.setValue(int(defaults.get("n_svd_components", 5)))
+        self.sp_batch = QtWidgets.QDoubleSpinBox()
+        self.sp_batch.setRange(0.05, 10.0)
+        self.sp_batch.setDecimals(2)
+        self.sp_batch.setSingleStep(0.1)
+        self.sp_batch.setValue(float(defaults.get("batch_seconds", 0.5)))
+
+        self.ck_extract_ni = QtWidgets.QCheckBox(
+            "Also queue NI event extraction (CatGT extract-only) for each source session"
+        )
+        self.ck_extract_ni.setChecked(bool(defaults.get("extract_ni", True)))
+        self.ck_extract_ni.setToolTip(
+            "Queues each original session for a CatGT extract-only pass so its NI digital/analog "
+            "event files are produced. The joint sort is done on the fused file, while events stay "
+            "per session; the curation 'Split concat → sessions' step then attaches each session's "
+            "events to its split spike trains. The source sessions are switched to events-only in "
+            "the queue so they are not sorted again individually."
+        )
+
+        form.addRow("Combined run name", self.ed_run)
+        form.addRow("Output folder", dir_wrap)
+        form.addRow("", self.ck_svd)
+        form.addRow("SVD components to remove", self.sp_comp)
+        form.addRow("SVD batch length (s)", self.sp_batch)
+        form.addRow("", self.ck_extract_ni)
+        layout.addLayout(form)
+
+        note = QtWidgets.QLabel(
+            "A new SpikeGLX-style run folder is created under the output folder, so every "
+            "downstream preprocessing step (CatGT, Kilosort, metrics) treats the fused file like an "
+            "ordinary recording."
+        )
+        note.setObjectName("SectionHint")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch(1)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        btns.button(QtWidgets.QDialogButtonBox.Ok).setText("Concatenate")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        btn_browse.clicked.connect(self._pick_output_dir)
+        self.ck_svd.toggled.connect(self.sp_comp.setEnabled)
+        self.ck_svd.toggled.connect(self.sp_batch.setEnabled)
+        self.sp_comp.setEnabled(self.ck_svd.isChecked())
+        self.sp_batch.setEnabled(self.ck_svd.isChecked())
+
+    def _pick_output_dir(self) -> None:
+        start = self.ed_dir.text().strip() or str(Path.cwd())
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder", start)
+        if folder:
+            self.ed_dir.setText(folder)
+
+    def values(self) -> Dict[str, object]:
+        return {
+            "run_name": self.ed_run.text().strip(),
+            "output_dir": self.ed_dir.text().strip(),
+            "svd_clean": self.ck_svd.isChecked(),
+            "n_svd_components": int(self.sp_comp.value()),
+            "batch_seconds": float(self.sp_batch.value()),
+            "extract_ni": self.ck_extract_ni.isChecked(),
+        }
+
+
 class PreprocessingTab(QtWidgets.QWidget):
     openCurationRequested = QtCore.Signal(list)
     openPostProcessingRequested = QtCore.Signal(str)
@@ -334,6 +476,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.completed_runs: List[Dict[str, object]] = []
         self._queue: List[Dict[str, str]] = []
         self._running = False
+        self._concatenating = False
+        self._pending_concat_ni_extract: List[str] = []
         self._ks4_adv_params: Dict[str, object] = {}
         self._active_run_context: Dict[str, object] | None = None
 
@@ -407,6 +551,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.cb_queue_filter = QtWidgets.QComboBox()
         self.cb_queue_filter.addItem("Non-processed", "non_processed")
         self.cb_queue_filter.addItem("All runs", "all")
+        self.btn_concat = QtWidgets.QPushButton("Concatenate selected")
         self.btn_remove = QtWidgets.QPushButton("Remove selected")
         self.btn_clear = QtWidgets.QPushButton("Clear")
         self.btn_run = QtWidgets.QPushButton("Run queue")
@@ -415,6 +560,13 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_scan_raw_root.setProperty("role", "secondary")
         self.btn_recent_files.setProperty("role", "ghost")
         self.btn_recent_folders.setProperty("role", "ghost")
+        self.btn_concat.setProperty("role", "secondary")
+        self.btn_concat.setEnabled(False)
+        self.btn_concat.setToolTip(
+            "Fuse 2+ selected AP recordings into a single binary so Kilosort sorts them jointly and "
+            "tracks the same units across sessions. Produces a new queued run plus a split-info map "
+            "for separating spikes per session afterward."
+        )
         self.btn_remove.setProperty("role", "ghost")
         self.btn_clear.setProperty("role", "ghost")
         self.btn_run.setProperty("role", "primary")
@@ -426,6 +578,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         top.addStretch(1)
         top.addWidget(QtWidgets.QLabel("Show"))
         top.addWidget(self.cb_queue_filter)
+        top.addWidget(self.btn_concat)
         top.addWidget(self.btn_remove)
         top.addWidget(self.btn_clear)
         top.addWidget(self.btn_run)
@@ -1025,7 +1178,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         work_sections = SideNavStack(vertical_labels=True, compact_rail=True)
         work_sections.add_page("Queue", queue_box)
         self.settings_section_index = work_sections.add_page("Settings", settings_page)
-        work_sections.add_page("Log", log_box)
+        self.log_section_index = work_sections.add_page("Log", log_box)
         self.completed_section_index = work_sections.add_page("Completed", done_box)
         work_sections.setCurrentIndex(0)
         self.work_sections = work_sections
@@ -1039,9 +1192,11 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_recent_files.clicked.connect(self._open_recent_file_menu)
         self.btn_recent_folders.clicked.connect(self._open_recent_folder_menu)
         self.cb_queue_filter.currentIndexChanged.connect(self._on_queue_filter_changed)
+        self.btn_concat.clicked.connect(self._concatenate_selected)
         self.btn_remove.clicked.connect(self._remove_selected)
         self.btn_clear.clicked.connect(self._clear)
         self.btn_run.clicked.connect(self._run_queue)
+        self.list_jobs.itemSelectionChanged.connect(self._update_concat_button_state)
         self.btn_copy_log.clicked.connect(self._copy_log)
         self.btn_scan_completed_root.clicked.connect(self._scan_completed_root)
         self.list_jobs.filesDropped.connect(self._consume_drop)
@@ -1189,6 +1344,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         base = (
             f"{job['name']}  |  g{job['gate_string']} t{job['trigger_string']} p{job['probe_string']}  |  {job['bin_file']}"
         )
+        overrides = job.get("cfg_overrides")
+        if isinstance(overrides, dict) and overrides.get("run_catgt_extract_only") and not overrides.get("run_kilosort", True):
+            base = f"{base}  |  NI events only"
         if completed_entry is not None:
             return f"{base}  |  completed"
         return base
@@ -1223,6 +1381,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             else:
                 item.setToolTip(str(job.get("bin_file") or ""))
             self.list_jobs.addItem(item)
+        self._update_concat_button_state()
 
     def _ingest_bins(self, bins: List[str], *, queue_completed: bool) -> tuple[int, int, int]:
         added_catalog = 0
@@ -1289,6 +1448,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         n_jobs = len(self.jobs)
         total_known = len(self._raw_run_catalog)
         total_completed = sum(1 for job in self._raw_run_catalog.values() if self._completed_entry_for_job(job) is not None)
+        if self._concatenating:
+            self.lbl_queue_summary.setText(
+                "Concatenating selected recordings into a joint binary. The fused run will be added "
+                "to the queue when finished."
+            )
+            return
         if self._running:
             remaining = len(self._queue)
             msg = f"{n_jobs} recording(s) loaded. Queue running with {remaining} remaining after the active job."
@@ -1337,6 +1502,239 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.list_jobs.clear()
         self.jobs.clear()
         self._raw_run_catalog.clear()
+        self._refresh_queue_summary()
+
+    def _selected_inqueue_jobs(self) -> List[Dict[str, str]]:
+        """Return queued job dicts for the current selection, in visual (top-down) order."""
+        out: List[Dict[str, str]] = []
+        for row in range(self.list_jobs.count()):
+            item = self.list_jobs.item(row)
+            if item is None or not item.isSelected():
+                continue
+            payload = item.data(QtCore.Qt.UserRole)
+            if not isinstance(payload, dict) or not bool(payload.get("in_queue")):
+                continue
+            job = payload.get("job")
+            if isinstance(job, dict) and job.get("bin_file"):
+                out.append(dict(job))
+        return out
+
+    def _update_concat_button_state(self) -> None:
+        if not hasattr(self, "btn_concat"):
+            return
+        busy = self._running or self._concatenating
+        self.btn_concat.setEnabled(len(self._selected_inqueue_jobs()) >= 2 and not busy)
+
+    def _prepare_concat_status_panel(self, run_name: str, n_files: int) -> None:
+        self._clear_step_status_panel()
+        self.lbl_active_run_name.setText(f"Concatenating {n_files} runs into {run_name}")
+        widget = StepStatusItem("Concatenate binaries", self.step_status_host)
+        self._step_widgets[ConcatenationWorker.STEP_KEY] = widget
+        self.step_status_host_layout.insertWidget(self.step_status_host_layout.count() - 1, widget)
+
+    def _concatenate_selected(self) -> None:
+        if self._running or self._concatenating:
+            self._append_log("Cannot concatenate while a job is running.")
+            return
+        jobs = self._selected_inqueue_jobs()
+        if len(jobs) < 2:
+            self._append_log("Select at least two queued AP recordings to concatenate.")
+            return
+
+        bin_files = [str(job["bin_file"]) for job in jobs]
+        meta_files = [str(find_meta_for_bin(b)) for b in bin_files]
+        missing = [b for b, m in zip(bin_files, meta_files) if not Path(m).exists()]
+        if missing:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing meta files",
+                "Cannot concatenate; no .meta found next to:\n" + "\n".join(missing),
+            )
+            return
+
+        ok, reason, _info = validate_concat_inputs(meta_files)
+        if not ok:
+            QtWidgets.QMessageBox.warning(self, "Incompatible recordings", reason)
+            return
+
+        run_names = [
+            str(job.get("name") or parse_spikeglx_bin_name(b).get("run_name") or Path(b).stem)
+            for job, b in zip(jobs, bin_files)
+        ]
+        combined_default = build_concat_run_name(run_names)
+        first = Path(bin_files[0])
+        default_dir = first.parents[2] if len(first.parents) >= 3 else first.parent
+
+        defaults = {
+            "svd_clean": self.settings.value("preproc/concat_svd_clean", True, type=bool),
+            "n_svd_components": int(self.settings.value("preproc/concat_n_components", 5)),
+            "batch_seconds": float(self.settings.value("preproc/concat_batch_seconds", 0.5)),
+            "extract_ni": self.settings.value("preproc/concat_extract_ni", True, type=bool),
+        }
+        dlg = ConcatenateDialog(run_names, str(default_dir), combined_default, defaults, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        vals = dlg.values()
+        combined = str(vals.get("run_name") or combined_default).strip() or combined_default
+        out_dir = str(vals.get("output_dir") or default_dir).strip() or str(default_dir)
+        probe = str(jobs[0].get("probe_string") or "0")
+        layout = default_concat_run_layout(out_dir, combined, probe)
+        target_bin = layout["bin"]
+
+        if target_bin.exists():
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Overwrite existing file?",
+                f"{target_bin}\nalready exists. Overwrite it?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+
+        try:
+            layout["probe_folder"].mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Cannot create folder", str(exc))
+            return
+
+        self.settings.setValue("preproc/concat_svd_clean", bool(vals["svd_clean"]))
+        self.settings.setValue("preproc/concat_n_components", int(vals["n_svd_components"]))
+        self.settings.setValue("preproc/concat_batch_seconds", float(vals["batch_seconds"]))
+        self.settings.setValue("preproc/concat_extract_ni", bool(vals.get("extract_ni", True)))
+        self._settings_sync_timer.start()
+
+        # Remember which source sessions to switch to NI events-only once the
+        # fused run has been written (applied in _on_concat_finished).
+        self._pending_concat_ni_extract = (
+            [self._normalized_path(b) for b in bin_files]
+            if bool(vals.get("extract_ni", True))
+            else []
+        )
+
+        cfg = ConcatenationConfig(
+            bin_files=bin_files,
+            meta_files=meta_files,
+            target_bin=str(target_bin),
+            run_name=combined,
+            svd_clean=bool(vals["svd_clean"]),
+            n_svd_components=int(vals["n_svd_components"]),
+            batch_seconds=float(vals["batch_seconds"]),
+        )
+
+        self._concatenating = True
+        self.btn_concat.setEnabled(False)
+        self.btn_run.setEnabled(False)
+        self.progress.setValue(0)
+        self._prepare_concat_status_panel(combined, len(bin_files))
+        if hasattr(self, "work_sections") and hasattr(self, "log_section_index"):
+            self.work_sections.setCurrentIndex(int(self.log_section_index))
+        self._append_log(
+            f"Starting concatenation of {len(bin_files)} recording(s) into {target_bin}"
+        )
+
+        worker = ConcatenationWorker(cfg)
+        worker.signals.log.connect(self._append_log)
+        worker.signals.progress.connect(self.progress.setValue)
+        worker.signals.error.connect(self._append_log)
+        worker.signals.stepStarted.connect(self._on_worker_step_started)
+        worker.signals.stepProgress.connect(self._on_worker_step_progress)
+        worker.signals.stepFinished.connect(self._on_worker_step_finished)
+        worker.signals.finished.connect(self._on_concat_finished)
+        self.pool.start(worker)
+        self._refresh_queue_summary()
+
+    def _on_concat_finished(self, result: Dict) -> None:
+        self._concatenating = False
+        self.btn_run.setEnabled(True)
+        ok = bool(result.get("ok"))
+        run_name = str(result.get("job") or result.get("run_name") or "concat")
+        if ok:
+            target_bin = str(result.get("target_bin") or "")
+            self.lbl_active_run_name.setText(f"{run_name} (concatenated)")
+            self._append_log(f"Concatenation complete: {target_bin}")
+            split = str(result.get("splitinfo_path") or "")
+            if split:
+                self._append_log(
+                    f"Per-session split map saved to {split}. "
+                    "Use it to separate sorted spikes back into each session."
+                )
+            if target_bin and Path(target_bin).exists():
+                self._add_paths([target_bin])
+                self._select_job_in_queue(target_bin)
+                if hasattr(self, "work_sections"):
+                    self.work_sections.setCurrentIndex(0)
+                self._append_log(
+                    f"Added concatenated run '{run_name}' to the queue. "
+                    "Configure the pipeline steps and Run queue to sort all sessions together."
+                )
+                if self._pending_concat_ni_extract:
+                    self._apply_ni_extract_overrides(self._pending_concat_ni_extract)
+        self._pending_concat_ni_extract = []
+        if not ok:
+            self.lbl_active_run_name.setText(f"{run_name} (concatenation failed)")
+            widget = self._step_widgets.get(ConcatenationWorker.STEP_KEY)
+            if widget is not None and widget.percent_label.text() != "Failed":
+                widget.set_failed()
+        if ok:
+            self.progress.setValue(100)
+        self._update_concat_button_state()
+        self._refresh_queue_summary()
+
+    def _apply_ni_extract_overrides(self, source_bins: List[str]) -> None:
+        """Switch the source sessions to a CatGT extract-only (NI events) pass.
+
+        They are kept in the queue so a single Run produces both the joint sort
+        (fused run) and each session's NI event files, but they are no longer
+        sorted individually. TPrime alignment is included only if the user has
+        the TPrime step enabled (it needs a per-session sort to resolve).
+        """
+        overrides = {
+            "run_catgt": False,
+            "run_catgt_extract_only": True,
+            "save_catgt_ap_bin": False,
+            "run_tprime": self.ck_tprime.isChecked(),
+            "run_kilosort": False,
+            "run_kilosort_postproc": False,
+            "run_noise_templates": False,
+            "run_mean_waveforms": False,
+            "run_quality_metrics": False,
+            "run_pybombcell": False,
+        }
+        targets = {self._normalized_path(b) for b in source_bins}
+        matched: set[str] = set()
+        for job in self.jobs:
+            norm = self._normalized_path(str(job.get("bin_file") or ""))
+            if norm in targets:
+                job["cfg_overrides"] = dict(overrides)
+                matched.add(norm)
+        for raw_bin in source_bins:
+            norm = self._normalized_path(raw_bin)
+            if norm in matched:
+                continue
+            ok_bin, _reason = validate_spikeglx_ap_bin(raw_bin)
+            if not ok_bin:
+                continue
+            parsed = parse_spikeglx_bin_name(raw_bin)
+            job = {
+                "name": parsed["run_name"],
+                "bin_file": raw_bin,
+                "workdir": str(Path(raw_bin).parent),
+                "gate_string": parsed["gate_string"],
+                "trigger_string": parsed["trigger_string"],
+                "probe_string": parsed["probe_string"],
+                "cfg_overrides": dict(overrides),
+            }
+            self.jobs.append(job)
+            self._raw_run_catalog[norm] = {k: v for k, v in job.items() if k != "cfg_overrides"}
+            matched.add(norm)
+        if matched:
+            self._append_log(
+                f"Switched {len(matched)} source session(s) to CatGT extract-only (NI events)"
+                + (" with TPrime alignment" if self.ck_tprime.isChecked() else "")
+                + ". They stay in the queue but are not sorted individually."
+            )
+        self._refresh_job_list_view()
         self._refresh_queue_summary()
 
     def _collect_cfg(self) -> EcephysPipelineConfig:
@@ -1887,6 +2285,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._running = True
         self.btn_run.setEnabled(False)
         self.progress.setValue(0)
+        self._update_concat_button_state()
         self._refresh_queue_summary()
         self._run_next()
 
@@ -1896,12 +2295,20 @@ class PreprocessingTab(QtWidgets.QWidget):
             self.btn_run.setEnabled(True)
             self.progress.setValue(100)
             self._append_log("All jobs completed.")
+            self._update_concat_button_state()
             self._refresh_queue_summary()
             return
 
         job = self._queue.pop(0)
         self._refresh_queue_summary()
         cfg = self._collect_cfg()
+        overrides = job.get("cfg_overrides")
+        if isinstance(overrides, dict) and overrides:
+            cfg = replace(cfg, **{k: v for k, v in overrides.items() if hasattr(cfg, k)})
+            self._append_log(
+                f"[{job.get('name', '')}] Using per-job step overrides: "
+                + ", ".join(f"{k}={overrides[k]}" for k in sorted(overrides))
+            )
         self._prepare_step_status_panel(str(job.get("name") or "Unknown run"), cfg)
         self._active_run_context = {
             "job_snapshot": dict(job),
@@ -2140,7 +2547,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._refresh_queue_summary()
 
     def is_busy(self) -> bool:
-        return bool(self._running)
+        return bool(self._running or self._concatenating)
 
     def _open_ks4_advanced(self) -> None:
         dlg = Ks4AdvancedDialog(self._ks4_adv_params, self)

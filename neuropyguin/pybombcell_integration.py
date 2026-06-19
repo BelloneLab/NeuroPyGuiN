@@ -216,6 +216,52 @@ def _best_meta_file(ks_folder: Path) -> Optional[Path]:
     return None
 
 
+def _resolve_meta_file(ks_folder: Path) -> Optional[Path]:
+    """Locate the SpikeGLX meta for a Kilosort folder.
+
+    Prefer the .meta sitting next to the raw bin recorded in ``params.py``.
+    This is robust for concatenated/joint sorts where the KS output folder
+    lives in a different tree than the recording (so the legacy sibling search
+    in :func:`_best_meta_file` would miss the combined .meta). Falls back to the
+    nearby-folder search when params.py is absent or points nowhere.
+    """
+    ks_folder = Path(ks_folder)
+    params_py = ks_folder / "params.py"
+    if params_py.exists():
+        try:
+            from .preprocessing import find_meta_for_bin, parse_kilosort_params_dat_path
+
+            dat_path = parse_kilosort_params_dat_path(params_py)
+            if dat_path:
+                meta = find_meta_for_bin(dat_path)
+                if meta.exists():
+                    return meta
+        except Exception:
+            pass
+    return _best_meta_file(ks_folder)
+
+
+def _resolve_raw_file(ks_folder: Path) -> Optional[Path]:
+    """Resolve the raw .bin a Kilosort folder was sorted from (via params.py).
+
+    Used for opt-in raw-waveform / SNR extraction. For a concatenated joint
+    sort this returns the fused .bin, so raw waveforms are extracted across the
+    full concatenated timeline using the joint spike times.
+    """
+    params_py = Path(ks_folder) / "params.py"
+    if not params_py.exists():
+        return None
+    try:
+        from .preprocessing import parse_kilosort_params_dat_path
+
+        dat_path = parse_kilosort_params_dat_path(params_py)
+    except Exception:
+        dat_path = ""
+    if dat_path and Path(dat_path).exists():
+        return Path(dat_path)
+    return None
+
+
 def _label_counts(labels_csv: Path) -> Dict[str, int]:
     if not labels_csv.exists():
         return {}
@@ -422,7 +468,7 @@ def _prepare_param_for_saved_metrics(ks_folder: Path, settings: Dict[str, object
 
     param = _load_saved_param_dict(ks_folder)
     if not param:
-        meta = _best_meta_file(ks_folder)
+        meta = _resolve_meta_file(ks_folder)
         param = get_default_parameters(
             kilosort_path=str(ks_folder),
             raw_file=None,
@@ -660,14 +706,20 @@ def run_pybombcell_on_folder(
     save_plots: bool = True,
     force_recompute: bool = False,
     settings: Optional[Dict[str, object]] = None,
+    extract_raw: bool = False,
 ) -> Dict:
     normalized_settings = normalize_pybombcell_settings(settings)
     ks = Path(ks_folder)
     if not ks.exists():
         raise RuntimeError(f"Invalid Kilosort folder: {ks}")
 
+    # Opt-in raw-waveform / SNR extraction. When a raw file is found we always
+    # recompute, because the cached metrics were template-only and reusing them
+    # would silently skip the requested raw waveforms / SNR.
+    raw_file = _resolve_raw_file(ks) if extract_raw else None
+
     summary = summarize_saved_pybombcell_results(ks, settings=normalized_settings)
-    if (not force_recompute) and summary.get("has_metrics", False):
+    if (not force_recompute) and raw_file is None and summary.get("has_metrics", False):
         return _refresh_pybombcell_outputs_from_saved_metrics(ks, normalized_settings, save_plots=save_plots)
 
     ensure_pybombcell_on_sys_path()
@@ -684,10 +736,10 @@ def run_pybombcell_on_folder(
     labels_csv = ks / "bombcell_labels.csv"
     plots_dir = ks / "bombcell_plots"
 
-    meta = _best_meta_file(ks)
+    meta = _resolve_meta_file(ks)
     param = get_default_parameters(
         kilosort_path=str(ks),
-        raw_file=None,
+        raw_file=str(raw_file) if raw_file else None,
         kilosort_version=4,
         meta_file=str(meta) if meta else None,
         gain_to_uV=None,
@@ -742,6 +794,7 @@ def run_pybombcell_on_folder(
         "cached": False,
         "metrics_reused": False,
         "cache_reason": "reran",
+        "raw_extracted": bool(raw_file is not None),
         "phy_group_sync": sync_result,
     }
 
@@ -752,6 +805,7 @@ def run_pybombcell_on_folders(
     save_plots: bool = True,
     force_recompute: bool = False,
     settings: Optional[Dict[str, object]] = None,
+    extract_raw: bool = False,
 ) -> Dict[str, object]:
     normalized_settings = normalize_pybombcell_settings(settings)
     seen: set[str] = set()
@@ -786,6 +840,7 @@ def run_pybombcell_on_folders(
                 save_plots=save_plots,
                 force_recompute=force_recompute,
                 settings=normalized_settings,
+                extract_raw=extract_raw,
             )
         except Exception as exc:
             results.append({"folder": folder, "ok": False, "error": str(exc)})

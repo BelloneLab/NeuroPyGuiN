@@ -92,6 +92,78 @@ class PipelineWorker(QtCore.QRunnable):
         _safe_emit(self.signals.finished, {"job": self.job["name"], "ok": True})
 
 
+@dataclass
+class ConcatenationConfig:
+    bin_files: List[str]
+    meta_files: List[str]
+    target_bin: str
+    run_name: str
+    svd_clean: bool = True
+    n_svd_components: int = 5
+    batch_seconds: float = 0.5
+
+
+class ConcatenationWorker(QtCore.QRunnable):
+    """Fuse several SpikeGLX AP binaries into one file for joint spike sorting."""
+
+    STEP_KEY = "concatenate"
+
+    def __init__(self, cfg: ConcatenationConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.signals = WorkerSignals()
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        from .preprocessing import concatenate_ap_session
+
+        name = self.cfg.run_name
+
+        def log_cb(line: str) -> None:
+            _safe_emit(self.signals.log, f"[{name}] {line}")
+
+        def progress_cb(percent: int) -> None:
+            _safe_emit(self.signals.stepProgress, self.STEP_KEY, percent)
+            _safe_emit(self.signals.progress, percent)
+
+        _safe_emit(self.signals.stepStarted, self.STEP_KEY, "Concatenate binaries")
+        try:
+            log_cb(
+                f"Concatenating {len(self.cfg.bin_files)} recording(s) into {self.cfg.target_bin}"
+            )
+            log_cb(
+                f"SVD cleaning={'on' if self.cfg.svd_clean else 'off'} "
+                f"components={self.cfg.n_svd_components} batch={self.cfg.batch_seconds:g}s"
+            )
+            result = concatenate_ap_session(
+                self.cfg.bin_files,
+                self.cfg.meta_files,
+                self.cfg.target_bin,
+                svd_clean=self.cfg.svd_clean,
+                n_svd_components=self.cfg.n_svd_components,
+                batch_seconds=self.cfg.batch_seconds,
+                progress_cb=progress_cb,
+                log_cb=log_cb,
+            )
+        except Exception as exc:
+            tb = traceback.format_exc()
+            _safe_emit(self.signals.stepFinished, self.STEP_KEY, False)
+            _safe_emit(self.signals.error, f"{name} concatenation failed: {exc}")
+            _safe_emit(self.signals.error, tb)
+            _safe_emit(self.signals.finished, {"job": name, "ok": False, "concat": True})
+            return
+
+        _safe_emit(self.signals.stepFinished, self.STEP_KEY, True)
+        log_cb(f"Wrote concatenated bin: {result['target_bin']}")
+        log_cb(f"Combined meta: {result['meta_path']}")
+        log_cb(f"Split-info map: {result['splitinfo_path']}")
+        if result.get("manifest_path"):
+            log_cb(f"Concat manifest: {result['manifest_path']}")
+        payload: Dict[str, object] = {"job": name, "ok": True, "concat": True}
+        payload.update(result)
+        _safe_emit(self.signals.finished, payload)
+
+
 class FunctionWorker(QtCore.QRunnable):
     def __init__(self, fn, *args, **kwargs) -> None:
         super().__init__()

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from neuropyguin.preprocessing import (
+    build_concat_run_name,
     catgt_extract_command_string,
     catgt_extract_only_flags,
     catgt_extract_only_stream_string,
     catgt_extract_stream_selection,
     catgt_stream_string,
     completed_run_target_folders,
+    concatenate_ap_session,
+    default_concat_run_layout,
     default_kilosort_output_name,
     default_local_ks_output_dir,
     default_pipeline_output_dir,
@@ -25,6 +29,7 @@ from neuropyguin.preprocessing import (
     parse_catgt_processed_bin_context,
     resolve_labelled_output_context,
     parse_spikeglx_bin_name,
+    validate_concat_inputs,
 )
 
 
@@ -341,3 +346,228 @@ def test_resolve_labelled_output_context_prefers_parsed_catgt_bin_context() -> N
         "trigger_string": "cat",
         "probe_string": "0",
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-session concatenation
+# ---------------------------------------------------------------------------
+
+
+def test_build_concat_run_name_joins_runs_and_collapses_large_sets() -> None:
+    assert build_concat_run_name(["sessA", "sessB"]) == "concat_sessA__sessB"
+    assert build_concat_run_name(["a b", "c/d"]) == "concat_a_b__c_d"
+    assert build_concat_run_name(["r1", "r2", "r3", "r4", "r5"]) == "concat_r1__and4more"
+
+
+def test_default_concat_run_layout_builds_spikeglx_standard_paths() -> None:
+    layout = default_concat_run_layout(r"D:\out", "concat_a__b", "0")
+    assert layout["bin"] == Path(r"D:\out\concat_a__b_g0\concat_a__b_g0_imec0\concat_a__b_g0_t0.imec0.ap.bin")
+    assert layout["meta"] == Path(r"D:\out\concat_a__b_g0\concat_a__b_g0_imec0\concat_a__b_g0_t0.imec0.ap.meta")
+    # The fused file parses back to the combined run name like a normal recording.
+    assert parse_spikeglx_bin_name(str(layout["bin"]))["run_name"] == "concat_a__b"
+
+
+def _write_fake_ap(path: Path, data) -> Path:
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.asarray(data, dtype=np.int16).tofile(path)
+    meta = Path(str(path).replace(".ap.bin", ".ap.meta"))
+    n_chan = np.asarray(data).shape[1]
+    meta.write_text(
+        "\n".join(
+            [
+                f"nSavedChans={n_chan}",
+                f"snsApLfSy={n_chan - 1},0,1",
+                "imSampRate=30000",
+                f"fileName={path}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return meta
+
+
+def test_concatenate_ap_session_glues_raw_samples_and_writes_split_map(tmp_path: Path) -> None:
+    import numpy as np
+
+    c = 4
+    data1 = np.arange(5 * c, dtype=np.int16).reshape(5, c)
+    data2 = (np.arange(3 * c, dtype=np.int16) + 100).reshape(3, c)
+    bin1 = tmp_path / "runA_g0_t0.imec0.ap.bin"
+    bin2 = tmp_path / "runB_g0_t0.imec0.ap.bin"
+    meta1 = _write_fake_ap(bin1, data1)
+    meta2 = _write_fake_ap(bin2, data2)
+
+    target = tmp_path / "concat_runA__runB_g0_t0.imec0.ap.bin"
+    # batch shorter than each file to exercise the streaming path; cleaning off
+    # so the output is an exact raw concatenation we can compare byte for byte.
+    result = concatenate_ap_session(
+        [str(bin1), str(bin2)],
+        [str(meta1), str(meta2)],
+        target,
+        svd_clean=False,
+        batch_seconds=2 / 30000,
+    )
+
+    assert result["samplelist"] == [5, 3]
+    assert Path(result["manifest_path"]).exists()
+    fused = np.fromfile(target, dtype=np.int16).reshape(-1, c)
+    assert np.array_equal(fused, np.vstack([data1, data2]))
+
+    split = json.loads(Path(result["splitinfo_path"]).read_text(encoding="utf-8"))
+    assert split["sampling_rate"] == 30000.0
+    assert [(s["start_sample"], s["end_sample"]) for s in split["segments"]] == [(0, 5), (5, 8)]
+
+    combined_meta = Path(result["meta_path"]).read_text(encoding="utf-8")
+    assert "fileSizeBytes=64" in combined_meta  # 2 bytes * 4 chan * 8 samples
+    assert "concatSampleList=5,3" in combined_meta
+
+
+def test_concatenate_svd_clean_removes_shared_component(tmp_path: Path) -> None:
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    n_samp, ap = 64, 8
+    # A strong shared component on all AP channels plus small per-channel noise.
+    shared = rng.normal(0, 50, size=(n_samp, 1)) * np.ones((1, ap))
+    noise = rng.normal(0, 5, size=(n_samp, ap))
+    ap_data = np.clip(np.rint(shared + noise), -32768, 32767).astype(np.int16)
+    sync = np.full((n_samp, 1), 7, dtype=np.int16)
+    data = np.hstack([ap_data, sync]).astype(np.int16)
+
+    b = tmp_path / "runA_g0_t0.imec0.ap.bin"
+    m = _write_fake_ap(b, data)
+    # Two copies so the helper has the >=1 file it expects; identical content.
+    b2 = tmp_path / "runB_g0_t0.imec0.ap.bin"
+    m2 = _write_fake_ap(b2, data)
+
+    target = tmp_path / "concat_g0_t0.imec0.ap.bin"
+    result = concatenate_ap_session(
+        [str(b), str(b2)],
+        [str(m), str(m2)],
+        target,
+        svd_clean=True,
+        n_svd_components=1,
+        batch_seconds=10.0,
+    )
+
+    fused = np.fromfile(target, dtype=np.int16).reshape(-1, data.shape[1])
+    first_half = fused[:n_samp]
+    # The dominant shared component should be strongly attenuated on AP channels.
+    assert np.var(first_half[:, :ap]) < np.var(data[:, :ap]) * 0.2
+    # Sync (non-AP) channel is passed through untouched.
+    assert np.array_equal(first_half[:, ap], data[:, ap])
+    assert result["samplelist"] == [n_samp, n_samp]
+
+
+def test_validate_concat_inputs_flags_channel_mismatch(tmp_path: Path) -> None:
+    import numpy as np
+
+    m1 = _write_fake_ap(tmp_path / "a_g0_t0.imec0.ap.bin", np.zeros((4, 4), dtype=np.int16))
+    m2 = _write_fake_ap(tmp_path / "b_g0_t0.imec0.ap.bin", np.zeros((4, 5), dtype=np.int16))
+
+    ok, reason, _info = validate_concat_inputs([str(m1), str(m2)])
+    assert not ok
+    assert "mismatch" in reason.lower()
+
+    ok2, reason2, info = validate_concat_inputs([str(m1), str(m1)])
+    assert ok2 and reason2 == ""
+    assert int(info["n_saved"]) == 4
+
+
+def test_split_concatenated_sort_masks_shifts_and_preserves_identity(tmp_path: Path) -> None:
+    import numpy as np
+
+    from neuropyguin.preprocessing import (
+        split_concatenated_sort,
+        write_concat_splitinfo,
+    )
+
+    # Two source sessions with a combined length of 100 samples (60 + 40).
+    sess_a = tmp_path / "runA_g0" / "runA_g0_imec0" / "runA_g0_t0.imec0.ap.bin"
+    sess_b = tmp_path / "runB_g0" / "runB_g0_imec0" / "runB_g0_t0.imec0.ap.bin"
+    for b in (sess_a, sess_b):
+        b.parent.mkdir(parents=True, exist_ok=True)
+        b.write_bytes(b"\x00" * 16)
+        Path(str(b).replace(".ap.bin", ".ap.meta")).write_text("imSampRate=30000\n", encoding="utf-8")
+
+    ks = tmp_path / "concat_runA__runB_g0" / "concat_runA__runB_g0_imec0" / "imec0_ks4"
+    ks.mkdir(parents=True)
+    target_bin = ks.parent / "concat_runA__runB_g0_t0.imec0.ap.bin"
+    splitinfo = write_concat_splitinfo(
+        [str(sess_a).replace(".ap.bin", ".ap.meta"), str(sess_b).replace(".ap.bin", ".ap.meta")],
+        target_bin,
+        [str(sess_a), str(sess_b)],
+        [60, 40],
+    )
+
+    # Minimal phy-like outputs: per-spike arrays + one shared array.
+    spike_times = np.array([5, 30, 65, 95], dtype=np.uint64)
+    spike_clusters = np.array([0, 1, 0, 2], dtype=np.int32)
+    amplitudes = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+    np.save(ks / "spike_times.npy", spike_times)
+    np.save(ks / "spike_clusters.npy", spike_clusters)
+    np.save(ks / "amplitudes.npy", amplitudes)
+    templates = np.zeros((3, 61, 4), dtype=np.float32)
+    np.save(ks / "templates.npy", templates)  # shared, must be copied verbatim
+    (ks / "params.py").write_text(
+        f"dat_path = r'{target_bin}'\nn_channels_dat = 385\nsample_rate = 30000\n", encoding="utf-8"
+    )
+
+    manifest = split_concatenated_sort(ks, splitinfo_path=str(splitinfo), copy_events=False)
+
+    assert manifest["n_sessions"] == 2
+    sessions = manifest["sessions"]
+    dir_a = Path(sessions[0]["output_dir"])
+    dir_b = Path(sessions[1]["output_dir"])
+
+    # Session A owns samples [0, 60): spikes at 5 and 30, unshifted because start=0.
+    assert np.array_equal(np.load(dir_a / "spike_times.npy"), np.array([5, 30], dtype=np.uint64))
+    assert np.array_equal(np.load(dir_a / "spike_clusters.npy"), np.array([0, 1], dtype=np.int32))
+    # Session B owns samples [60, 100): spikes at 65 and 95, shifted by -60 -> 5 and 35.
+    assert np.array_equal(np.load(dir_b / "spike_times.npy"), np.array([5, 35], dtype=np.uint64))
+    assert np.array_equal(np.load(dir_b / "spike_clusters.npy"), np.array([0, 2], dtype=np.int32))
+    # Shared templates copied verbatim into each session (identity preserved).
+    assert np.load(dir_a / "templates.npy").shape == (3, 61, 4)
+    assert np.load(dir_b / "templates.npy").shape == (3, 61, 4)
+    # params.py repointed at the per-session recording, not the concatenated bin.
+    assert str(sess_b) in (dir_b / "params.py").read_text(encoding="utf-8")
+
+
+def test_find_concat_splitinfo_for_ks_folder_via_params(tmp_path: Path) -> None:
+    from neuropyguin.preprocessing import find_concat_splitinfo_for_ks_folder
+
+    bin_dir = tmp_path / "concat_x_g0" / "concat_x_g0_imec0"
+    bin_dir.mkdir(parents=True)
+    target_bin = bin_dir / "concat_x_g0_t0.imec0.ap.bin"
+    split = bin_dir / "concat_x_g0_t0.imec0.ap.splitinfo.json"
+    split.write_text(json.dumps({"segments": [], "sampling_rate": 30000}), encoding="utf-8")
+
+    ks = tmp_path / "elsewhere" / "imec0_ks4"
+    ks.mkdir(parents=True)
+    (ks / "params.py").write_text(f"dat_path = r'{target_bin}'\n", encoding="utf-8")
+
+    found = find_concat_splitinfo_for_ks_folder(ks)
+    assert found is not None and Path(found) == split
+
+
+def test_session_event_files_filters_extra_roots_by_run_name(tmp_path: Path) -> None:
+    from neuropyguin.preprocessing import _session_event_files
+
+    raw = tmp_path / "raw" / "runA_g0" / "runA_g0_imec0" / "runA_g0_t0.imec0.ap.bin"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"\x00" * 8)
+
+    out = tmp_path / "processed"
+    cat_a = out / "runA" / "catgt_runA_g0" / "runA_g0_imec0"
+    cat_a.mkdir(parents=True)
+    (cat_a / "runA_g0_tcat.nidq.xd_8_3_0.txt").write_text("0.1\n", encoding="utf-8")
+    cat_b = out / "runB" / "catgt_runB_g0" / "runB_g0_imec0"
+    cat_b.mkdir(parents=True)
+    (cat_b / "runB_g0_tcat.nidq.xd_8_3_0.txt").write_text("0.2\n", encoding="utf-8")
+
+    names = [f.name for f in _session_event_files(raw, run_name="runA", extra_roots=[str(out)])]
+    assert "runA_g0_tcat.nidq.xd_8_3_0.txt" in names
+    assert "runB_g0_tcat.nidq.xd_8_3_0.txt" not in names
