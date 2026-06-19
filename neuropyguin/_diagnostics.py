@@ -52,6 +52,23 @@ def _write_build_header(fh) -> None:
     fh.flush()
 
 
+def breadcrumb(msg: str) -> None:
+    """Record the last GUI/render step so a native crash log shows where we were.
+
+    The access violation is in async Qt paint code with no Python frame, so the
+    faulthandler stack only shows ``app.exec()``. The last breadcrumb written
+    before the crash identifies which widget operation was being painted.
+    """
+    fh = _LOG_FILE
+    if fh is None:
+        return
+    try:
+        fh.write(f"  . {datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {msg}\n")
+        fh.flush()
+    except Exception:
+        pass
+
+
 def install_crash_logging() -> Path:
     """Enable faulthandler to a persistent log file. Idempotent. Returns the path."""
     global _INSTALLED, _LOG_FILE

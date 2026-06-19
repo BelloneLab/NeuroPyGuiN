@@ -31,6 +31,12 @@ from ..workers import FunctionWorker
 from ..histology import atlas as hatlas
 from ..histology import io_formats, matching, tracing, alignment, slice_prep, ibl_launch
 
+try:  # crash breadcrumbs: identify the last render step before a native paint crash
+    from .._diagnostics import breadcrumb as _crumb
+except Exception:  # pragma: no cover
+    def _crumb(msg: str) -> None:  # type: ignore
+        pass
+
 
 PROBE_QCOLORS = [
     QtGui.QColor(*[int(c * 255) for c in rgb]) for rgb in tracing.probe_colormap(20)
@@ -66,8 +72,11 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
                 lo, hi = float(a.min()), float(a.max())
                 levels = (lo, hi if hi > lo else lo + 1.0)
         a = np.ascontiguousarray(a)
+        _crumb(f"ImageCanvas.set_image setImage {a.shape} {a.dtype}")
         self.img.setImage(a, autoLevels=(levels is None), levels=levels)
+        _crumb("ImageCanvas.set_image autoRange")
         self.view.autoRange()
+        _crumb("ImageCanvas.set_image done")
 
     def _on_click(self, ev) -> None:
         if ev.button() != QtCore.Qt.LeftButton:
@@ -104,10 +113,12 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         mask = np.ascontiguousarray(np.asarray(mask).astype(bool))
         rgba = np.zeros((*mask.shape, 4), dtype=np.ubyte)
         rgba[mask] = [*color, 160]
+        _crumb(f"add_mask_overlay ImageItem {rgba.shape}")
         item = pg.ImageItem(np.ascontiguousarray(rgba))
         item.setOpts(axisOrder="row-major")
         self.view.addItem(item)
         self._overlays.append(item)
+        _crumb("add_mask_overlay done")
 
 
 class HistologyTab(QtWidgets.QWidget):
@@ -882,39 +893,100 @@ class HistologyTab(QtWidgets.QWidget):
         except OSError as exc:
             self._log(f"Could not save match specs: {exc}")
 
-    def _load_match_specs(self) -> None:
-        """Restore the per-slice match planes saved for this run, if present."""
-        if self.folder is None:
-            return
+    def _read_match_specs_file(self) -> List[Optional[Dict[str, np.ndarray]]]:
         fp = self.folder / self._MATCH_SPECS_FN
         if not fp.exists():
-            return
+            return []
         try:
             with open(fp) as f:
                 data = json.load(f)
         except (OSError, ValueError) as exc:
             self._log(f"Could not load match specs: {exc}")
-            return
+            return []
         specs: List[Optional[Dict[str, np.ndarray]]] = []
         for s in data.get("specs", []):
             if s is None:
                 specs.append(None)
                 continue
-            specs.append({
-                "slice_point": np.asarray(s["slice_point"], float),
-                "camera_vector": np.asarray(s["camera_vector"], float),
-                "ap": int(s.get("ap", 0)),
-                "lr": int(s.get("lr", 0)),
-                "si": int(s.get("si", 0)),
-                "mode": str(s.get("mode", "TV")),
-            })
-        if not specs:
+            try:
+                specs.append({
+                    "slice_point": np.asarray(s["slice_point"], float),
+                    "camera_vector": np.asarray(s["camera_vector"], float),
+                    "ap": int(s.get("ap", 0)),
+                    "lr": int(s.get("lr", 0)),
+                    "si": int(s.get("si", 0)),
+                    "mode": str(s.get("mode", "TV")),
+                })
+            except (KeyError, ValueError, TypeError):
+                specs.append(None)
+        return specs
+
+    @staticmethod
+    def _recover_plane_spec(sl: Dict[str, np.ndarray], dv_n: int, ml_n: int):
+        """Recover (slice_point, camera_vector, sliders) from a saved CCF plane."""
+        try:
+            ap, dv, ml = sl["plane_ap"], sl["plane_dv"], sl["plane_ml"]
+        except (KeyError, TypeError):
+            return None
+        h, w = ap.shape
+        if h < 2 or w < 2:
+            return None
+        y0, x0 = h // 2, w // 2
+        P = np.array([ap[y0, x0], dv[y0, x0], ml[y0, x0]], float)
+        dx = np.array([ap[y0, x0 + 1] - ap[y0, x0], dv[y0, x0 + 1] - dv[y0, x0], ml[y0, x0 + 1] - ml[y0, x0]])
+        dy = np.array([ap[y0 + 1, x0] - ap[y0, x0], dv[y0 + 1, x0] - dv[y0, x0], ml[y0 + 1, x0] - ml[y0, x0]])
+        n = np.cross(dx, dy)
+        nn = float(np.linalg.norm(n))
+        if not np.isfinite(nn) or nn < 1e-9 or not np.isfinite(P).all():
+            return None
+        cv = n / nn
+        if cv[0] < 0:
+            cv = -cv  # coronal convention: normal points along +AP
+        si = float(np.degrees(np.arcsin(np.clip(cv[1], -1, 1))))
+        cp = np.cos(np.radians(si))
+        lr = float(np.degrees(np.arcsin(np.clip(cv[2] / cp, -1, 1)))) if abs(cp) > 1e-6 else 0.0
+        if abs(cv[0]) > 1e-6:
+            ap_s = float((cv @ P - cv[1] * (dv_n / 2.0) - cv[2] * (ml_n / 2.0)) / cv[0])
+        else:
+            ap_s = float(P[0])
+        return {"slice_point": P, "camera_vector": cv,
+                "ap": int(round(ap_s)), "lr": int(round(lr)), "si": int(round(si)), "mode": "TV"}
+
+    def _specs_from_histology_ccf(self) -> List[Optional[Dict[str, np.ndarray]]]:
+        at = self._ensure_atlas()
+        n = max(len(self.slice_images), len(self.histology_ccf))
+        specs: List[Optional[Dict[str, np.ndarray]]] = [None] * n
+        if at is None:
+            return specs
+        _, dv_n, ml_n = at.shape
+        for i, sl in enumerate(self.histology_ccf):
+            if i < n:
+                specs[i] = self._recover_plane_spec(sl, dv_n, ml_n)
+        return specs
+
+    def _load_match_specs(self) -> None:
+        """Restore the per-slice match planes for this run.
+
+        Prefer the saved sidecar; otherwise reconstruct them from histology_ccf.mat
+        so a run matched before the sidecar existed still shows its planes (and the
+        Match sliders) on reopen instead of starting blank.
+        """
+        if self.folder is None:
+            return
+        specs = self._read_match_specs_file()
+        from_ccf = False
+        if not any(s is not None for s in specs) and self.histology_ccf:
+            specs = self._specs_from_histology_ccf()
+            from_ccf = True
+        if not any(s is not None for s in specs):
             return
         n = max(len(self.slice_images), len(self.histology_ccf), len(specs))
         specs += [None] * (n - len(specs))
         self.slice_specs = specs
-        n_assigned = sum(x is not None for x in specs)
-        self._log(f"Restored {n_assigned} matched plane(s) from {self._MATCH_SPECS_FN}.")
+        if from_ccf:
+            self._save_match_specs()  # cache reconstructed specs so next load is exact
+        src = "histology_ccf.mat" if from_ccf else self._MATCH_SPECS_FN
+        self._log(f"Restored {sum(s is not None for s in specs)} matched plane(s) from {src}.")
 
     def _match_save(self) -> None:
         at = self._ensure_atlas()
@@ -1340,6 +1412,7 @@ class HistologyTab(QtWidgets.QWidget):
 
     def _draw_one_trajectory(self, i: int, p: dict) -> None:
         ta = p.get("trajectory_areas")
+        _crumb(f"draw_trajectory probe {i} addPlot")
         plt = self.trace_areas.addPlot(row=0, col=i)
         plt.setTitle(f"Probe {i + 1}")
         plt.invertY(True)
@@ -1366,6 +1439,7 @@ class HistologyTab(QtWidgets.QWidget):
                     txt = pg.TextItem(acr, color="k", anchor=(0, 0.5))
                     txt.setPos(0.05, (d0 + d1) / 2.0)
                     plt.addItem(txt)
+        _crumb(f"draw_trajectory probe {i} done")
 
     # --------------------------------------------------- Channel map / IBL
     def _ibl_kwargs(self) -> dict:
