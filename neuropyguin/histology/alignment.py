@@ -216,6 +216,7 @@ def auto_align_isolated(
     import subprocess
     import sys
     import tempfile
+    from ..processes import tracked_run
 
     hist = np.nan_to_num(np.asarray(histology_gray, dtype=np.float32))
     atlas = np.nan_to_num(np.asarray(atlas_tv, dtype=np.float32))
@@ -232,7 +233,7 @@ def auto_align_isolated(
         cmd = [python_exe or sys.executable, "-m", "neuropyguin.histology.alignment",
                str(hp), str(ap), str(op)]
         try:
-            proc = subprocess.run(
+            proc = tracked_run(
                 cmd, capture_output=True, text=True, timeout=timeout, cwd=str(repo_root),
             )
         except subprocess.TimeoutExpired:

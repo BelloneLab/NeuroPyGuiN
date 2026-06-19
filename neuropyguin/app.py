@@ -107,6 +107,7 @@ if __package__ in (None, ""):
     from neuropyguin.tabs.postprocessing_tab import PostProcessingTab
     from neuropyguin.tabs.preprocessing_tab import PreprocessingTab
     from neuropyguin.tabs.histology_tab import HistologyTab
+    from neuropyguin.processes import terminate_child_processes
     from neuropyguin.styles import build_app_palette, build_app_qss
 else:
     from .side_nav import SideNavStack
@@ -114,6 +115,7 @@ else:
     from .tabs.postprocessing_tab import PostProcessingTab
     from .tabs.preprocessing_tab import PreprocessingTab
     from .tabs.histology_tab import HistologyTab
+    from .processes import terminate_child_processes
     from .styles import build_app_palette, build_app_qss
 
 
@@ -269,6 +271,7 @@ class PreferencesDialog(QtWidgets.QDialog):
 class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self._shutdown_started = False
         self.setWindowTitle("NeuroPyGuiN")
         app_icon = _load_app_icon()
         if not app_icon.isNull():
@@ -808,35 +811,106 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         )
         QtWidgets.QMessageBox.about(self, "About NeuroPyGuiN", txt)
 
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self._persist_all_settings()
-        # Flush settings to disk now: os._exit below skips normal QSettings sync.
+    @staticmethod
+    def _terminate_qprocess(process: QtCore.QProcess | None, timeout_ms: int = 1000) -> None:
+        if process is None:
+            return
+        try:
+            if process.state() == QtCore.QProcess.NotRunning:
+                return
+            process.terminate()
+            if not process.waitForFinished(timeout_ms):
+                process.kill()
+                process.waitForFinished(500)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _clear_thread_pool(pool: QtCore.QThreadPool | None, timeout_ms: int = 750) -> None:
+        if pool is None:
+            return
+        try:
+            pool.clear()
+        except Exception:
+            pass
+        try:
+            pool.waitForDone(timeout_ms)
+        except Exception:
+            pass
+
+    def _shutdown_for_exit(self) -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        try:
+            self._persist_all_settings()
+        except Exception:
+            pass
         try:
             self.settings.sync()
         except Exception:
             pass
-        # Stop the recurring UI timer and drop any queued background work.
         try:
             self.busy_timer.stop()
         except Exception:
             pass
-        for pool in (QtCore.QThreadPool.globalInstance(),
-                     getattr(self.hist_tab, "pool", None)):
+        self._terminate_qprocess(getattr(self.cur_tab, "phy_process", None))
+        for pool in (
+            QtCore.QThreadPool.globalInstance(),
+            getattr(self.hist_tab, "pool", None),
+        ):
             try:
                 if pool is not None:
                     pool.clear()
             except Exception:
                 pass
-        super().closeEvent(event)
-        # Terminate hard from here: a pool worker blocked in subprocess.wait() or
-        # the matplotlib Qt canvas can stop app.exec() from ever returning, so the
-        # window vanishes but python.exe lingers and the terminal never frees up.
+        try:
+            terminate_child_processes(timeout=1.5, kill_timeout=0.75)
+        except Exception:
+            pass
+        for pool in (
+            QtCore.QThreadPool.globalInstance(),
+            getattr(self.hist_tab, "pool", None),
+        ):
+            self._clear_thread_pool(pool)
+        try:
+            self.settings.sync()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _hard_exit(exit_code: int) -> None:
         try:
             sys.stdout.flush()
             sys.stderr.flush()
         except Exception:
             pass
-        os._exit(0)
+        os._exit(int(exit_code))
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        event.accept()
+        self._shutdown_for_exit()
+        try:
+            super().closeEvent(event)
+        except Exception:
+            pass
+        self._hard_exit(0)
+
+
+def _final_process_exit(win: NeuroPyGuiNMainWindow, exit_code: int) -> None:
+    try:
+        win._shutdown_for_exit()
+    except Exception:
+        try:
+            terminate_child_processes(timeout=1.0, kill_timeout=0.5)
+        except Exception:
+            pass
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(int(exit_code))
 
 
 def main() -> int:
@@ -876,16 +950,7 @@ def main() -> int:
     if splash is not None:
         splash.finish(win)
     exit_code = int(app.exec())
-    # The window is closed and settings are persisted, but a worker blocked in
-    # subprocess.wait() on a pool thread, the matplotlib Qt canvas, or an atexit
-    # hook can keep the interpreter alive (the app "doesn't close fully"). Flush
-    # what we care about and terminate hard so the process always exits.
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception:
-        pass
-    os._exit(exit_code)
+    _final_process_exit(win, exit_code)
 
 
 if __name__ == "__main__":

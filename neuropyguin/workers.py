@@ -13,6 +13,7 @@ from typing import Dict, List, Sequence, Tuple
 from PySide6 import QtCore
 from .ecephys_runtime import ecephys_subprocess_env, ensure_ecephys_on_sys_path
 from .ks_output_resolver import archive_output_dir, find_kilosort_output_dir, has_kilosort_output
+from .processes import tracked_popen, unregister_process
 
 
 def _safe_emit(signal, *args) -> None:
@@ -60,7 +61,7 @@ class PipelineWorker(QtCore.QRunnable):
             cmd = step.command_template.format(**self.placeholders)
             _safe_emit(self.signals.log, f"[{self.job['name']}] {step.name}: {cmd}")
             try:
-                proc = subprocess.Popen(
+                proc = tracked_popen(
                     cmd,
                     cwd=self.job["workdir"],
                     stdout=subprocess.PIPE,
@@ -74,13 +75,16 @@ class PipelineWorker(QtCore.QRunnable):
                 _safe_emit(self.signals.finished, {"job": self.job["name"], "ok": False})
                 return
 
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    _safe_emit(self.signals.log, line)
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        _safe_emit(self.signals.log, line)
 
-            rc = proc.wait()
+                rc = proc.wait()
+            finally:
+                unregister_process(proc)
             if rc != 0:
                 _safe_emit(self.signals.error, f"{self.job['name']} {step.name} failed (exit={rc})")
                 _safe_emit(self.signals.finished, {"job": self.job["name"], "ok": False})
@@ -275,7 +279,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         )
         lines: List[str] = []
         _safe_emit(self.signals.log, f"[{self.job['name']}] Running {module_name}")
-        proc = subprocess.Popen(
+        proc = tracked_popen(
             cmd,
             cwd=cwd,
             env=ecephys_subprocess_env(),
@@ -284,14 +288,17 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             text=True,
             bufsize=1,
         )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                lines.append(line)
-                _safe_emit(self.signals.log, line)
-                self._emit_step_progress_from_line(line)
-        rc = proc.wait()
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    lines.append(line)
+                    _safe_emit(self.signals.log, line)
+                    self._emit_step_progress_from_line(line)
+            rc = proc.wait()
+        finally:
+            unregister_process(proc)
         if rc != 0:
             raise RuntimeError(f"{module_name} exited with code {rc}")
         return lines
@@ -954,6 +961,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 expected_ni_catgt_output_patterns,
                 extractor_label_rename_map,
                 is_catgt_processed_bin,
+                is_concatenated_run_bin,
                 has_ni_catgt_extractors,
                 merge_extractors_into_catgt_command,
                 parse_catgt_processed_bin_context,
@@ -1029,9 +1037,13 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 effective_catgt_cmd = strip_ni_catgt_extractor_flags(effective_catgt_cmd)
                 effective_ni_extract_string = ""
                 dropped_preview = ", ".join(Path(p).name for p in dropped_ni) if dropped_ni else "NI digital extractors"
+                if is_concatenated_run_bin(bin_file):
+                    reason = "Concatenated run has no nidq stream by design"
+                else:
+                    reason = "No nidq stream found for this run"
                 _safe_emit(
                     self.signals.log,
-                    f"[{self.job['name']}] No nidq stream found for this run; skipping NI extraction "
+                    f"[{self.job['name']}] {reason}; skipping NI extraction "
                     f"({dropped_preview}). Keeping AP-stream extractors only.",
                 )
 
@@ -1449,7 +1461,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         gate_string=gate_string,
                         trigger_string=trigger_string,
                         probe_string=probe_string,
-                        tPrime_ni_ex_list=re.sub(r"\[[^\]]*\]", "", self.cfg.ni_extract_string),
+                        tPrime_ni_ex_list=re.sub(r"\[[^\]]*\]", "", effective_ni_extract_string),
                         sync_period=self.cfg.sync_period,
                         toStream_sync_params=self.cfg.tostream_sync_params,
                         ks_output_tag=ks_tag,

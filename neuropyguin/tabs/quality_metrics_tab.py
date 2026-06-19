@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -13,6 +12,7 @@ import pyqtgraph as pg
 
 from ..ecephys_runtime import ecephys_subprocess_env
 from ..ks_output_resolver import find_kilosort_output_dir, find_metrics_file
+from ..processes import tracked_run
 from ..pybombcell_integration import run_pybombcell_on_folder
 from ..workers import FunctionWorker
 
@@ -54,7 +54,7 @@ def _recompute_quality_metrics(ks_folder: str, json_root: str) -> str:
         "--output_json",
         str(out),
     ]
-    proc = subprocess.run(cmd, cwd=str(folder), capture_output=True, text=True, env=ecephys_subprocess_env())
+    proc = tracked_run(cmd, cwd=str(folder), capture_output=True, text=True, env=ecephys_subprocess_env())
     if proc.returncode != 0:
         raise RuntimeError(f"quality_metrics failed: {proc.stdout}\n{proc.stderr}")
     return "Quality metrics recomputed successfully."

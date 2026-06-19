@@ -712,6 +712,23 @@ def _concat_splitinfo_path_for_bin(target_bin: Path) -> Path:
     return target_bin.with_suffix(".splitinfo.json")
 
 
+def is_concatenated_run_bin(bin_file: str | Path) -> bool:
+    """True if ``bin_file`` is a multi-session concatenated AP file.
+
+    Concatenation (see :func:`concatenate_ap_session`) merges several AP
+    recordings into one ``*.imecK.ap.bin`` and writes a ``*.ap.splitinfo.json``
+    plus a ``concat_manifest.json`` beside it. Only the AP probe stream is
+    concatenated, so these runs carry **no nidq stream by design** and NI
+    extraction never applies to them.
+    """
+    bin_path = Path(bin_file)
+    if _concat_splitinfo_path_for_bin(bin_path).exists():
+        return True
+    if (bin_path.parent / "concat_manifest.json").exists():
+        return True
+    return False
+
+
 def concatenate_ap_binaries(
     bin_files: Sequence[str],
     meta_files: Sequence[str],

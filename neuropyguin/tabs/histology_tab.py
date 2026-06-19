@@ -2286,6 +2286,24 @@ class HistologyTab(QtWidgets.QWidget):
             if sclu.size:
                 counts = np.bincount(sclu, minlength=n)[:n].astype(float)
 
+        # Firing RATE (Hz) = spike count / recording duration (ALF spikes.times is in
+        # seconds), so dot size compares units fairly. Falls back to raw count when the
+        # spike-times file is absent (sizes are then proportional within the session).
+        duration = None
+        rates = counts.copy()
+        stimes_f = folder / "spikes.times.npy"
+        if stimes_f.exists():
+            try:
+                stimes = np.asarray(np.load(stimes_f), dtype=float)
+                if stimes.size:
+                    duration = float(np.nanmax(stimes) - np.nanmin(stimes))
+                    if duration > 0:
+                        rates = counts / duration
+                    else:
+                        duration = None
+            except Exception:
+                duration = None
+
         id2col = {}
         try:
             base = hatlas.resolve_atlas_path(atlas_path)
@@ -2307,6 +2325,7 @@ class HistologyTab(QtWidgets.QWidget):
         region_order = sorted(regions, key=lambda a: float(np.mean(regions[a]["depths"])))
         return {
             "n_units": n, "depths": depths, "lateral": lat, "rid": rid, "counts": counts,
+            "acr": acr, "rates": rates, "duration": duration,
             "id2col": id2col, "regions": regions, "region_order": region_order,
         }
 
@@ -2318,49 +2337,90 @@ class HistologyTab(QtWidgets.QWidget):
             ax.setPen(pg.mkPen((90, 90, 90)))
             ax.setTextPen(pg.mkPen((40, 40, 40)))
 
+    # Qualitative, perceptually-distinct palette (tab20-style, no near-white). The
+    # Allen CCF colours paint neighbouring midbrain nuclei near-identical pink, so a
+    # categorical palette is what actually separates regions by eye.
+    _REGION_PALETTE = [
+        (31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40),
+        (148, 103, 189), (140, 86, 75), (227, 119, 194), (23, 190, 207),
+        (188, 189, 34), (23, 90, 160), (174, 199, 232), (255, 152, 150),
+        (152, 223, 138), (255, 187, 120), (197, 176, 213), (196, 156, 148),
+    ]
+
     def _draw_unit_distribution(self, data) -> None:
         try:
             self.units_plot.clear()
         except Exception as exc:
             self._log(f"Could not reset unit plot: {exc}")
             return
-        id2col = data["id2col"]
 
-        def col(rid_val):
-            return id2col.get(int(rid_val), (120, 120, 120))
-
-        depths = data["depths"]
+        depths = np.asarray(data["depths"], float)
         lat = np.nan_to_num(np.asarray(data["lateral"]), nan=0.0)
-        rid = data["rid"]
-        counts = np.asarray(data["counts"], float)
-        cmax = float(np.log10(counts.max() + 1)) if counts.size else 1.0
-        cmax = cmax if cmax > 0 else 1.0
-        sizes = (6.0 + 14.0 * (np.log10(counts + 1) / cmax)).tolist()
+        acr = np.asarray(data["acr"], dtype=object)
+        rates = np.asarray(data.get("rates", data["counts"]), float)
+        region_order = data["region_order"]
+        has_rate = bool(data.get("duration"))
+        unit_word = "Hz" if has_rate else "spikes"
+        size_word = "firing rate" if has_rate else "spike count"
 
-        # Panel 1: spatial scatter (lateral vs depth), coloured by region.
+        # One distinct colour per region, used in BOTH panels so a region reads the
+        # same everywhere; "?" (unmapped) stays neutral grey.
+        pal = HistologyTab._REGION_PALETTE
+        region_colors = {a: pal[i % len(pal)] for i, a in enumerate(region_order)}
+        region_colors["?"] = (120, 120, 120)
+
+        # Dot size encodes firing rate, log-scaled so a wide Hz range stays legible.
+        rmax = float(np.nanmax(rates)) if rates.size else 1.0
+        lrmax = float(np.log10(rmax + 1.0)) or 1.0
+
+        def rate_to_size(r):
+            return 6.0 + 16.0 * (np.log10(np.asarray(r, float) + 1.0) / lrmax)
+
+        sizes = rate_to_size(rates)
+
+        # Panel 1: spatial scatter (lateral vs depth), colour = region, size = rate.
         p1 = self.units_plot.addPlot(row=0, col=0)
-        self._style_plot(p1, f"{data['n_units']} units  (size = firing)")
+        self._style_plot(p1, f"{data['n_units']} units   (colour = region, size = {size_word})")
         p1.setLabel("left", "depth (um)")
         p1.setLabel("bottom", "lateral (um)")
         p1.showGrid(x=False, y=True, alpha=0.15)
         jitter = (np.random.default_rng(0).random(len(lat)) - 0.5) * 14.0
-        brushes = [pg.mkBrush(*col(rid[i]), 210) for i in range(len(depths))]
+        brushes = [pg.mkBrush(*region_colors.get(str(acr[i]), (120, 120, 120)), 215)
+                   for i in range(len(depths))]
         p1.addItem(pg.ScatterPlotItem(
-            x=(lat + jitter).tolist(), y=np.asarray(depths).tolist(),
-            size=sizes, brush=brushes, pen=pg.mkPen((40, 40, 40), width=0.4)))
+            x=(lat + jitter).tolist(), y=depths.tolist(),
+            size=sizes.tolist(), brush=brushes, pen=pg.mkPen((40, 40, 40), width=0.4)))
 
-        # Panel 2: units per region (horizontal bars), in anatomical (depth) order.
-        order = data["region_order"]
+        # Legend: region colour key + a firing-rate size scale, in one anchored box.
+        leg = p1.addLegend(offset=(-8, 8), labelTextColor=(40, 40, 40),
+                           brush=pg.mkBrush(255, 255, 255, 215), pen=pg.mkPen(170, 170, 170))
+        for a in region_order:
+            c = region_colors.get(a, (120, 120, 120))
+            swatch = pg.ScatterPlotItem(symbol="o", size=10, brush=pg.mkBrush(*c, 235),
+                                        pen=pg.mkPen((40, 40, 40), width=0.4))
+            leg.addItem(swatch, f"{a}  ({data['regions'][a]['count']})")
+        if rates.size:
+            spacer = pg.ScatterPlotItem(symbol="o", size=0.1, pen=None,
+                                        brush=pg.mkBrush(255, 255, 255, 0))
+            leg.addItem(spacer, f"— {size_word} ({unit_word}) —")
+            refs = np.unique(np.round(np.nanpercentile(rates, [15, 55, 95]), 1))
+            for r in refs:
+                ref = pg.ScatterPlotItem(symbol="o", size=float(rate_to_size(r)),
+                                         brush=pg.mkBrush(135, 135, 135, 230),
+                                         pen=pg.mkPen((40, 40, 40), width=0.4))
+                leg.addItem(ref, f"{r:g} {unit_word}")
+
+        # Panel 2: units per region (horizontal bars), same region colours.
+        order = region_order
         if order:
             p2 = self.units_plot.addPlot(row=0, col=1)
             self._style_plot(p2, "units per region")
             p2.setLabel("bottom", "# units")
             ypos = np.arange(len(order))
             widths = np.array([data["regions"][a]["count"] for a in order], float)
-            rids = [data["regions"][a]["rid"] for a in order]
             p2.addItem(pg.BarGraphItem(
                 x0=np.zeros(len(order)), x1=widths, y=ypos, height=0.7,
-                brushes=[pg.mkBrush(*col(r), 235) for r in rids],
+                brushes=[pg.mkBrush(*region_colors.get(a, (120, 120, 120)), 235) for a in order],
                 pen=pg.mkPen((70, 70, 70), width=0.5)))
             p2.getAxis("left").setTicks([[(i, a) for i, a in enumerate(order)]])
             wmax = float(widths.max()) if widths.size else 1.0

@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+from ..processes import tracked_popen, tracked_run, unregister_process
+
 #: Repo root (so ``-m neuropyguin.histology.ibl_bridge`` resolves in the child).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -51,7 +53,7 @@ def resolve_ibl_python(configured: Optional[str] = None) -> str:
 
 def _has_iblatlas(python_exe: str) -> bool:
     try:
-        r = subprocess.run(
+        r = tracked_run(
             [python_exe, "-c", "import iblatlas"],
             capture_output=True, timeout=60,
         )
@@ -81,17 +83,20 @@ def run_bridge(
     cmd = [python, "-m", "neuropyguin.histology.ibl_bridge", *args]
     if log:
         log(f"$ {' '.join(cmd)}")
-    proc = subprocess.Popen(
+    proc = tracked_popen(
         cmd, cwd=str(_REPO_ROOT), env=_child_env(iblapps_path),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
     lines: List[str] = []
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        lines.append(line.rstrip("\n"))
-        if log:
-            log(line.rstrip("\n"))
-    proc.wait(timeout=timeout)
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.append(line.rstrip("\n"))
+            if log:
+                log(line.rstrip("\n"))
+        proc.wait(timeout=timeout)
+    finally:
+        unregister_process(proc)
     return proc.returncode, "\n".join(lines)
 
 
@@ -141,7 +146,7 @@ def launch_ibl_gui(
         log(f"$ {' '.join(cmd)}")
         if logfile is not None:
             log(f"GUI output -> {logfile}")
-    return subprocess.Popen(
+    return tracked_popen(
         cmd, cwd=str(apps), env=env,
         stdout=out, stderr=(subprocess.STDOUT if out is not None else None), text=True,
     )

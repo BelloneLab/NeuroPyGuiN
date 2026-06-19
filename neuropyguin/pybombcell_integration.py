@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .bombcell_core import sync_phy_cluster_group
+from .processes import tracked_popen
 from .pybombcell_runtime import ensure_pybombcell_on_sys_path
 
 PYBOMBCELL_SETTINGS_SCHEMA: List[tuple[str, object]] = [
@@ -681,7 +682,7 @@ def launch_pybombcell_gui(ks_folder: str | Path) -> Dict[str, object]:
         creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     for cmd in commands:
         try:
-            subprocess.Popen(
+            tracked_popen(
                 cmd,
                 cwd=str(notebook_path.parent),
                 stdout=subprocess.DEVNULL,

@@ -4,7 +4,6 @@ import ast
 import json
 import math
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -29,6 +28,7 @@ from ..preprocessing import (
     infer_completed_run_name,
     split_concatenated_sort,
 )
+from ..processes import tracked_run
 from ..pybombcell_integration import (
     PYBOMBCELL_SETTINGS_SCHEMA,
     launch_pybombcell_gui,
@@ -79,7 +79,7 @@ def _recompute_quality_metrics(ks_folder: str, json_root: str) -> str:
         "--output_json",
         str(out),
     ]
-    proc = subprocess.run(cmd, cwd=str(folder), capture_output=True, text=True, env=ecephys_subprocess_env())
+    proc = tracked_run(cmd, cwd=str(folder), capture_output=True, text=True, env=ecephys_subprocess_env())
     if proc.returncode != 0:
         raise RuntimeError(f"quality_metrics failed: {proc.stdout}\n{proc.stderr}")
     return "Quality metrics recomputed successfully."

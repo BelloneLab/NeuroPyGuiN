@@ -24,11 +24,13 @@ from neuropyguin.preprocessing import (
     has_ni_catgt_extractors,
     infer_completed_run_name,
     is_catgt_processed_bin,
+    is_concatenated_run_bin,
     merge_extractors_into_catgt_command,
     parse_kilosort_params_dat_path,
     parse_catgt_processed_bin_context,
     resolve_labelled_output_context,
     parse_spikeglx_bin_name,
+    strip_ni_catgt_extractor_flags,
     validate_concat_inputs,
 )
 
@@ -179,6 +181,47 @@ def test_catgt_extract_only_stream_string_keeps_ap_when_imec_extractors_are_pres
 def test_has_ni_catgt_extractors_detects_ni_only_rows() -> None:
     assert has_ni_catgt_extractors("-xa=0,0,0,2,0,0 -xd=2,0,-1,6,500")
     assert not has_ni_catgt_extractors("-xd=2,0,-1,6,500")
+
+
+def test_strip_ni_catgt_extractor_flags_drops_ni_keeps_ap() -> None:
+    # Probe-only / concatenated run: NI (js=0) extractors must go, but the
+    # AP-stream sync extractor (js=2) and filtering flags must survive so CatGT
+    # is never asked to read a non-existent nidq stream.
+    cmd = (
+        "-prb_fld -out_prb_fld -apfilter=butter,12,300,10000 -gfix=0.4,0.1,0.02 "
+        "-ni -xd=0,0,8,3,0 -xd=0,0,8,4,0 -xd=0,0,8,0,0 -xd=2,0,384,6,500"
+    )
+    stripped = strip_ni_catgt_extractor_flags(cmd)
+    assert stripped == (
+        "-prb_fld -out_prb_fld -apfilter=butter,12,300,10000 -gfix=0.4,0.1,0.02 "
+        "-xd=2,0,384,6,500"
+    )
+    assert not has_ni_catgt_extractors(stripped)
+    # The stream selector must no longer request -ni.
+    assert "-ni" not in catgt_stream_string(stripped).split()
+    assert catgt_stream_string(stripped) == "-ap"
+
+
+def test_strip_ni_catgt_extractor_flags_drops_labelled_ni_extractors() -> None:
+    cmd = "-prb_fld -xd=0,0,8,3,0[laser] -xd=2,0,384,6,500[sync]"
+    assert strip_ni_catgt_extractor_flags(cmd) == "-prb_fld -xd=2,0,384,6,500[sync]"
+
+
+def test_is_concatenated_run_bin_detects_splitinfo_and_manifest(tmp_path: Path) -> None:
+    imec = tmp_path / "run_g0" / "run_g0_imec0"
+    imec.mkdir(parents=True)
+    bin_file = imec / "run_g0_t0.imec0.ap.bin"
+    bin_file.write_bytes(b"")
+    # Plain probe-only run (no concat markers) is not concatenated.
+    assert not is_concatenated_run_bin(bin_file)
+    # A *.ap.splitinfo.json beside the bin marks a concatenated run.
+    (imec / "run_g0_t0.imec0.ap.splitinfo.json").write_text("{}", encoding="utf-8")
+    assert is_concatenated_run_bin(bin_file)
+    # The concat_manifest.json alone is also sufficient.
+    (imec / "run_g0_t0.imec0.ap.splitinfo.json").unlink()
+    assert not is_concatenated_run_bin(bin_file)
+    (imec / "concat_manifest.json").write_text("{}", encoding="utf-8")
+    assert is_concatenated_run_bin(bin_file)
 
 
 def test_expected_ni_catgt_output_patterns_cover_rise_fall_and_bitfield() -> None:
