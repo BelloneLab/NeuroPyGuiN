@@ -131,6 +131,23 @@ def _shank_split(chn_coords_all: np.ndarray):
     return n_shanks, out
 
 
+def _latest_alignment_key(keys):
+    """Most recent alignment by timestamp.
+
+    Keys are ISO timestamps; our auto proposals carry an ``auto_`` prefix. A plain
+    string sort would rank ``auto_2026...`` after a later manual ``2026...`` upload
+    (``'a' > '2'``), so parse the timestamp and pick the genuinely latest, so a
+    refined GUI alignment always wins over the earlier auto proposal.
+    """
+    def stamp(k):
+        s = k[5:] if k.startswith("auto_") else k
+        try:
+            return datetime.fromisoformat(s)
+        except ValueError:
+            return datetime.min
+    return max(keys, key=lambda k: (stamp(k), k))
+
+
 def _read_alignment(folder: Path, shank_idx: int, n_shanks: int, which: str):
     """Return (feature_prev, track_prev) or (None, None) for the 'original' track."""
     if which == "original":
@@ -143,7 +160,7 @@ def _read_alignment(folder: Path, shank_idx: int, n_shanks: int, which: str):
         aligns = json.load(f)
     if not aligns:
         return None, None
-    key = sorted(aligns.keys())[-1]  # latest timestamp
+    key = _latest_alignment_key(aligns.keys())
     feature = np.array(aligns[key][0])
     track = np.array(aligns[key][1])
     return feature, track

@@ -844,7 +844,11 @@ class HistologyTab(QtWidgets.QWidget):
         b_units.clicked.connect(self._plot_unit_distribution)
         b_prop = QtWidgets.QPushButton("Propose alignment (auto)")
         b_prop.clicked.connect(self._propose_alignment)
-        for b in [b_xyz, b_ch, b_all, b_units, b_prop]:
+        b_final = QtWidgets.QPushButton("Finalize regions (IBL alignment)")
+        b_final.setToolTip("Regenerate channel_locations_shankN.json from the latest "
+                           "alignment you saved in the IBL GUI (per shank).")
+        b_final.clicked.connect(self._finalize_channels)
+        for b in [b_xyz, b_ch, b_all, b_units, b_prop, b_final]:
             btns.addWidget(b)
         btns.addStretch(1)
         v.addLayout(btns)
@@ -1953,6 +1957,20 @@ class HistologyTab(QtWidgets.QWidget):
         self._load_channel_table()
         if self.folder is not None and (self.folder / "clusters.channels.npy").exists():
             self._plot_unit_distribution()  # auto-show the summary when units exist
+
+    def _finalize_channels(self) -> None:
+        """Rebuild per-shank channel regions from the latest IBL GUI alignments."""
+        if self.folder is None:
+            self._log("Load a session folder first.")
+            return
+        prev = sorted(self.folder.glob("prev_alignments*.json"))
+        if not prev:
+            self._log("No saved IBL alignments found. In the IBL GUI, align each shank "
+                      "and press Upload first (writes prev_alignments_shankN.json).")
+            return
+        self._log(f"Finalizing channel regions from {len(prev)} saved alignment file(s) "
+                  "(latest per shank).")
+        self._gen_channels(alignment_override="latest")
 
     def _propose_alignment(self) -> None:
         if self.folder is None:
