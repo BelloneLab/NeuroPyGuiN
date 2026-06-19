@@ -136,8 +136,8 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._plot_theme = "Light"
-        self._wire_cache_key: Optional[Tuple[str, Tuple[int, int, int]]] = None
-        self._wire_cache: List[np.ndarray] = []
+        self._shell_cache_key: Optional[Tuple[str, Tuple[int, int, int]]] = None
+        self._shell_cache: List[np.ndarray] = []
         self._last_atlas: Optional[hatlas.AllenCCFAtlas] = None
         self._last_probes: Optional[List[dict]] = None
 
@@ -194,14 +194,14 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
             return
 
         self.figure.clear()
-        wire_paths = self._brain_wireframe_paths(atlas) if atlas is not None else []
+        shell_polygons = self._brain_shell_polygons(atlas) if atlas is not None else []
         self._draw_scene(
             self.figure,
             atlas,
             self._last_probes,
             self._plot_theme,
             azim=-58.0,
-            wire_paths=wire_paths,
+            shell_polygons=shell_polygons,
         )
         self.canvas.draw_idle()
 
@@ -227,7 +227,7 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         probes = list(probes or [])
         frames = max(int(frames), 2)
         fps = max(int(fps), 1)
-        wire_paths = cls._build_brain_wireframe_paths(atlas) if atlas is not None else []
+        shell_polygons = cls._build_brain_shell_polygons(atlas) if atlas is not None else []
 
         fig = Figure(figsize=(5.6, 5.2), dpi=100)
         fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
@@ -235,7 +235,14 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         images = []
         for azim in np.linspace(-68.0, 292.0, frames, endpoint=False):
             fig.clear()
-            cls._draw_scene(fig, atlas, probes, theme, azim=float(azim), wire_paths=wire_paths)
+            cls._draw_scene(
+                fig,
+                atlas,
+                probes,
+                theme,
+                azim=float(azim),
+                shell_polygons=shell_polygons,
+            )
             canvas.draw()
             rgba = np.asarray(canvas.buffer_rgba()).copy()
             images.append(Image.fromarray(rgba[:, :, :3]))
@@ -259,22 +266,21 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         probes,
         theme: str,
         azim: float,
-        wire_paths: Optional[List[np.ndarray]] = None,
+        shell_polygons: Optional[List[np.ndarray]] = None,
     ) -> None:
-        bg, fg, wire = cls._theme_colors_for(theme)
+        bg, fg, shell = cls._theme_colors_for(theme)
         figure.patch.set_facecolor(bg)
         ax = figure.add_subplot(111, projection="3d")
         ax.set_facecolor(bg)
 
         plotted_anything = False
         if atlas is not None:
-            for path in wire_paths if wire_paths is not None else cls._build_brain_wireframe_paths(atlas):
-                xyz = cls._ccf_to_plot_mm(path)
-                ax.plot(
-                    xyz[:, 0], xyz[:, 1], xyz[:, 2],
-                    color=wire, linewidth=0.35, alpha=0.50,
-                )
-                plotted_anything = True
+            polygons = (
+                shell_polygons
+                if shell_polygons is not None
+                else cls._build_brain_shell_polygons(atlas)
+            )
+            plotted_anything = cls._draw_brain_shell(ax, polygons, shell, theme)
             cls._set_atlas_limits(ax, atlas)
 
         plotted_probe = False
@@ -284,9 +290,35 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                 continue
             xyz = cls._ccf_to_plot_mm(coords)
             color = cls._probe_rgb(i)
+            region_segments = cls._trajectory_region_segments(probe, coords)
+            if region_segments:
+                for seg_start, seg_end, seg_color in region_segments:
+                    seg_xyz = cls._ccf_to_plot_mm(np.vstack([seg_start, seg_end]))
+                    mesh = cls._tube_mesh(seg_xyz[0], seg_xyz[1], radius_mm=0.055)
+                    if mesh is None:
+                        continue
+                    ax.plot_surface(
+                        mesh[0], mesh[1], mesh[2],
+                        color=seg_color,
+                        alpha=0.30,
+                        linewidth=0,
+                        antialiased=False,
+                        shade=False,
+                    )
+            else:
+                mesh = cls._tube_mesh(xyz[0], xyz[-1], radius_mm=0.045)
+                if mesh is not None:
+                    ax.plot_surface(
+                        mesh[0], mesh[1], mesh[2],
+                        color=color,
+                        alpha=0.18,
+                        linewidth=0,
+                        antialiased=False,
+                        shade=False,
+                    )
             ax.plot(
                 xyz[:, 0], xyz[:, 1], xyz[:, 2],
-                color=color, linewidth=2.2, alpha=0.98,
+                color=color, linewidth=1.25, alpha=0.96,
             )
             ax.scatter(
                 xyz[:, 0], xyz[:, 1], xyz[:, 2],
@@ -323,8 +355,8 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
     @staticmethod
     def _theme_colors_for(theme: str) -> Tuple[str, str, str]:
         if str(theme).lower().startswith("dark"):
-            return "#0b0f14", "#d7dde5", "#8b949e"
-        return "#ffffff", "#27313a", "#6f7882"
+            return "#0b0f14", "#d7dde5", "#aebbc8"
+        return "#ffffff", "#27313a", "#d8dee6"
 
     @staticmethod
     def _probe_rgb(index: int) -> Tuple[float, float, float]:
@@ -350,6 +382,182 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         pts = np.asarray(points, dtype=float).reshape(-1, 3)
         rel = (pts - hatlas.BREGMA_CCF[None, :]) * (hatlas.CCF_VOXEL_UM / 1000.0)
         return np.column_stack([rel[:, 2], rel[:, 0], rel[:, 1]])
+
+    @classmethod
+    def _draw_brain_shell(
+        cls,
+        ax,
+        polygons: List[np.ndarray],
+        color: str,
+        theme: str,
+    ) -> bool:
+        if not polygons:
+            return False
+        try:
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        except Exception:
+            return False
+        xyz_polygons = [
+            cls._ccf_to_plot_mm(poly)
+            for poly in polygons
+            if np.asarray(poly).ndim == 2 and np.asarray(poly).shape[0] >= 3
+        ]
+        if not xyz_polygons:
+            return False
+        alpha = 0.14 if str(theme).lower().startswith("dark") else 0.11
+        shell = Poly3DCollection(
+            xyz_polygons,
+            facecolors=color,
+            edgecolors="none",
+            linewidths=0.0,
+            alpha=alpha,
+            zsort="average",
+        )
+        shell.set_antialiased(False)
+        ax.add_collection3d(shell)
+        return True
+
+    @staticmethod
+    def _tube_mesh(
+        start_xyz: np.ndarray,
+        end_xyz: np.ndarray,
+        radius_mm: float,
+        sides: int = 10,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        p0 = np.asarray(start_xyz, dtype=float).reshape(3)
+        p1 = np.asarray(end_xyz, dtype=float).reshape(3)
+        axis = p1 - p0
+        length = float(np.linalg.norm(axis))
+        if not np.isfinite(length) or length < 1e-9:
+            return None
+        direction = axis / length
+        reference = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(direction, reference))) > 0.92:
+            reference = np.array([0.0, 1.0, 0.0])
+        u = np.cross(direction, reference)
+        u_norm = float(np.linalg.norm(u))
+        if not np.isfinite(u_norm) or u_norm < 1e-9:
+            return None
+        u /= u_norm
+        v = np.cross(direction, u)
+        theta = np.linspace(0.0, 2.0 * np.pi, max(int(sides), 6) + 1)
+        circle = radius_mm * (
+            np.cos(theta)[:, None] * u[None, :]
+            + np.sin(theta)[:, None] * v[None, :]
+        )
+        tube = np.stack([p0[None, :] + circle, p1[None, :] + circle], axis=0)
+        return tube[:, :, 0], tube[:, :, 1], tube[:, :, 2]
+
+    @staticmethod
+    def _hex_to_rgb(hex_triplet, fallback: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        h = str(hex_triplet or "").strip().lstrip("#")
+        if len(h) == 5:
+            h = "0" + h
+        try:
+            if len(h) >= 6:
+                return (
+                    int(h[0:2], 16) / 255.0,
+                    int(h[2:4], 16) / 255.0,
+                    int(h[4:6], 16) / 255.0,
+                )
+        except (TypeError, ValueError):
+            pass
+        return fallback
+
+    @staticmethod
+    def _flatten_field(value) -> List:
+        if value is None:
+            return []
+        arr = np.asarray(value, dtype=object)
+        return arr.reshape(-1).tolist()
+
+    @classmethod
+    def _trajectory_area_rows(cls, areas) -> List[dict]:
+        if areas is None:
+            return []
+        rows: List[dict] = []
+        if hasattr(areas, "iloc"):
+            for j in range(len(areas)):
+                row = areas.iloc[j]
+                d0 = row.get("depth_start_um", None)
+                d1 = row.get("depth_end_um", None)
+                if d0 is None or d1 is None:
+                    depth = np.asarray(row.get("trajectory_depth", []), dtype=float).reshape(-1)
+                    if depth.size >= 2:
+                        d0, d1 = depth[:2]
+                rows.append({
+                    "depth_start_um": d0,
+                    "depth_end_um": d1,
+                    "color_hex_triplet": row.get("color_hex_triplet", ""),
+                })
+            return rows
+        if isinstance(areas, dict):
+            colors = cls._flatten_field(areas.get("color_hex_triplet"))
+            if "depth_start_um" in areas and "depth_end_um" in areas:
+                starts = np.asarray(areas.get("depth_start_um"), dtype=float).reshape(-1)
+                ends = np.asarray(areas.get("depth_end_um"), dtype=float).reshape(-1)
+                n = min(len(starts), len(ends))
+                for j in range(n):
+                    rows.append({
+                        "depth_start_um": starts[j],
+                        "depth_end_um": ends[j],
+                        "color_hex_triplet": colors[j] if j < len(colors) else "",
+                    })
+                return rows
+            depth = np.asarray(areas.get("trajectory_depth", np.zeros((0, 2))), dtype=float)
+            if depth.size:
+                depth = depth.reshape(-1, 2)
+                for j, (d0, d1) in enumerate(depth):
+                    rows.append({
+                        "depth_start_um": d0,
+                        "depth_end_um": d1,
+                        "color_hex_triplet": colors[j] if j < len(colors) else "",
+                    })
+        return rows
+
+    @classmethod
+    def _trajectory_region_segments(
+        cls,
+        probe: dict,
+        coords: np.ndarray,
+    ) -> List[Tuple[np.ndarray, np.ndarray, Tuple[float, float, float]]]:
+        rows = cls._trajectory_area_rows(probe.get("trajectory_areas"))
+        if not rows or coords.shape[0] < 2:
+            return []
+        entry = np.asarray(coords[0], dtype=float)
+        exit_ = np.asarray(coords[-1], dtype=float)
+        axis = exit_ - entry
+        length_um = float(np.linalg.norm(axis) * hatlas.CCF_VOXEL_UM)
+        if not np.isfinite(length_um) or length_um <= 0.0:
+            return []
+
+        parsed = []
+        for row in rows:
+            try:
+                d0 = float(row.get("depth_start_um"))
+                d1 = float(row.get("depth_end_um"))
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(d0) and np.isfinite(d1)) or d1 <= d0:
+                continue
+            if d1 - d0 < 12.0:
+                continue
+            parsed.append((d0, d1, row.get("color_hex_triplet", "")))
+        if not parsed:
+            return []
+
+        depth_max = max(float(max(d1 for _, d1, _ in parsed)), 1.0)
+        fallback = (0.55, 0.60, 0.66)
+        segments: List[Tuple[np.ndarray, np.ndarray, Tuple[float, float, float]]] = []
+        for d0, d1, hex_color in parsed:
+            f0 = float(np.clip(d0 / depth_max, 0.0, 1.0))
+            f1 = float(np.clip(d1 / depth_max, 0.0, 1.0))
+            if f1 <= f0:
+                continue
+            p0 = entry + axis * f0
+            p1 = entry + axis * f1
+            segments.append((p0, p1, cls._hex_to_rgb(hex_color, fallback)))
+        return segments
 
     @staticmethod
     def _boundary_mask(mask: np.ndarray) -> np.ndarray:
@@ -404,42 +612,42 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
             lines.append((y, x))
         return lines
 
-    def _brain_wireframe_paths(self, atlas: hatlas.AllenCCFAtlas) -> List[np.ndarray]:
+    def _brain_shell_polygons(self, atlas: hatlas.AllenCCFAtlas) -> List[np.ndarray]:
         key = (str(atlas.atlas_path), tuple(atlas.shape))
-        if self._wire_cache_key == key:
-            return self._wire_cache
-        self._wire_cache_key = key
-        self._wire_cache = self._build_brain_wireframe_paths(atlas)
-        return self._wire_cache
+        if self._shell_cache_key == key:
+            return self._shell_cache
+        self._shell_cache_key = key
+        self._shell_cache = self._build_brain_shell_polygons(atlas)
+        return self._shell_cache
 
     @classmethod
-    def _build_brain_wireframe_paths(cls, atlas: hatlas.AllenCCFAtlas) -> List[np.ndarray]:
+    def _build_brain_shell_polygons(cls, atlas: hatlas.AllenCCFAtlas) -> List[np.ndarray]:
         av = atlas.av
         ap_n, dv_n, ml_n = atlas.shape
-        paths: List[np.ndarray] = []
+        polygons: List[np.ndarray] = []
 
-        for ap_i in np.unique(np.linspace(0, ap_n - 1, 18, dtype=int)):
+        for ap_i in np.unique(np.linspace(0, ap_n - 1, 7, dtype=int)):
             mask = np.asarray(av[ap_i, :, :]) > 1
-            for y, x in cls._contour_lines(mask):
-                paths.append(np.column_stack([
+            for y, x in cls._contour_lines(mask, max_points=96):
+                polygons.append(np.column_stack([
                     np.full(y.shape, ap_i + 1.0), y + 1.0, x + 1.0,
                 ]))
 
-        for ml_i in np.unique(np.linspace(0, ml_n - 1, 12, dtype=int)):
+        for ml_i in np.unique(np.linspace(0, ml_n - 1, 5, dtype=int)):
             mask = np.asarray(av[:, :, ml_i]) > 1
-            for y, x in cls._contour_lines(mask):
-                paths.append(np.column_stack([
+            for y, x in cls._contour_lines(mask, max_points=96):
+                polygons.append(np.column_stack([
                     y + 1.0, x + 1.0, np.full(y.shape, ml_i + 1.0),
                 ]))
 
-        for dv_i in np.unique(np.linspace(0, dv_n - 1, 7, dtype=int)):
+        for dv_i in np.unique(np.linspace(0, dv_n - 1, 3, dtype=int)):
             mask = np.asarray(av[:, dv_i, :]) > 1
-            for y, x in cls._contour_lines(mask, max_points=140):
-                paths.append(np.column_stack([
+            for y, x in cls._contour_lines(mask, max_points=84):
+                polygons.append(np.column_stack([
                     y + 1.0, np.full(y.shape, dv_i + 1.0), x + 1.0,
                 ]))
 
-        return [np.asarray(path, dtype=float) for path in paths if len(path) >= 2]
+        return [np.asarray(poly, dtype=float) for poly in polygons if len(poly) >= 3]
 
     @classmethod
     def _set_atlas_limits(cls, ax, atlas: hatlas.AllenCCFAtlas) -> None:
@@ -1855,11 +2063,17 @@ class HistologyTab(QtWidgets.QWidget):
     def _copy_probe_geometry_for_gif(probes) -> List[dict]:
         copied = []
         for probe in probes or []:
+            areas = probe.get("trajectory_areas")
+            if hasattr(areas, "copy"):
+                areas = areas.copy()
+            elif isinstance(areas, dict):
+                areas = dict(areas)
             copied.append({
                 "trajectory_coords": np.asarray(
                     probe.get("trajectory_coords", np.zeros((0, 3))), dtype=float
                 ).copy(),
                 "points": np.asarray(probe.get("points", np.zeros((0, 3))), dtype=float).copy(),
+                "trajectory_areas": areas,
             })
         return copied
 

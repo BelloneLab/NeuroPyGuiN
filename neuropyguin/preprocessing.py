@@ -89,6 +89,25 @@ def _is_ni_catgt_extractor_flag(token: str) -> bool:
     return bool(values) and values[0] == "0"
 
 
+def strip_ni_catgt_extractor_flags(catgt_command: str) -> str:
+    """Drop NI-stream (``js=0``) extractor flags and any bare ``-ni`` selector.
+
+    Used when a run has no nidq stream so CatGT is never asked to read a
+    non-existent NI file. CatGT aborts immediately (``Meta file not found
+    ...nidq.meta``) if an ``-ni`` extractor is requested but the stream does
+    not exist, so probe-only / concatenated runs must have these removed.
+    Extractors on other streams (AP ``js=2``, OneBox ``js=1``) are preserved.
+    """
+    kept: List[str] = []
+    for token in _split_catgt_flags(catgt_command):
+        if token.lower() == "-ni":
+            continue
+        if _is_ni_catgt_extractor_flag(token):
+            continue
+        kept.append(token)
+    return " ".join(kept)
+
+
 def _catgt_extractor_streams(catgt_command: str) -> List[str]:
     streams: List[str] = []
     stream_map = {"0": "ni", "1": "obx", "2": "ap"}

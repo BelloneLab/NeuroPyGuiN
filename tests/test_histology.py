@@ -113,6 +113,39 @@ def test_probe_ccf_csv_schema(tmp_path):
     assert df.iloc[0]["acronym"] == "VTA"
 
 
+def test_trajectory_3d_region_segments_follow_depth_table():
+    from neuropyguin.tabs.histology_tab import Trajectory3DCanvas
+
+    coords = np.array([[540.0, 100.0, 570.0], [540.0, 300.0, 570.0]])
+    ta = pd.DataFrame({
+        "color_hex_triplet": ["ff0000", "00ff00"],
+        "depth_start_um": [0.0, 1000.0],
+        "depth_end_um": [1000.0, 2000.0],
+    })
+    segments = Trajectory3DCanvas._trajectory_region_segments(
+        {"trajectory_areas": ta},
+        coords,
+    )
+    assert len(segments) == 2
+    assert np.allclose(segments[0][0], coords[0])
+    assert np.allclose(segments[0][1], [540.0, 200.0, 570.0])
+    assert np.allclose(segments[1][1], coords[1])
+    assert segments[0][2] == (1.0, 0.0, 0.0)
+
+
+def test_trajectory_3d_tube_mesh_shape():
+    from neuropyguin.tabs.histology_tab import Trajectory3DCanvas
+
+    mesh = Trajectory3DCanvas._tube_mesh(
+        np.array([0.0, 0.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+        radius_mm=0.05,
+    )
+    assert mesh is not None
+    assert mesh[0].shape == (2, 11)
+    assert all(part.shape == mesh[0].shape for part in mesh)
+
+
 # ---------------------------------------------------------------- atlas
 @pytest.mark.skipif(not ATLAS_OK, reason="Allen CCF atlas files not present")
 def test_coronal_slice_is_constant_ap():

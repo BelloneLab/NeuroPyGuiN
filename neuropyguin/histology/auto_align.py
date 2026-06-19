@@ -104,7 +104,7 @@ def _shank_groups(chn_all: np.ndarray):
 # main entry
 # --------------------------------------------------------------------------- #
 def propose_alignment(hist_folder, atlas_path=None, brain_atlas=None,
-                      offset_grid_um=None, write=True) -> dict:
+                      offset_grid_um=None, write=True, rigid=True) -> dict:
     """Compute a per-shank alignment proposal; optionally write GUI/report files."""
     from iblatlas.atlas import AllenAtlas
     from ibllib.pipes.ephys_alignment import EphysAlignment
@@ -171,9 +171,28 @@ def propose_alignment(hist_folder, atlas_path=None, brain_atlas=None,
             "xyz_pick_name": picks[0].name,
         })
 
+    # Rigid-probe constraint: a multi-shank probe is one rigid body inserted at a
+    # single angle with coplanar tips, so the depth offset is shared across shanks.
+    # Propagate the confidence-weighted offset of the confident shank(s) to the
+    # low-confidence ones (whose own ephys can't pin the depth) instead of leaving
+    # them unshifted.
+    confident = [s for s in shanks if s["good"]]
+    shared = None
+    if rigid and confident and len(shanks) > 1:
+        w = np.array([s["confidence"] for s in confident], float)
+        shared = float(np.average([s["offset_um"] for s in confident], weights=w))
+    for s in shanks:
+        if s["good"]:
+            s["applied_offset_um"], s["source"] = s["offset_um"], "own"
+        elif shared is not None:
+            s["applied_offset_um"], s["source"] = shared, "shared (rigid probe)"
+        else:
+            s["applied_offset_um"], s["source"] = 0.0, "none (kept original)"
+
     summary = {
         "n_recorded_shanks": n_shanks, "n_xyz_picks": n_xyz,
         "pairing_ok": (n_shanks == n_xyz), "shanks": shanks,
+        "shared_offset_um": shared,
     }
     if write:
         _write_proposals(hist_folder, shanks)
@@ -185,10 +204,9 @@ def propose_alignment(hist_folder, atlas_path=None, brain_atlas=None,
 def _write_proposals(hist_folder: Path, shanks: List[dict]) -> None:
     """Write an ``auto_`` prev_alignments entry the IBL GUI lists, for every shank.
 
-    Confident shanks get the proposed offset; low-confidence shanks get an identity
-    (no-shift) entry so the option is still visible in the GUI drop-down but does
-    not move anything (a low-confidence offset is just noise in a flat correlation
-    landscape, and the histology track is the better estimate there).
+    Each shank uses its applied offset: its own value when confident, the shared
+    rigid-probe offset when not (and 0 if nothing is confident). The entry is always
+    written so the option is visible in the GUI drop-down for every shank.
     """
     key = "auto_" + datetime.datetime.now().replace(microsecond=0).isoformat()
     multi = len(shanks) > 1
@@ -201,8 +219,11 @@ def _write_proposals(hist_folder: Path, shanks: List[dict]) -> None:
                 data = json.loads(fp.read_text())
             except (OSError, ValueError):
                 data = {}
-        off = s["offset_um"] if s["good"] else 0.0
-        feature = np.asarray(s["feature"], float)
+        off = float(s.get("applied_offset_um", s["offset_um"] if s["good"] else 0.0))
+        f2 = np.asarray(s["feature"], float)
+        # 3 collinear points (same offset) so the GUI has an interior reference line
+        # to draw; a bare 2-point alignment can crash its rendering on reload.
+        feature = np.array([f2[0], 0.5 * (f2[0] + f2[-1]), f2[-1]])
         data[key] = [feature.tolist(), (feature + off * 1e-6).tolist()]
         fp.write_text(json.dumps(data, indent=2))
 
@@ -246,15 +267,19 @@ def _write_report(hist_folder: Path, summary: dict) -> Path:
             f"{summary['n_xyz_picks']} xyz_picks track(s). The recorded shanks may be "
             "paired with the wrong traced tracks. Verify the per-shank regions look "
             "anatomically right before trusting any alignment.", ""]
-    lines += ["| shank | offset (um) | confidence | verdict | units | depth (um) | regions |",
+    if summary.get("shared_offset_um") is not None:
+        lines += [
+            f"Rigid-probe constraint applied: shared offset "
+            f"**{summary['shared_offset_um']:+.0f} um** from the confident shank(s) is "
+            "used for the low-confidence shanks (the probe is one rigid body, coplanar "
+            "tips, single insertion angle).", ""]
+    lines += ["| shank | applied offset (um) | source | confidence | units | depth (um) | regions |",
               "|---|---|---|---|---|---|---|"]
     for s in summary["shanks"]:
-        verdict = f"auto offset {s['offset_um']:+.0f} um (review & accept)" if s["good"] \
-            else "auto = no shift (low confidence; trust histology)"
         regs = ", ".join(s["regions"][:10])
         lines.append(
-            f"| {s['shank']} | {s['offset_um']:+.0f} | "
-            f"{s['confidence']:.2f} (peak {s['peak_corr']:.2f}) | {verdict} | "
+            f"| {s['shank']} | {s.get('applied_offset_um', 0):+.0f} | {s.get('source', '')} | "
+            f"{s['confidence']:.2f} (peak {s['peak_corr']:.2f}, raw {s['offset_um']:+.0f}) | "
             f"{s['n_clusters']} | {s['depth_um'][0]:.0f}-{s['depth_um'][1]:.0f} | {regs} |")
     lines += ["",
               "## How to apply",

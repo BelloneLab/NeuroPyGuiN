@@ -843,6 +843,31 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         extra = "" if len(fresh_txt) <= 4 else f" (+{len(fresh_txt) - 4} more)"
         _safe_emit(self.signals.log, f"[{self.job['name']}] Extract-only CatGT outputs: {preview}{extra}")
 
+    def _run_has_ni_stream(self, bin_file: Path) -> bool:
+        """Return True if a SpikeGLX nidq stream exists for this run.
+
+        Looks beside the raw probe data for any ``*.nidq.meta``/``*.nidq.bin``.
+        With ``-prb_fld`` layout the AP bin lives in ``<run>_gN/<run>_gN_imecK/``
+        and the nidq files sit in the gate folder ``<run>_gN/`` (or, for
+        ``-no_run_fld`` layouts, the session ``-dir``). Probe-only and
+        concatenated runs have no nidq stream and return False.
+        """
+        probe_dir = bin_file.parent          # <run>_gN_imecK (or gate folder if flat)
+        gate_dir = probe_dir.parent          # <run>_gN
+        session_dir = gate_dir.parent        # CatGT -dir
+        seen: set = set()
+        for candidate in (probe_dir, gate_dir, session_dir):
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+            if not candidate or resolved in seen or not candidate.is_dir():
+                continue
+            seen.add(resolved)
+            if any(candidate.glob("*.nidq.meta")) or any(candidate.glob("*.nidq.bin")):
+                return True
+        return False
+
     def _verify_ni_extractor_outputs(
         self,
         *,
@@ -934,6 +959,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 parse_catgt_processed_bin_context,
                 resolve_labelled_output_context,
                 parse_spikeglx_bin_name,
+                strip_ni_catgt_extractor_flags,
                 validate_spikeglx_ap_bin,
             )
         except Exception as exc:
@@ -987,6 +1013,28 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     self.signals.log,
                     f"[{self.job['name']}] Merged extractor field into CatGT command: {effective_catgt_cmd}",
                 )
+
+            # Probe-only / concatenated runs have no nidq stream. Asking CatGT for the
+            # NI stream (-ni) or NI-stream extractors (js=0) makes it abort instantly with
+            # "Meta file not found ...nidq.meta". Detect the absence and drop NI extraction
+            # gracefully, keeping AP-stream extractors (e.g. the imec sync on word 384).
+            effective_ni_extract_string = self.cfg.ni_extract_string
+            if (
+                (run_catgt_effective or run_catgt_extract_only)
+                and not catgt_processed_input
+                and has_ni_catgt_extractors(effective_catgt_cmd)
+                and not self._run_has_ni_stream(bin_file)
+            ):
+                dropped_ni = expected_ni_catgt_output_patterns(effective_catgt_cmd, run_name, gate_string)
+                effective_catgt_cmd = strip_ni_catgt_extractor_flags(effective_catgt_cmd)
+                effective_ni_extract_string = ""
+                dropped_preview = ", ".join(Path(p).name for p in dropped_ni) if dropped_ni else "NI digital extractors"
+                _safe_emit(
+                    self.signals.log,
+                    f"[{self.job['name']}] No nidq stream found for this run; skipping NI extraction "
+                    f"({dropped_preview}). Keeping AP-stream extractors only.",
+                )
+
             full_catgt_stream = catgt_stream_string(effective_catgt_cmd)
             extract_only_catgt_cmd = catgt_extract_command_string(
                 effective_catgt_cmd,
@@ -994,7 +1042,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             )
             extract_only_stream = catgt_extract_stream_selection(
                 effective_catgt_cmd,
-                self.cfg.ni_extract_string,
+                effective_ni_extract_string,
                 save_ap_bin=False,
             )
             extract_only_save_ap_cmd = catgt_extract_command_string(
@@ -1003,7 +1051,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             )
             extract_only_save_ap_stream = catgt_extract_stream_selection(
                 effective_catgt_cmd,
-                self.cfg.ni_extract_string,
+                effective_ni_extract_string,
                 save_ap_bin=self.cfg.save_catgt_ap_bin,
             )
             if has_ni_catgt_extractors(effective_catgt_cmd):
