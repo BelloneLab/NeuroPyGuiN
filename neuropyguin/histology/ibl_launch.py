@@ -128,6 +128,13 @@ def launch_ibl_gui(
     except OSError:
         out, logfile = None, None  # fall back to inheriting the parent's streams
 
+    # The IBL GUI is a PyQt5 app, but this process inherits PYQTGRAPH_QT_LIB from
+    # NeuroPyGuiN (PySide6). pyqtgraph would then mix PySide6 with the GUI's PyQt5
+    # enums and crash (QPen.setStyle TypeError). Force the child to PyQt5.
+    env = _child_env(str(apps))
+    env["PYQTGRAPH_QT_LIB"] = "PyQt5"
+    env["QT_API"] = "pyqt5"
+
     if log:
         target = f"auto-loading {hist_folder.name}" if auto_load else f"select folder: {hist_folder}"
         log(f"Launching IBL alignment GUI ({target}).")
@@ -135,6 +142,6 @@ def launch_ibl_gui(
         if logfile is not None:
             log(f"GUI output -> {logfile}")
     return subprocess.Popen(
-        cmd, cwd=str(apps), env=_child_env(str(apps)),
+        cmd, cwd=str(apps), env=env,
         stdout=out, stderr=(subprocess.STDOUT if out is not None else None), text=True,
     )

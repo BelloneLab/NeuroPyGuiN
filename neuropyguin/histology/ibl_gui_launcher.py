@@ -16,9 +16,16 @@ Run as::
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
+
+# The IBL GUI is PyQt5; make pyqtgraph use PyQt5 here so it does not pick up an
+# inherited PYQTGRAPH_QT_LIB=PySide6 and crash mixing bindings. Must run before
+# pyqtgraph is imported (it is imported lazily inside main()).
+os.environ["PYQTGRAPH_QT_LIB"] = "PyQt5"
+os.environ.setdefault("QT_API", "pyqt5")
 
 
 def _auto_load(win, folder: Path) -> None:
