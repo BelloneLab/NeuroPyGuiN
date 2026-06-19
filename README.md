@@ -12,7 +12,7 @@
 ![Curation](https://img.shields.io/badge/Curation-Bombcell%20%2B%20phy-8a2be2)
 ![Histology](https://img.shields.io/badge/Histology-Allen%20CCF%20%2B%20IBL-e91e63)
 
-*From raw `.bin` to "this neuron lives in the VTA", without typing a single flag.*
+
 
 </div>
 
