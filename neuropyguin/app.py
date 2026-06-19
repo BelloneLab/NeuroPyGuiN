@@ -244,6 +244,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 
         self.pre_tab.openCurationRequested.connect(self._open_curation)
         self.pre_tab.openPostProcessingRequested.connect(self._open_postprocessing)
+        self.pre_tab.openHistologyRequested.connect(self._open_histology)
         self.pre_tab.saveSettingsFileRequested.connect(self._export_settings_file)
         self.pre_tab.loadSettingsFileRequested.connect(self._load_settings_file)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -450,6 +451,10 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
     def _open_postprocessing(self, folder: str) -> None:
         self.post_tab.open_ks_folder(folder)
         self.tabs.setCurrentWidget(self.post_tab)
+
+    def _open_histology(self, ks_folder: str) -> None:
+        self.tabs.setCurrentWidget(self.hist_tab)
+        self.hist_tab.setup_from_ks_folder(ks_folder)
 
     def _restore_plot_preferences(self) -> None:
         theme = str(self.settings.value("plot/theme", "Light"))

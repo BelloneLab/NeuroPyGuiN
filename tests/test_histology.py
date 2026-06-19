@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from neuropyguin.histology import alignment, io_formats, tracing
+from neuropyguin.histology import alignment, io_formats, tracing, slice_prep
 from neuropyguin.histology import atlas as hatlas
 
 
@@ -75,6 +75,30 @@ def test_tform_io_roundtrip(tmp_path):
     io_formats.save_tforms(fn, tforms)
     out = io_formats.load_tforms(fn)
     assert np.allclose(out[1][2, :2], [5, 7])
+
+
+def test_load_image_reports_missing_imagecodecs(monkeypatch, tmp_path):
+    class BrokenTiffFile:
+        @staticmethod
+        def imread(_path):
+            raise ValueError("<COMPRESSION.LZW: 5> requires the 'imagecodecs' package")
+
+    def broken_pillow(_path):
+        raise OSError("cannot decode")
+
+    monkeypatch.setattr(slice_prep, "_HAS_TIFFFILE", True)
+    monkeypatch.setattr(slice_prep, "tifffile", BrokenTiffFile)
+    monkeypatch.setattr(slice_prep, "_read_tiff_with_pillow", broken_pillow)
+
+    path = tmp_path / "lzw_slice.tif"
+    path.write_bytes(b"")
+    with pytest.raises(RuntimeError) as excinfo:
+        slice_prep.load_image(path)
+
+    msg = str(excinfo.value)
+    assert "lzw_slice.tif" in msg
+    assert "imagecodecs" in msg
+    assert "python -m pip install imagecodecs" in msg
 
 
 def test_probe_ccf_csv_schema(tmp_path):

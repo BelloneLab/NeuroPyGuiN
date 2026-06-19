@@ -34,6 +34,7 @@ dependencies:
       # --- Histology tab: native AP_histology workflow (slice prep, matching,
       #     alignment, probe tracing, MAT/CSV export) ---
       - tifffile
+      - imagecodecs
       - opencv-python-headless
       # --- Histology channel map + optional IBL ephys-alignment GUI ---
       #     numpy<2 first so pip keeps ibllib on a Kilosort-compatible numpy.

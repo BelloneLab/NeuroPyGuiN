@@ -25,6 +25,7 @@ try:
     import tifffile
     _HAS_TIFFFILE = True
 except Exception:  # pragma: no cover
+    tifffile = None
     _HAS_TIFFFILE = False
 
 from PIL import Image
@@ -50,23 +51,47 @@ def _natsort(paths: Sequence[Path]) -> List[Path]:
     return sorted(paths, key=key)
 
 
+def _read_tiff_with_pillow(path: Path) -> np.ndarray:
+    """Read a TIFF through Pillow, including multi-frame stacks."""
+    im = Image.open(str(path))
+    frames = []
+    try:
+        i = 0
+        while True:
+            im.seek(i)
+            frames.append(np.array(im))
+            i += 1
+    except EOFError:
+        pass
+    return frames[0] if len(frames) == 1 else np.stack(frames, axis=-1)
+
+
+def _missing_imagecodecs_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "imagecodecs" in msg or ("compression" in msg and "requires" in msg)
+
+
 def load_image(path: str | Path) -> np.ndarray:
     """Load a TIFF as an array. RGB -> (H, W, 3); multi-channel -> (H, W, C)."""
     path = Path(path)
     if _HAS_TIFFFILE:
-        arr = tifffile.imread(str(path))
-    else:  # PIL fallback (handles RGB and multi-frame)
-        im = Image.open(str(path))
-        frames = []
         try:
-            i = 0
-            while True:
-                im.seek(i)
-                frames.append(np.array(im))
-                i += 1
-        except EOFError:
-            pass
-        arr = frames[0] if len(frames) == 1 else np.stack(frames, axis=-1)
+            arr = tifffile.imread(str(path))
+        except ValueError as exc:
+            if not _missing_imagecodecs_error(exc):
+                raise
+            try:
+                arr = _read_tiff_with_pillow(path)
+            except Exception as pil_exc:
+                raise RuntimeError(
+                    f"Could not decode TIFF '{path.name}': {exc}. "
+                    "Install imagecodecs in this environment with "
+                    "'python -m pip install imagecodecs' or "
+                    "'conda install -c conda-forge imagecodecs'. "
+                    f"Pillow fallback also failed: {pil_exc}"
+                ) from exc
+    else:  # PIL fallback (handles RGB and multi-frame)
+        arr = _read_tiff_with_pillow(path)
     arr = np.asarray(arr)
     # Normalise channel axis to last for multi-channel stacks like (C, H, W).
     if arr.ndim == 3 and arr.shape[0] <= 4 and arr.shape[0] < arr.shape[-1]:

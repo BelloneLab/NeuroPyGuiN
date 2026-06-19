@@ -4,6 +4,7 @@
 # probe tracing, CSV/MAT export) needs only lightweight imaging packages:
 h5py
 tifffile
+imagecodecs
 opencv-python-headless
 Pillow
 # (numpy, scipy, pandas, matplotlib, pyqtgraph, PySide6 come from requirements.txt)

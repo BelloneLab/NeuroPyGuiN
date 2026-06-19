@@ -457,6 +457,7 @@ class ConcatenateDialog(QtWidgets.QDialog):
 class PreprocessingTab(QtWidgets.QWidget):
     openCurationRequested = QtCore.Signal(list)
     openPostProcessingRequested = QtCore.Signal(str)
+    openHistologyRequested = QtCore.Signal(str)
     saveSettingsFileRequested = QtCore.Signal()
     loadSettingsFileRequested = QtCore.Signal()
     _OK_ICON = Path(__file__).resolve().parents[1] / "assets" / "ok-icon.png"
@@ -1061,9 +1062,16 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_scan_completed_root.setProperty("role", "ghost")
         self.btn_to_curation = QtWidgets.QPushButton("To Curation")
         self.btn_to_curation.setProperty("role", "secondary")
+        self.btn_to_histology = QtWidgets.QPushButton("To Histology")
+        self.btn_to_histology.setProperty("role", "secondary")
+        self.btn_to_histology.setToolTip(
+            "Set up a histology session from the selected sorted run "
+            "(auto-fills the Kilosort, ephys, and histology folders)."
+        )
         done_row.addWidget(self.btn_scan_completed_root, 0)
         done_row.addStretch(1)
         done_row.addWidget(self.btn_to_curation)
+        done_row.addWidget(self.btn_to_histology)
         done_layout.addLayout(done_row)
 
         log_box = QtWidgets.QGroupBox("Pipeline log")
@@ -1253,6 +1261,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_build_bitfield.clicked.connect(self._open_bitfield_builder)
         self.btn_build_tprime.clicked.connect(self._open_tprime_builder)
         self.btn_to_curation.clicked.connect(self._open_selected_curation)
+        self.btn_to_histology.clicked.connect(self._open_selected_histology)
         self.btn_adv_ks4.clicked.connect(self._open_ks4_advanced)
         self.btn_save_settings_file.clicked.connect(self.saveSettingsFileRequested.emit)
         self.btn_load_settings_file.clicked.connect(self.loadSettingsFileRequested.emit)
@@ -2049,12 +2058,18 @@ class PreprocessingTab(QtWidgets.QWidget):
         if folder:
             self.openPostProcessingRequested.emit(folder)
 
+    def _open_completed_in_histology(self, entry: Dict[str, object]) -> None:
+        folder = str(entry.get("ks_folder") or "")
+        if folder:
+            self.openHistologyRequested.emit(folder)
+
     def _show_completed_entry_menu(self, entry: Dict[str, object], global_pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
         act_open_folder = menu.addAction("Open Folder in Explorer")
         act_view_params = menu.addAction("View Run Parameters")
         act_requeue = menu.addAction("Re-run with New Parameters")
         act_post = menu.addAction("Load in Post-Processing")
+        act_hist = menu.addAction("Set up Histology")
         action = menu.exec(global_pos)
         if action is act_open_folder:
             self._open_completed_folder(entry)
@@ -2064,6 +2079,8 @@ class PreprocessingTab(QtWidgets.QWidget):
             self._requeue_completed_entry(entry)
         elif action is act_post:
             self._open_completed_in_postprocessing(entry)
+        elif action is act_hist:
+            self._open_completed_in_histology(entry)
 
     def _scan_raw_root(self) -> None:
         start = str(
@@ -2538,6 +2555,17 @@ class PreprocessingTab(QtWidgets.QWidget):
         folders = completed_run_target_folders(entries)
         if folders:
             self.openCurationRequested.emit(folders)
+
+    def _open_selected_histology(self, item: QtWidgets.QListWidgetItem | None = None) -> None:
+        entries = self._selected_completed_entries(item)
+        if not entries:
+            self._append_log("Select a completed run to set up histology.")
+            return
+        if len(entries) > 1:
+            self._append_log("Histology is per probe; using the first selected run.")
+        folder = str(entries[0].get("ks_folder") or "")
+        if folder:
+            self.openHistologyRequested.emit(folder)
 
     def clear_completed_history(self) -> None:
         self.completed_runs.clear()

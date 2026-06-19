@@ -164,7 +164,7 @@ Core Python packages live in [`requirements.txt`](./requirements.txt): `PySide6`
 `joblib`, `h5py`, `seaborn`, `cachecache`, `upsetplot`, `pyarrow`, `ipython`,
 `cmcrameri`, `pillow`. Histology extras live in
 [`requirements-histology.txt`](./requirements-histology.txt): `tifffile`,
-`opencv-python-headless`, and (for the channel map + IBL GUI) `ibllib`,
+`imagecodecs`, `opencv-python-headless`, and (for the channel map + IBL GUI) `ibllib`,
 `iblatlas`, `SimpleITK`. The bundled `environment.yml` targets Python 3.10 and is
 the recommended path for rebuilding or packaging the app.
 

@@ -548,6 +548,60 @@ class HistologyTab(QtWidgets.QWidget):
         self.ed_folder.setText(str(folder))
         self._load_session()
 
+    @staticmethod
+    def _derive_histology_folder(ks_folder: Path) -> Path:
+        """Session histology folder for a Kilosort output path.
+
+        Mirrors the lab layout ``<session>/spike_sorting/.../imecN_ks4``: the
+        histology folder lives at ``<session>/histology``. Falls back to a
+        ``histology`` folder next to the ephys/imec folder.
+        """
+        for parent in ks_folder.parents:
+            if parent.name.lower() == "spike_sorting":
+                return parent.parent / "histology"
+        return ks_folder.parent / "histology"
+
+    @staticmethod
+    def _find_ephys_folder(ks_folder: Path) -> Path:
+        """Folder holding the raw ephys (``*.ap.bin``/``*.ap.meta``) for this run."""
+        for cand in (ks_folder, ks_folder.parent, ks_folder.parent.parent):
+            if any(cand.glob("*.ap.bin")) or any(cand.glob("*.ap.meta")):
+                return cand
+        return ks_folder.parent
+
+    def setup_from_ks_folder(self, ks_folder: str) -> None:
+        """Auto-configure a histology session from a completed spike-sorting run.
+
+        Fills the Kilosort, ephys and histology folders (creating the histology
+        folder if needed) and loads the session, so the user only needs to point
+        at their raw histology images and proceed.
+        """
+        ks = Path(str(ks_folder))
+        if not ks.exists():
+            self._log(f"Kilosort folder not found: {ks}")
+            return
+        hist = self._derive_histology_folder(ks)
+        ephys = self._find_ephys_folder(ks)
+        hist.mkdir(parents=True, exist_ok=True)
+
+        self.ed_ks.setText(str(ks))
+        self.ed_ephys.setText(str(ephys))
+        self.ed_folder.setText(str(hist))
+        if not self.ed_atlas.text().strip():
+            self.ed_atlas.setText(hatlas.DEFAULT_ATLAS_PATH)
+        if not self.ed_iblapps.text().strip():
+            self.ed_iblapps.setText(ibl_launch.DEFAULT_IBLAPPS_PATH)
+        self._persist_settings()
+
+        self._log("Histology session set up from sorted run:")
+        self._log(f"  Kilosort: {ks}")
+        self._log(f"  Ephys:    {ephys}")
+        self._log(f"  Histology: {hist}")
+        self._load_session()
+        self.nav.setCurrentIndex(0)
+        if not self.ed_raw.text().strip():
+            self._log("Next: point 'Raw images' at your histology scans, then Preprocess.")
+
     def _load_session(self) -> None:
         text = self.ed_folder.text().strip()
         if not text:
@@ -555,8 +609,15 @@ class HistologyTab(QtWidgets.QWidget):
         self.folder = Path(text)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.settings.setValue("histology/last_folder", text)
+        self.slice_images = []
+        self.histology_ccf = []
+        self.tforms = []
         # Load any slice images already saved.
-        self.slice_images = [slice_prep.load_image(p) for p in slice_prep.list_tiffs(self.folder)]
+        for p in slice_prep.list_tiffs(self.folder):
+            try:
+                self.slice_images.append(slice_prep.load_image(p))
+            except Exception as exc:
+                self._log(f"Could not load slice image {p.name}: {exc}")
         # Existing products.
         hccf = self.folder / "histology_ccf.mat"
         if hccf.exists():
