@@ -1,0 +1,26 @@
+# Extra dependencies for the Histology (probe localization) tab.
+#
+# The native AP_histology workflow (slice prep, atlas matching, alignment,
+# probe tracing, CSV/MAT export) needs only lightweight imaging packages:
+h5py
+tifffile
+opencv-python-headless
+Pillow
+# (numpy, scipy, pandas, matplotlib, pyqtgraph, PySide6 come from requirements.txt)
+
+# ---------------------------------------------------------------------------
+# The channel-region map and the optional IBL ephys-alignment GUI need the IBL
+# stack. On a Python 3.9 env that also runs Kilosort 4 (numpy < 2), install
+# with numpy pinned so kilosort keeps working:
+#
+#     pip install -c <(echo "numpy<2") ibllib iblatlas SimpleITK
+#
+# This resolves to ibllib 2.39.1 / iblatlas 0.5.4 / PyQt5, all numpy<2 compatible.
+# Then put the IBL apps repo on the path (a .pth in site-packages or PYTHONPATH):
+#
+#     D:\int-brain-lab\iblapps
+#
+# ibllib            # ephys alignment, ALF extraction
+# iblatlas          # CCF <-> bregma transforms, region lookup
+# SimpleITK         # required by the IBL GUI histology loader
+# PyQt5             # the IBL GUI's Qt binding (separate process from PySide6)

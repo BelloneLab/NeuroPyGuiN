@@ -5,7 +5,8 @@ channels:
 dependencies:
   - python=3.10
   - pip
-  - numpy
+  # numpy is pinned < 2 so Kilosort 4 and the IBL stack live happily in one env.
+  - numpy<2
   - pandas
   - scipy
   - matplotlib
@@ -30,3 +31,16 @@ dependencies:
       - PySide6
       - pyqtgraph>=0.14.0,<0.15
       - upsetplot
+      # --- Histology tab: native AP_histology workflow (slice prep, matching,
+      #     alignment, probe tracing, MAT/CSV export) ---
+      - tifffile
+      - opencv-python-headless
+      # --- Histology channel map + optional IBL ephys-alignment GUI ---
+      #     numpy<2 first so pip keeps ibllib on a Kilosort-compatible numpy.
+      - numpy<2
+      - ibllib
+      - iblatlas
+      - SimpleITK
+      # The IBL apps repo (folder containing `atlaselectrophysiology`) must also be
+      # on the path. Either clone https://github.com/int-brain-lab/iblapps and add
+      # it to PYTHONPATH, or drop a `.pth` pointing at it into site-packages.

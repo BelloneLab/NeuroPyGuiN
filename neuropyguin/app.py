@@ -48,16 +48,18 @@ if __package__ in (None, ""):
     from neuropyguin.tabs.curation_tab import CurationTab
     from neuropyguin.tabs.postprocessing_tab import PostProcessingTab
     from neuropyguin.tabs.preprocessing_tab import PreprocessingTab
+    from neuropyguin.tabs.histology_tab import HistologyTab
     from neuropyguin.styles import build_app_palette, build_app_qss
 else:
     from .side_nav import SideNavStack
     from .tabs.curation_tab import CurationTab
     from .tabs.postprocessing_tab import PostProcessingTab
     from .tabs.preprocessing_tab import PreprocessingTab
+    from .tabs.histology_tab import HistologyTab
     from .styles import build_app_palette, build_app_qss
 
 
-TAB_TITLES = ["Preprocessing", "Curation", "Post Processing"]
+TAB_TITLES = ["Preprocessing", "Curation", "Post Processing", "Histology"]
 STARTUP_TAB_OPTIONS = ["Last Used", *TAB_TITLES]
 PLOT_THEME_OPTIONS = ["Light", "Dark"]
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
@@ -227,12 +229,13 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.pre_tab = PreprocessingTab(thread_pool)
         self.cur_tab = CurationTab(thread_pool)
         self.post_tab = PostProcessingTab(thread_pool)
-        for t in [self.pre_tab, self.cur_tab, self.post_tab]:
+        self.hist_tab = HistologyTab(thread_pool)
+        for t in [self.pre_tab, self.cur_tab, self.post_tab, self.hist_tab]:
             t.setMinimumSize(0, 0)
             t.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         tabs.setMinimumSize(0, 0)
         tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        for title, widget in zip(TAB_TITLES, [self.pre_tab, self.cur_tab, self.post_tab]):
+        for title, widget in zip(TAB_TITLES, [self.pre_tab, self.cur_tab, self.post_tab, self.hist_tab]):
             tabs.addTab(widget, title)
         self.tabs = tabs
 
@@ -327,6 +330,10 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_tab_post.setShortcut("Ctrl+3")
         self.act_tab_post.triggered.connect(lambda: self.tabs.setCurrentWidget(self.post_tab))
 
+        self.act_tab_hist = QtGui.QAction("Histology", self)
+        self.act_tab_hist.setShortcut("Ctrl+4")
+        self.act_tab_hist.triggered.connect(lambda: self.tabs.setCurrentWidget(self.hist_tab))
+
         self.theme_group = QtGui.QActionGroup(self)
         self.theme_group.setExclusive(True)
 
@@ -375,6 +382,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         view_menu.addAction(self.act_tab_pre)
         view_menu.addAction(self.act_tab_cur)
         view_menu.addAction(self.act_tab_post)
+        view_menu.addAction(self.act_tab_hist)
         view_menu.addSeparator()
         theme_menu = view_menu.addMenu("Theme")
         theme_menu.addAction(self.act_theme_light)
@@ -495,7 +503,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         dark = theme.lower().startswith("dark")
         pg.setConfigOption("background", "#0b0f14" if dark else "w")
         pg.setConfigOption("foreground", "#e8eef7" if dark else "k")
-        for tab in [self.cur_tab, self.post_tab]:
+        for tab in [self.cur_tab, self.post_tab, self.hist_tab]:
             if hasattr(tab, "set_plot_preferences"):
                 tab.set_plot_preferences(theme, grid)
         self._sync_menu_controls()
@@ -698,7 +706,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_export_units.setEnabled(current is self.post_tab)
 
     def _refresh_bottom_busy(self) -> None:
-        tabs = [self.pre_tab, self.cur_tab, self.post_tab]
+        tabs = [self.pre_tab, self.cur_tab, self.post_tab, self.hist_tab]
         busy = any(bool(getattr(t, "is_busy", lambda: False)()) for t in tabs)
         if busy:
             if self.bottom_busy.maximum() != 0:
