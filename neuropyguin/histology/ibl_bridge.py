@@ -85,13 +85,30 @@ def compute_xyz_picks(
 # 2. ALF extraction  (wrap atlaselectrophysiology.extract_files.extract_data)
 # ---------------------------------------------------------------------------
 
-def extract_alf(ks_dir: str | Path, ephys_path: str | Path, out_dir: str | Path) -> Path:
-    """Run the IBL ALF extraction (spikes/clusters/channels + RMS) into ``out_dir``."""
-    from atlaselectrophysiology.extract_files import extract_data
+def extract_alf(ks_dir: str | Path, ephys_path: str | Path, out_dir: str | Path,
+                compute_rms: bool = False) -> Path:
+    """Run the IBL ALF extraction (spikes/clusters/channels) into ``out_dir``.
+
+    The per-channel RMS/QC map (``extract_rmsmap``) streams the **entire** raw AP
+    binary window-by-window and is by far the slowest part (many minutes, and
+    I/O-bound when the binary is on a network drive). It is only consumed by the
+    IBL alignment GUI's RMS display, not by xyz_picks, the channel map or the unit
+    distribution, so it is skipped unless ``compute_rms`` is set.
+    """
+    from atlaselectrophysiology.extract_files import ks2_to_alf, extract_rmsmap, _sample2v
+    import spikeglx
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    extract_data(Path(ks_dir), Path(ephys_path), out_dir)
+    efiles = spikeglx.glob_ephys_files(Path(ephys_path))
+    for efile in efiles:
+        if efile.get("ap") and efile.ap.exists():
+            ks2_to_alf(Path(ks_dir), Path(ephys_path), out_dir, bin_file=efile.ap,
+                       ampfactor=_sample2v(efile.ap), label=None, force=True)
+            if compute_rms:
+                extract_rmsmap(efile.ap, out_folder=out_dir, spectra=False)
+        if compute_rms and efile.get("lf") and efile.lf.exists():
+            extract_rmsmap(efile.lf, out_folder=out_dir)
     return out_dir
 
 
@@ -293,6 +310,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
     p_alf.add_argument("ks_dir")
     p_alf.add_argument("ephys_dir")
     p_alf.add_argument("out_dir")
+    p_alf.add_argument("--rms", action="store_true",
+                       help="also compute the slow RMS/QC map (streams the whole raw AP binary)")
 
     p_ch = sub.add_parser("channels")
     p_ch.add_argument("hist_folder")
@@ -304,6 +323,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
     p_all.add_argument("--ks", default=None)
     p_all.add_argument("--ephys", default=None)
     p_all.add_argument("--alignment", choices=["original", "latest"], default="original")
+    p_all.add_argument("--rms", action="store_true",
+                       help="also compute the slow RMS/QC map (streams the whole raw AP binary)")
 
     args = parser.parse_args(argv)
 
@@ -313,7 +334,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         out = compute_xyz_picks(ccf, hf, res=args.res)
         print(json.dumps({"xyz_picks": [str(p) for p in out]}))
     elif args.cmd == "extract_alf":
-        out = extract_alf(args.ks_dir, args.ephys_dir, args.out_dir)
+        out = extract_alf(args.ks_dir, args.ephys_dir, args.out_dir, compute_rms=args.rms)
         print(json.dumps({"alf_out": str(out)}))
     elif args.cmd == "channels":
         out = compute_channel_locations(args.hist_folder, alignment=args.alignment, ks_dir=args.ks)
@@ -321,7 +342,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     elif args.cmd == "all":
         hf = Path(args.hist_folder)
         if args.ks and args.ephys:
-            extract_alf(args.ks, args.ephys, hf)
+            extract_alf(args.ks, args.ephys, hf, compute_rms=args.rms)
         compute_xyz_picks(hf / "probe_ccf.mat", hf)
         out = compute_channel_locations(hf, alignment=args.alignment, ks_dir=args.ks)
         print(json.dumps({k: str(v) for k, v in out.items()}))

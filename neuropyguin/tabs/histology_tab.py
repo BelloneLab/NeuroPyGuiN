@@ -736,6 +736,9 @@ class HistologyTab(QtWidgets.QWidget):
         )
         self.ck_extract = QtWidgets.QCheckBox("Run ALF extraction first (needs Kilosort + ephys folders)")
         v.addWidget(self.ck_extract)
+        self.ck_rms = QtWidgets.QCheckBox(
+            "Also compute RMS/QC map (slow: streams the whole raw binary; only for IBL GUI)")
+        v.addWidget(self.ck_rms)
         self.cb_alignment = QtWidgets.QComboBox()
         self.cb_alignment.addItems(["original", "latest"])
         row = QtWidgets.QHBoxLayout()
@@ -1770,6 +1773,8 @@ class HistologyTab(QtWidgets.QWidget):
         if self.ck_extract.isChecked():
             if ks and ephys:
                 args += ["--ephys", ephys]
+                if self.ck_rms.isChecked():
+                    args += ["--rms"]  # opt-in to the slow RMS/QC map
             else:
                 self._log("ALF extraction needs both Kilosort and ephys folders; "
                           "skipping extraction and reusing existing geometry.")
