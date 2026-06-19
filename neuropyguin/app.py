@@ -38,6 +38,54 @@ def _install_qt_message_filter() -> None:
         _PREVIOUS_QT_MESSAGE_HANDLER = QtCore.qInstallMessageHandler(_qt_message_filter)
 
 
+_EXCEPTHOOK_BUSY = False
+
+
+def _install_global_excepthook() -> None:
+    """Keep the GUI alive when an exception escapes a Qt slot.
+
+    PySide6 turns an unhandled Python exception raised inside a slot (a button
+    handler, a queued ``finished`` signal, a paint event) into a fatal
+    ``qFatal()`` abort: the whole window vanishes with no dialog. Routing those
+    exceptions through a custom ``sys.excepthook`` logs the traceback and shows a
+    non-fatal dialog instead, so a single bad action (e.g. histology auto-align on
+    a degenerate slice) no longer kills the running session.
+    """
+    import traceback
+
+    previous_hook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            previous_hook(exc_type, exc_value, exc_tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(text, file=sys.stderr)
+        global _EXCEPTHOOK_BUSY
+        app = QtWidgets.QApplication.instance()
+        if app is None or _EXCEPTHOOK_BUSY:
+            return
+        _EXCEPTHOOK_BUSY = True  # avoid recursive dialogs if painting keeps failing
+        try:
+            box = QtWidgets.QMessageBox(
+                QtWidgets.QMessageBox.Icon.Critical,
+                "Unexpected error",
+                f"{exc_type.__name__}: {exc_value}",
+            )
+            box.setInformativeText(
+                "The action could not be completed, but the application is still running."
+            )
+            box.setDetailedText(text)
+            box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+            box.exec()
+        except Exception:
+            pass
+        finally:
+            _EXCEPTHOOK_BUSY = False
+
+    sys.excepthook = _hook
+
+
 _install_qt_message_filter()
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 import pyqtgraph as pg
@@ -758,6 +806,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 def main() -> int:
     _set_windows_taskbar_app_id()
     app = QtWidgets.QApplication(sys.argv)
+    _install_global_excepthook()
     app.setApplicationName("NeuroPyGuiN")
     app.setApplicationDisplayName("NeuroPyGuiN")
     app_icon = _load_app_icon()

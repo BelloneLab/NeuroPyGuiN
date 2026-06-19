@@ -17,6 +17,8 @@ works whether or not the IBL stack is importable in-process.
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -80,6 +82,15 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         self.view.addItem(ln)
         self._overlays.append(ln)
 
+    def add_line_roi(self, pts: np.ndarray, color, width: int = 3) -> pg.LineSegmentROI:
+        pen = pg.mkPen(color, width=width)
+        hover_pen = pg.mkPen(color, width=width + 2)
+        roi = pg.LineSegmentROI([tuple(pts[0]), tuple(pts[1])], pen=pen, hoverPen=hover_pen)
+        roi.setZValue(20)
+        self.view.addItem(roi)
+        self._overlays.append(roi)
+        return roi
+
     def add_mask_overlay(self, mask: np.ndarray, color=(255, 40, 40)) -> None:
         rgba = np.zeros((*mask.shape, 4), dtype=np.ubyte)
         rgba[mask.astype(bool)] = [*color, 160]
@@ -90,9 +101,19 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
 
 
 class HistologyTab(QtWidgets.QWidget):
+    #: Emitted from worker threads so log lines reach the GUI thread safely.
+    log_requested = QtCore.Signal(str)
+
     def __init__(self, thread_pool: QtCore.QThreadPool) -> None:
         super().__init__()
-        self.pool = thread_pool
+        # Histology work (atlas sampling, probe_ccf, IBL bridge) is short and
+        # interactive. The shared global pool can be fully occupied for hours by
+        # Kilosort/CatGT jobs queued in the Preprocessing tab, which would leave an
+        # instant probe_ccf build "Building..." forever. A dedicated pool keeps
+        # histology responsive regardless of what other tabs are running.
+        self.pool = QtCore.QThreadPool(self)
+        self.pool.setMaxThreadCount(4)
+        self._shared_pool = thread_pool
         self.settings = QtCore.QSettings("NeuroPyGuiN", "NeuroPyGuiN")
         self._busy_count = 0
         self._plot_theme = "Light"
@@ -112,9 +133,14 @@ class HistologyTab(QtWidgets.QWidget):
         self._align_atlas_pts: Dict[int, List[Tuple[float, float]]] = {}
         self._active_probe = 1
         self._pending_click: List[Tuple[float, float]] = []
+        self._trace_roi: Optional[pg.LineSegmentROI] = None
+        self._trace_updating_roi = False
+        self._trace_updating_controls = False
+        self._trace_coord_spins: Dict[str, QtWidgets.QDoubleSpinBox] = {}
 
         self._build_ui()
         self._restore_settings()
+        self.log_requested.connect(self._log)  # queued: safe to emit from workers
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -364,13 +390,13 @@ class HistologyTab(QtWidgets.QWidget):
     def _build_trace_page(self) -> QtWidgets.QWidget:
         page, v = self._section(
             "Trace probe tracks",
-            "Pick a probe number, then click two endpoints on each slice the probe "
-            "crosses. Save writes probe_ccf.mat + CSV and the trajectory-area chart.",
+            "Pick a probe number, create one editable line on each slice the probe "
+            "crosses, then save probe_ccf.mat, CSV files, and the trajectory-area chart.",
         )
         body = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.canvas_trace = ImageCanvas()
         self.canvas_trace.clicked.connect(self._trace_click)
-        body.addWidget(self._titled("Histology (click 2 points per probe)", self.canvas_trace))
+        body.addWidget(self._titled("Histology probe line", self.canvas_trace))
         self.trace_areas = pg.GraphicsLayoutWidget()
         body.addWidget(self._titled("Trajectory areas", self.trace_areas))
         body.setSizes([700, 350])
@@ -388,16 +414,38 @@ class HistologyTab(QtWidgets.QWidget):
         self.sp_probe.setRange(1, 20)
         self.sp_probe.valueChanged.connect(self._trace_set_probe)
         ctl.addWidget(self.sp_probe)
+        b_new = QtWidgets.QPushButton("New line")
+        b_new.clicked.connect(self._trace_new_line)
+        ctl.addWidget(b_new)
         b_clear = QtWidgets.QPushButton("Clear probe on slice")
         b_clear.clicked.connect(self._trace_clear)
         ctl.addWidget(b_clear)
-        b_build = QtWidgets.QPushButton("Build + Save probe_ccf")
-        b_build.clicked.connect(self._trace_build)
-        ctl.addWidget(b_build)
+        self.btn_trace_build = QtWidgets.QPushButton("Build + Save probe_ccf")
+        self.btn_trace_build.clicked.connect(self._trace_build)
+        ctl.addWidget(self.btn_trace_build)
         ctl.addStretch(1)
         self.lbl_trace = QtWidgets.QLabel("slice 0 / 0")
         ctl.addWidget(self.lbl_trace)
         v.addLayout(ctl)
+
+        coords = QtWidgets.QHBoxLayout()
+        coords.addWidget(QtWidgets.QLabel("Line endpoints"))
+        for key, label in (("x1", "x1"), ("y1", "y1"), ("x2", "x2"), ("y2", "y2")):
+            coords.addWidget(QtWidgets.QLabel(label))
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-1_000_000.0, 1_000_000.0)
+            spin.setDecimals(1)
+            spin.setSingleStep(1.0)
+            spin.setKeyboardTracking(False)
+            spin.setFixedWidth(92)
+            spin.valueChanged.connect(self._trace_controls_changed)
+            self._trace_coord_spins[key] = spin
+            coords.addWidget(spin)
+        coords.addStretch(1)
+        self.lbl_trace_line = QtWidgets.QLabel("")
+        self.lbl_trace_line.setObjectName("SectionHint")
+        coords.addWidget(self.lbl_trace_line)
+        v.addLayout(coords)
         return page
 
     # ---- Channel map page ----
@@ -501,7 +549,7 @@ class HistologyTab(QtWidgets.QWidget):
             if c is not None:
                 c.setBackground(bg)
 
-    def _run_bg(self, fn, on_done, *args, busy_msg: str = "") -> None:
+    def _run_bg(self, fn, on_done, *args, busy_msg: str = "", on_finished=None) -> None:
         if busy_msg:
             self._log(busy_msg)
         self._busy_count += 1
@@ -509,10 +557,14 @@ class HistologyTab(QtWidgets.QWidget):
 
         def _finished(payload: dict) -> None:
             self._busy_count = max(0, self._busy_count - 1)
-            if payload.get("ok"):
-                on_done(payload.get("result"))
-            else:
-                self._log("Task failed.")
+            try:
+                if payload.get("ok"):
+                    on_done(payload.get("result"))
+                else:
+                    self._log("Task failed.")
+            finally:
+                if on_finished is not None:
+                    on_finished(payload)
 
         worker.signals.finished.connect(_finished)
         worker.signals.error.connect(lambda m: self._log(f"Error: {m}"))
@@ -632,6 +684,7 @@ class HistologyTab(QtWidgets.QWidget):
             except Exception as exc:
                 self._log(f"Could not load tforms: {exc}")
         self.slice_specs = [None] * max(len(self.slice_images), len(self.histology_ccf))
+        self._load_match_specs()  # restore saved atlas matching for this run
         self._refresh_status()
         self._preproc_show()
         self._match_show()
@@ -738,7 +791,27 @@ class HistologyTab(QtWidgets.QWidget):
         idx = min(self._cur_match_slice, len(self.slice_images) - 1)
         self.canvas_match_hist.set_image(self.slice_images[idx])
         self.lbl_match.setText(f"slice {idx + 1} / {len(self.slice_images)}")
+        self._restore_match_sliders(idx)
         self._match_update_atlas()
+
+    def _restore_match_sliders(self, idx: int) -> None:
+        """Reflect a previously-saved plane for slice ``idx`` in the sliders."""
+        spec = self.slice_specs[idx] if idx < len(self.slice_specs) else None
+        if not spec or "ap" not in spec:
+            return
+        widgets = (self.sl_ap, self.sl_lr, self.sl_si, self.cb_mode)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.sl_ap.setValue(int(spec.get("ap", self.sl_ap.value())))
+            self.sl_lr.setValue(int(spec.get("lr", self.sl_lr.value())))
+            self.sl_si.setValue(int(spec.get("si", self.sl_si.value())))
+            mi = self.cb_mode.findText(str(spec.get("mode", "")))
+            if mi >= 0:
+                self.cb_mode.setCurrentIndex(mi)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
 
     def _match_update_atlas(self) -> None:
         at = self._ensure_atlas()
@@ -758,10 +831,77 @@ class HistologyTab(QtWidgets.QWidget):
         sp = hatlas.coronal_slice_point(self.sl_ap.value(), at)
         while len(self.slice_specs) < len(self.slice_images):
             self.slice_specs.append(None)
-        self.slice_specs[self._cur_match_slice] = {"slice_point": sp, "camera_vector": cv}
+        self.slice_specs[self._cur_match_slice] = {
+            "slice_point": sp,
+            "camera_vector": cv,
+            "ap": int(self.sl_ap.value()),
+            "lr": int(self.sl_lr.value()),
+            "si": int(self.sl_si.value()),
+            "mode": self.cb_mode.currentText(),
+        }
+        self._save_match_specs()  # persist immediately so matching survives a reopen
         n_assigned = sum(s is not None for s in self.slice_specs)
         self._log(f"Assigned plane to slice {self._cur_match_slice + 1} "
                   f"({n_assigned}/{len(self.slice_images)} assigned).")
+
+    _MATCH_SPECS_FN = "histology_match_specs.json"
+
+    def _save_match_specs(self) -> None:
+        """Persist the per-slice match planes (sidecar to histology_ccf.mat)."""
+        if self.folder is None:
+            return
+        payload = []
+        for s in self.slice_specs:
+            if s is None:
+                payload.append(None)
+                continue
+            payload.append({
+                "slice_point": np.asarray(s["slice_point"], float).ravel().tolist(),
+                "camera_vector": np.asarray(s["camera_vector"], float).ravel().tolist(),
+                "ap": int(s.get("ap", 0)),
+                "lr": int(s.get("lr", 0)),
+                "si": int(s.get("si", 0)),
+                "mode": str(s.get("mode", "TV")),
+            })
+        try:
+            with open(self.folder / self._MATCH_SPECS_FN, "w") as f:
+                json.dump({"specs": payload}, f, indent=2)
+        except OSError as exc:
+            self._log(f"Could not save match specs: {exc}")
+
+    def _load_match_specs(self) -> None:
+        """Restore the per-slice match planes saved for this run, if present."""
+        if self.folder is None:
+            return
+        fp = self.folder / self._MATCH_SPECS_FN
+        if not fp.exists():
+            return
+        try:
+            with open(fp) as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            self._log(f"Could not load match specs: {exc}")
+            return
+        specs: List[Optional[Dict[str, np.ndarray]]] = []
+        for s in data.get("specs", []):
+            if s is None:
+                specs.append(None)
+                continue
+            specs.append({
+                "slice_point": np.asarray(s["slice_point"], float),
+                "camera_vector": np.asarray(s["camera_vector"], float),
+                "ap": int(s.get("ap", 0)),
+                "lr": int(s.get("lr", 0)),
+                "si": int(s.get("si", 0)),
+                "mode": str(s.get("mode", "TV")),
+            })
+        if not specs:
+            return
+        n = max(len(self.slice_images), len(self.histology_ccf), len(specs))
+        specs += [None] * (n - len(specs))
+        self.slice_specs = specs
+        n_assigned = sum(x is not None for x in specs)
+        self._log(f"Restored {n_assigned} matched plane(s) from {self._MATCH_SPECS_FN}.")
 
     def _match_save(self) -> None:
         at = self._ensure_atlas()
@@ -771,6 +911,7 @@ class HistologyTab(QtWidgets.QWidget):
         if len(specs) != len(self.slice_images):
             self._log("Assign a plane to every slice before saving histology_ccf.")
             return
+        self._save_match_specs()  # keep the editable match state alongside the result
 
         def job():
             hccf = matching.build_histology_ccf(at, specs, spacing=1)
@@ -840,22 +981,29 @@ class HistologyTab(QtWidgets.QWidget):
 
     def _align_auto(self) -> None:
         idx = self._cur_align_slice
-        if idx >= len(self.histology_ccf):
+        if idx >= len(self.histology_ccf) or idx >= len(self.slice_images):
             self._log("Match atlas slices first (need histology_ccf).")
             return
         hist = self.slice_images[idx]
         hist_gray = hist.mean(axis=2) if hist.ndim == 3 else hist
-        atlas_tv = self.histology_ccf[idx]["tv_slices"]
+        atlas_tv = self.histology_ccf[idx].get("tv_slices")
+        if atlas_tv is None or np.asarray(atlas_tv).size == 0:
+            self._log("Atlas slice has no tv_slices; re-run Match before auto-align.")
+            return
 
         def job():
-            return alignment.auto_align(hist_gray, atlas_tv)
+            # Isolated in a child process: OpenCV's ECC can abort natively, which
+            # would otherwise crash the whole GUI. Returns (T, status).
+            return alignment.auto_align_isolated(hist_gray, atlas_tv)
 
-        def done(T):
+        def done(result):
+            T, status = result
             self._set_tform(idx, T)
-            self._log(f"Auto-aligned slice {idx + 1}.")
+            self._log(f"Slice {idx + 1}: {status}")
             self._align_overlay(idx)
 
-        self._run_bg(job, done, busy_msg="Auto-aligning (intensity registration)...")
+        self._run_bg(job, done,
+                     busy_msg="Auto-aligning in an isolated process (intensity registration)...")
 
     def _set_tform(self, idx: int, T: np.ndarray) -> None:
         while len(self.tforms) <= idx:
@@ -863,16 +1011,20 @@ class HistologyTab(QtWidgets.QWidget):
         self.tforms[idx] = T
 
     def _align_overlay(self, idx: int) -> None:
-        if idx >= len(self.histology_ccf) or idx >= len(self.tforms):
+        if idx >= len(self.histology_ccf) or idx >= len(self.tforms) or idx >= len(self.slice_images):
             return
-        av = self.histology_ccf[idx]["av_slices"]
-        hist = self.slice_images[idx]
-        shape = hist.shape[:2]
-        warped = alignment.warp_atlas(av, self.tforms[idx], shape, nearest=True)
-        bound = alignment.atlas_boundaries(warped)
-        self.canvas_align_hist.set_image(self.slice_images[idx])
-        self._align_redraw_points()
-        self.canvas_align_hist.add_mask_overlay(bound, (60, 180, 255))
+        try:
+            av = self.histology_ccf[idx]["av_slices"]
+            hist = self.slice_images[idx]
+            shape = hist.shape[:2]
+            # use_cv2=False: GUI-thread warp must not be able to abort natively.
+            warped = alignment.warp_atlas(av, self.tforms[idx], shape, nearest=True, use_cv2=False)
+            bound = alignment.atlas_boundaries(warped)
+            self.canvas_align_hist.set_image(self.slice_images[idx])
+            self._align_redraw_points()
+            self.canvas_align_hist.add_mask_overlay(bound, (60, 180, 255))
+        except Exception as exc:
+            self._log(f"Could not draw atlas overlay: {exc}")
 
     def _align_save(self) -> None:
         if self.folder is None or not self.tforms:
@@ -886,15 +1038,55 @@ class HistologyTab(QtWidgets.QWidget):
 
     # ------------------------------------------------------ Trace actions
     def _trace_set_probe(self, v: int) -> None:
+        self._trace_commit_roi()
         self._active_probe = int(v)
         self._pending_click = []
+        self._trace_show()
 
     def _trace_step(self, d: int) -> None:
         if not self.slice_images:
             return
+        self._trace_commit_roi()
         self._cur_trace_slice = int(np.clip(self._cur_trace_slice + d, 0, len(self.slice_images) - 1))
         self._pending_click = []
         self._trace_show()
+
+    def _trace_key(self) -> Tuple[int, int]:
+        return self._cur_trace_slice, self._active_probe
+
+    def _trace_default_line(self, center: Optional[Tuple[float, float]] = None) -> np.ndarray:
+        idx = min(self._cur_trace_slice, len(self.slice_images) - 1)
+        img = self.slice_images[idx]
+        h, w = img.shape[:2]
+        if center is None:
+            x = float(np.clip(w * (0.42 + 0.045 * ((self._active_probe - 1) % 6)), 0, max(w - 1, 0)))
+            y = h * 0.56
+        else:
+            x = float(np.clip(center[0], 0, max(w - 1, 0)))
+            y = float(np.clip(center[1], 0, max(h - 1, 0)))
+        length = max(40.0, 0.62 * h)
+        y0 = float(np.clip(y - 0.5 * length, 0, max(h - 1, 0)))
+        y1 = float(np.clip(y + 0.5 * length, 0, max(h - 1, 0)))
+        if abs(y1 - y0) < 1.0:
+            y0, y1 = 0.0, float(max(h - 1, 1))
+        return np.array([[x, y0], [x, y1]], dtype=float)
+
+    def _trace_roi_points(self) -> Optional[np.ndarray]:
+        roi = self._trace_roi
+        if roi is None:
+            return None
+        pts = []
+        for handle in roi.getHandles():
+            p = roi.mapToParent(handle.pos())
+            pts.append([float(p.x()), float(p.y())])
+        if len(pts) != 2:
+            return None
+        return np.asarray(pts, dtype=float)
+
+    def _trace_commit_roi(self) -> None:
+        pts = self._trace_roi_points()
+        if pts is not None:
+            self.probe_points[self._trace_key()] = pts
 
     def _trace_show(self) -> None:
         if not self.slice_images:
@@ -902,20 +1094,92 @@ class HistologyTab(QtWidgets.QWidget):
         idx = min(self._cur_trace_slice, len(self.slice_images) - 1)
         self.canvas_trace.set_image(self.slice_images[idx])
         self.canvas_trace.clear_overlays()
+        self._trace_roi = None
+        active_pts = None
         for (s, p), pts in self.probe_points.items():
             if s == idx and pts is not None and len(pts):
                 color = PROBE_QCOLORS[(p - 1) % len(PROBE_QCOLORS)]
-                self.canvas_trace.add_line(pts[:, 0], pts[:, 1], color, 3)
+                if p == self._active_probe:
+                    active_pts = np.asarray(pts, dtype=float)
+                else:
+                    self.canvas_trace.add_line(pts[:, 0], pts[:, 1], color, 3)
+        if active_pts is not None and len(active_pts) == 2:
+            color = PROBE_QCOLORS[(self._active_probe - 1) % len(PROBE_QCOLORS)]
+            self._trace_roi = self.canvas_trace.add_line_roi(active_pts, color, 3)
+            self._trace_roi.sigRegionChanged.connect(self._trace_roi_changed)
+            self._trace_roi.sigRegionChangeFinished.connect(self._trace_roi_changed)
+            self._trace_update_controls(active_pts)
+        else:
+            self._trace_update_controls(None)
         self.lbl_trace.setText(f"slice {idx + 1} / {len(self.slice_images)}")
 
     def _trace_click(self, x: float, y: float) -> None:
-        self._pending_click.append((x, y))
-        if len(self._pending_click) == 2:
-            idx = self._cur_trace_slice
-            self.probe_points[(idx, self._active_probe)] = np.array(self._pending_click, dtype=float)
-            self._pending_click = []
+        key = self._trace_key()
+        if key in self.probe_points:
+            return
+        self.probe_points[key] = self._trace_default_line((x, y))
+        self._trace_show()
+        self._log(f"Created editable probe {self._active_probe} line on slice {key[0] + 1}.")
+
+    def _trace_new_line(self) -> None:
+        if not self.slice_images:
+            return
+        key = self._trace_key()
+        self.probe_points[key] = self._trace_default_line()
+        self._trace_show()
+        self._log(f"Created editable probe {self._active_probe} line on slice {key[0] + 1}.")
+
+    def _trace_roi_changed(self, *_args) -> None:
+        if self._trace_updating_roi:
+            return
+        pts = self._trace_roi_points()
+        if pts is None:
+            return
+        self.probe_points[self._trace_key()] = pts
+        self._trace_update_controls(pts)
+
+    def _trace_update_controls(self, pts: Optional[np.ndarray]) -> None:
+        self._trace_updating_controls = True
+        try:
+            enabled = pts is not None and len(pts) == 2
+            for spin in self._trace_coord_spins.values():
+                spin.setEnabled(enabled)
+            if enabled:
+                vals = {
+                    "x1": float(pts[0, 0]), "y1": float(pts[0, 1]),
+                    "x2": float(pts[1, 0]), "y2": float(pts[1, 1]),
+                }
+                for key, val in vals.items():
+                    self._trace_coord_spins[key].setValue(val)
+                self.lbl_trace_line.setText(
+                    f"probe {self._active_probe} on slice {self._cur_trace_slice + 1}"
+                )
+            else:
+                for spin in self._trace_coord_spins.values():
+                    spin.setValue(0.0)
+                self.lbl_trace_line.setText("no line for selected probe")
+        finally:
+            self._trace_updating_controls = False
+
+    def _trace_controls_changed(self) -> None:
+        if self._trace_updating_controls or not self.slice_images:
+            return
+        pts = np.array([
+            [self._trace_coord_spins["x1"].value(), self._trace_coord_spins["y1"].value()],
+            [self._trace_coord_spins["x2"].value(), self._trace_coord_spins["y2"].value()],
+        ], dtype=float)
+        self.probe_points[self._trace_key()] = pts
+        if self._trace_roi is None:
             self._trace_show()
-            self._log(f"Set probe {self._active_probe} on slice {idx + 1}.")
+            return
+        self._trace_updating_roi = True
+        try:
+            state = self._trace_roi.saveState()
+            state["pos"] = (0.0, 0.0)
+            state["points"] = [tuple(pts[0]), tuple(pts[1])]
+            self._trace_roi.setState(state)
+        finally:
+            self._trace_updating_roi = False
 
     def _trace_clear(self) -> None:
         self.probe_points.pop((self._cur_trace_slice, self._active_probe), None)
@@ -923,23 +1187,43 @@ class HistologyTab(QtWidgets.QWidget):
         self._trace_show()
 
     def _trace_build(self) -> None:
-        at = self._ensure_atlas()
-        if at is None or self.folder is None:
+        self._trace_commit_roi()
+        if self.folder is None:
             return
         if not self.histology_ccf or not self.tforms:
             self._log("Need histology_ccf and tforms first (Match + Align).")
             return
+        if len(self.tforms) < len(self.histology_ccf):
+            self._log("Need one atlas2histology transform per matched slice. Save tforms first.")
+            return
         if not self.probe_points:
             self._log("Draw at least one probe track first.")
             return
+        # Load the atlas on the GUI thread (mmap is instant) so the worker is pure
+        # compute + save; this also caches it and surfaces a slow first load.
+        at = self._ensure_atlas()
+        if at is None:
+            return
         n_probes = max(p for _, p in self.probe_points)
         # tracing uses 0-based probe indices
-        pts0 = {(s, p - 1): v for (s, p), v in self.probe_points.items()}
+        pts0 = {(s, p - 1): np.asarray(v, dtype=float).copy() for (s, p), v in self.probe_points.items()}
+        histology_ccf = list(self.histology_ccf)
+        tforms = [np.asarray(t, dtype=float).copy() for t in self.tforms]
+        folder = self.folder
+        emit_log = self.log_requested.emit  # thread-safe logging from the worker
+        if hasattr(self, "btn_trace_build"):
+            self.btn_trace_build.setEnabled(False)
 
         def job():
-            probes = tracing.build_probe_ccf(pts0, self.histology_ccf, self.tforms, at, n_probes)
-            io_formats.save_probe_ccf(self.folder / "probe_ccf.mat", probes)
-            io_formats.export_probe_ccf_csv(self.folder, probes)
+            emit_log("[probe_ccf] worker started; sampling trajectories through the CCF...")
+            s = time.perf_counter()
+            probes = tracing.build_probe_ccf(pts0, histology_ccf, tforms, at, n_probes)
+            emit_log(f"[probe_ccf] sampled {len(probes)} probe(s) in {time.perf_counter() - s:.2f}s.")
+            s = time.perf_counter()
+            io_formats.save_probe_ccf(folder / "probe_ccf.mat", probes)
+            io_formats.export_probe_ccf_csv(folder, probes)
+            emit_log(f"[probe_ccf] wrote probe_ccf.mat + CSV in {time.perf_counter() - s:.2f}s "
+                     f"(folder: {folder}).")
             return probes
 
         def done(probes):
@@ -947,7 +1231,16 @@ class HistologyTab(QtWidgets.QWidget):
             self._refresh_status()
             self._draw_trajectory_areas(probes)
 
-        self._run_bg(job, done, busy_msg="Sampling probe trajectories through the CCF...")
+        def finished(_payload):
+            if hasattr(self, "btn_trace_build"):
+                self.btn_trace_build.setEnabled(True)
+
+        self._run_bg(
+            job,
+            done,
+            busy_msg="Building probe_ccf in the background...",
+            on_finished=finished,
+        )
 
     def _draw_trajectory_areas(self, probes) -> None:
         self.trace_areas.clear()
@@ -999,10 +1292,13 @@ class HistologyTab(QtWidgets.QWidget):
             return
         align = alignment_override or self.cb_alignment.currentText()
         kw = self._ibl_kwargs()
+        args = ["channels", str(self.folder), "--alignment", align]
+        ks = self.ed_ks.text().strip()
+        if ks:
+            args += ["--ks", ks]  # lets the bridge reuse channel_positions.npy
 
         def job():
-            rc, out = ibl_launch.run_bridge(
-                ["channels", str(self.folder), "--alignment", align], **kw)
+            rc, out = ibl_launch.run_bridge(args, **kw)
             return rc
 
         self._run_bg(job, lambda rc: self._on_channels_done(rc),
@@ -1012,11 +1308,16 @@ class HistologyTab(QtWidgets.QWidget):
         if self.folder is None:
             return
         args = ["all", str(self.folder), "--alignment", self.cb_alignment.currentText()]
+        ks = self.ed_ks.text().strip()
+        ephys = self.ed_ephys.text().strip()
+        if ks:
+            args += ["--ks", ks]  # geometry reuse; extraction only if --ephys is added too
         if self.ck_extract.isChecked():
-            ks = self.ed_ks.text().strip()
-            ephys = self.ed_ephys.text().strip()
             if ks and ephys:
-                args += ["--ks", ks, "--ephys", ephys]
+                args += ["--ephys", ephys]
+            else:
+                self._log("ALF extraction needs both Kilosort and ephys folders; "
+                          "skipping extraction and reusing existing geometry.")
         kw = self._ibl_kwargs()
         self._run_bg(lambda: ibl_launch.run_bridge(args, **kw)[0],
                      lambda rc: self._on_channels_done(rc),
@@ -1049,9 +1350,12 @@ class HistologyTab(QtWidgets.QWidget):
         if self.folder is None:
             self._log("Load a session folder first.")
             return
+        if not (self.folder / "channels.localCoordinates.npy").exists():
+            self._log("Tip: run the Channel map step first so the IBL GUI can auto-load "
+                      "(it needs channels.localCoordinates.npy + xyz_picks).")
         try:
             ibl_launch.launch_ibl_gui(self.folder, **self._ibl_kwargs())
-            self._log("IBL GUI launched (separate window).")
+            self._log("IBL GUI launching in a separate window; it will auto-load this session.")
         except Exception as exc:
             self._log(f"Could not launch IBL GUI: {exc}")
 

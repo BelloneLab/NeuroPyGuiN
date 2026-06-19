@@ -152,12 +152,52 @@ def _channel_dict_for_shank(brain_regions, chn_coords, orig_idx) -> Dict[str, di
     return out
 
 
+def _resolve_local_coordinates(hist_folder: Path, ks_dir: Optional[str | Path] = None) -> np.ndarray:
+    """Locate (or synthesise) ``channels.localCoordinates.npy`` for the session.
+
+    ALF extraction writes this file, but it is just the per-channel probe geometry
+    (lateral/axial micrometres) that Kilosort already stores as
+    ``channel_positions.npy``. When the ALF file is absent we reuse the Kilosort
+    geometry and cache it as the ALF name, so the "AP_histology is enough" path
+    works without re-extracting the raw ephys (and the IBL GUI finds it too).
+    """
+    local = hist_folder / "channels.localCoordinates.npy"
+    if local.exists():
+        return np.load(local)
+
+    seen: set[str] = set()
+    search: List[Path] = []
+    for base in ([Path(ks_dir)] if ks_dir else []) + [
+        hist_folder, hist_folder.parent, hist_folder.parent.parent
+    ]:
+        key = str(base)
+        if key not in seen:
+            seen.add(key)
+            search.append(base)
+
+    for base in search:
+        cand = base / "channel_positions.npy"
+        if cand.exists():
+            coords = np.asarray(np.load(cand), dtype=np.float64)
+            np.save(local, coords)  # cache for re-runs and the IBL alignment GUI
+            print(f"Derived channels.localCoordinates.npy from {cand}")
+            return coords
+
+    raise FileNotFoundError(
+        "channels.localCoordinates.npy not found and no Kilosort channel_positions.npy "
+        f"could be located near {hist_folder}. Either run ALF extraction (Channel map tab "
+        "-> 'Run ALF extraction first', with the Kilosort and ephys folders set) or set the "
+        "Kilosort folder on the Setup tab so the probe geometry can be reused."
+    )
+
+
 def compute_channel_locations(
     hist_folder: str | Path,
     out_folder: Optional[str | Path] = None,
     alignment: str = "original",
     brain_atlas=None,
     write_per_shank: bool = True,
+    ks_dir: Optional[str | Path] = None,
 ) -> Dict[str, Path]:
     """Compute per-channel CCF locations for every shank and the merged file.
 
@@ -177,7 +217,7 @@ def compute_channel_locations(
     out_folder.mkdir(parents=True, exist_ok=True)
     ba = brain_atlas or AllenAtlas(25)
 
-    chn_coords_all = np.load(hist_folder / "channels.localCoordinates.npy")
+    chn_coords_all = _resolve_local_coordinates(hist_folder, ks_dir)
     n_shanks, shanks = _shank_split(chn_coords_all)
 
     all_shanks: Dict[str, dict] = {}
@@ -257,6 +297,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     p_ch = sub.add_parser("channels")
     p_ch.add_argument("hist_folder")
     p_ch.add_argument("--alignment", choices=["original", "latest"], default="original")
+    p_ch.add_argument("--ks", default=None)
 
     p_all = sub.add_parser("all")
     p_all.add_argument("hist_folder")
@@ -275,14 +316,14 @@ def _main(argv: Optional[List[str]] = None) -> int:
         out = extract_alf(args.ks_dir, args.ephys_dir, args.out_dir)
         print(json.dumps({"alf_out": str(out)}))
     elif args.cmd == "channels":
-        out = compute_channel_locations(args.hist_folder, alignment=args.alignment)
+        out = compute_channel_locations(args.hist_folder, alignment=args.alignment, ks_dir=args.ks)
         print(json.dumps({k: str(v) for k, v in out.items()}))
     elif args.cmd == "all":
         hf = Path(args.hist_folder)
         if args.ks and args.ephys:
             extract_alf(args.ks, args.ephys, hf)
         compute_xyz_picks(hf / "probe_ccf.mat", hf)
-        out = compute_channel_locations(hf, alignment=args.alignment)
+        out = compute_channel_locations(hf, alignment=args.alignment, ks_dir=args.ks)
         print(json.dumps({k: str(v) for k, v in out.items()}))
     return 0
 

@@ -91,8 +91,31 @@ def _best_fit_direction(points: np.ndarray) -> np.ndarray:
     return direction
 
 
+def _line_box_interval(r0: np.ndarray, direction: np.ndarray, shape: Tuple[int, int, int]) -> Optional[Tuple[float, float]]:
+    """Return the parameter interval where a 3D line intersects the atlas box."""
+    lo = np.ones(3, dtype=np.float64)
+    hi = np.asarray(shape, dtype=np.float64)
+    t_min = -np.inf
+    t_max = np.inf
+    for dim in range(3):
+        d = float(direction[dim])
+        if abs(d) < 1e-12:
+            if r0[dim] < lo[dim] or r0[dim] > hi[dim]:
+                return None
+            continue
+        a = (lo[dim] - r0[dim]) / d
+        b = (hi[dim] - r0[dim]) / d
+        if a > b:
+            a, b = b, a
+        t_min = max(t_min, a)
+        t_max = min(t_max, b)
+        if t_min > t_max:
+            return None
+    return float(t_min), float(t_max)
+
+
 def trajectory_areas_from_points(
-    points: np.ndarray, atlas: AllenCCFAtlas
+    points: np.ndarray, atlas: AllenCCFAtlas, sample_um: float = 10.0
 ) -> Tuple[pd.DataFrame, np.ndarray]:
     """Sample the Allen annotation along the best-fit line through ``points``.
 
@@ -104,11 +127,18 @@ def trajectory_areas_from_points(
 
     r0 = points.mean(axis=0)
     direction = _best_fit_direction(points)
-    line_eval = np.array([-1000.0, 1000.0])
+    interval = _line_box_interval(r0, direction, av.shape)
+    empty_df = pd.DataFrame(columns=[
+        "acronym", "name", "id", "color_hex_triplet", "depth_start_um", "depth_end_um",
+    ])
+    if interval is None:
+        return empty_df, np.zeros((0, 3))
+    line_eval = np.array(interval, dtype=np.float64)
     fit_line = r0[None, :] + line_eval[:, None] * direction[None, :]  # (2,3)
 
-    n_coords = int(round(np.linalg.norm(np.diff(fit_line, axis=0)) * 10))  # 10um->1um
-    n_coords = max(n_coords, 2)
+    sample_um = max(float(sample_um), 1.0)
+    length_um = float(np.linalg.norm(np.diff(fit_line, axis=0)) * 10.0)
+    n_coords = max(int(np.ceil(length_um / sample_um)) + 1, 2)
     traj = np.vstack([
         np.round(np.linspace(fit_line[0, d], fit_line[1, d], n_coords)) for d in range(3)
     ]).T.astype(np.int64)  # (n_coords, 3) [AP, DV, ML]
@@ -120,9 +150,7 @@ def trajectory_areas_from_points(
     )
     coords = traj[in_bounds]
     if len(coords) == 0:
-        return pd.DataFrame(columns=[
-            "acronym", "name", "id", "color_hex_triplet", "depth_start_um", "depth_end_um",
-        ]), np.zeros((0, 3))
+        return empty_df, np.zeros((0, 3))
 
     area_idx_sampled = np.asarray(av[coords[:, 0] - 1, coords[:, 1] - 1, coords[:, 2] - 1])
 
@@ -134,16 +162,18 @@ def trajectory_areas_from_points(
 
     store = run_area_idx > 1  # only regions inside the brain (idx > 1)
     if not np.any(store):
-        return pd.DataFrame(columns=[
-            "acronym", "name", "id", "color_hex_triplet", "depth_start_um", "depth_end_um",
-        ]), np.zeros((0, 3))
+        return empty_df, np.zeros((0, 3))
 
     first_in_brain_start = boundaries[np.flatnonzero(store)[0], 0]
-    depth = boundaries[store] - first_in_brain_start  # micrometres (1 sample = 1um)
+    depth = (boundaries[store] - first_in_brain_start).astype(float) * sample_um
 
     rows = []
+    row_cache = {}
     for v in run_area_idx[store]:
-        r = atlas.region_row(int(v))
+        vi = int(v)
+        if vi not in row_cache:
+            row_cache[vi] = atlas.region_row(vi)
+        r = row_cache[vi]
         rows.append({
             "acronym": "" if r is None else str(r["acronym"]),
             "name": "" if r is None else str(r["name"]),

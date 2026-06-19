@@ -140,7 +140,7 @@ def load_tforms(path: str | Path) -> List[np.ndarray]:
 # probe_ccf.mat
 # ---------------------------------------------------------------------------
 
-def save_probe_ccf(path: str | Path, probes: Sequence[Dict]) -> None:
+def save_probe_ccf(path: str | Path, probes: Sequence[Dict], compress: bool = False) -> None:
     """Save the per-probe CCF result.
 
     ``probes[i]`` keys:
@@ -163,7 +163,7 @@ def save_probe_ccf(path: str | Path, probes: Sequence[Dict]) -> None:
         arr[i, 0]["trajectory_coords"] = (
             np.zeros((0, 3)) if coords is None else np.asarray(coords, dtype=np.float64)
         )
-    sio.savemat(str(path), {"probe_ccf": arr}, do_compression=True)
+    sio.savemat(str(path), {"probe_ccf": arr}, do_compression=bool(compress))
 
 
 def load_probe_ccf_points(path: str | Path) -> List[np.ndarray]:

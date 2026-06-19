@@ -100,19 +100,41 @@ def launch_ibl_gui(
     ibl_python: Optional[str] = None,
     iblapps_path: Optional[str] = None,
     log: Optional[Callable[[str], None]] = None,
+    auto_load: bool = True,
 ) -> subprocess.Popen:
-    """Launch the unmodified IBL ephys-alignment GUI (offline) as a subprocess.
+    """Launch the IBL ephys-alignment GUI (offline) as a subprocess.
 
-    The GUI opens a folder picker; ``hist_folder`` is reported to the user so
-    they select the right session. Returns the running ``Popen`` (non-blocking).
+    With ``auto_load`` (default) the GUI opens straight on ``hist_folder`` and
+    presses "Get Data" itself, via :mod:`ibl_gui_launcher`. Otherwise the stock
+    GUI opens with a manual folder picker. The child's stdout/stderr is redirected
+    to ``<hist_folder>/ibl_gui.log`` so a startup failure is visible afterwards.
+    Returns the running ``Popen`` (non-blocking).
     """
     python = resolve_ibl_python(ibl_python)
     apps = Path(iblapps_path or DEFAULT_IBLAPPS_PATH)
     gui_script = apps / "atlaselectrophysiology" / "ephys_atlas_gui.py"
     if not gui_script.exists():
         raise FileNotFoundError(f"IBL GUI not found: {gui_script}")
-    cmd = [python, str(gui_script), "-o", "True"]
+    hist_folder = Path(hist_folder)
+
+    if auto_load:
+        cmd = [python, "-m", "neuropyguin.histology.ibl_gui_launcher", str(hist_folder)]
+    else:
+        cmd = [python, str(gui_script), "-o", "True"]
+
+    logfile = hist_folder / "ibl_gui.log"
+    try:
+        out = open(logfile, "w", encoding="utf-8", errors="ignore")
+    except OSError:
+        out, logfile = None, None  # fall back to inheriting the parent's streams
+
     if log:
-        log(f"Launching IBL alignment GUI; select folder: {hist_folder}")
+        target = f"auto-loading {hist_folder.name}" if auto_load else f"select folder: {hist_folder}"
+        log(f"Launching IBL alignment GUI ({target}).")
         log(f"$ {' '.join(cmd)}")
-    return subprocess.Popen(cmd, cwd=str(apps), env=_child_env(str(apps)))
+        if logfile is not None:
+            log(f"GUI output -> {logfile}")
+    return subprocess.Popen(
+        cmd, cwd=str(apps), env=_child_env(str(apps)),
+        stdout=out, stderr=(subprocess.STDOUT if out is not None else None), text=True,
+    )
