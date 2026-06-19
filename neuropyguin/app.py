@@ -810,6 +810,19 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._persist_all_settings()
+        # Stop the recurring UI timer and drop any queued background work so the
+        # thread pools do not keep the process alive after the window closes.
+        try:
+            self.busy_timer.stop()
+        except Exception:
+            pass
+        for pool in (QtCore.QThreadPool.globalInstance(),
+                     getattr(self.hist_tab, "pool", None)):
+            try:
+                if pool is not None:
+                    pool.clear()
+            except Exception:
+                pass
         super().closeEvent(event)
 
 
@@ -849,7 +862,17 @@ def main() -> int:
     win.showMaximized()
     if splash is not None:
         splash.finish(win)
-    return app.exec()
+    exit_code = int(app.exec())
+    # The window is closed and settings are persisted, but a worker blocked in
+    # subprocess.wait() on a pool thread, the matplotlib Qt canvas, or an atexit
+    # hook can keep the interpreter alive (the app "doesn't close fully"). Flush
+    # what we care about and terminate hard so the process always exits.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":
