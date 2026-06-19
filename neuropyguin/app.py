@@ -810,8 +810,12 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._persist_all_settings()
-        # Stop the recurring UI timer and drop any queued background work so the
-        # thread pools do not keep the process alive after the window closes.
+        # Flush settings to disk now: os._exit below skips normal QSettings sync.
+        try:
+            self.settings.sync()
+        except Exception:
+            pass
+        # Stop the recurring UI timer and drop any queued background work.
         try:
             self.busy_timer.stop()
         except Exception:
@@ -824,6 +828,15 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         super().closeEvent(event)
+        # Terminate hard from here: a pool worker blocked in subprocess.wait() or
+        # the matplotlib Qt canvas can stop app.exec() from ever returning, so the
+        # window vanishes but python.exe lingers and the terminal never frees up.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 def main() -> int:
