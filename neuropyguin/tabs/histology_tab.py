@@ -31,6 +31,13 @@ from ..workers import FunctionWorker
 from ..histology import atlas as hatlas
 from ..histology import io_formats, matching, tracing, alignment, slice_prep, ibl_launch
 
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
+except Exception:  # pragma: no cover
+    FigureCanvasQTAgg = None  # type: ignore[assignment]
+    Figure = None  # type: ignore[assignment]
+
 try:  # crash breadcrumbs: identify the last render step before a native paint crash
     from .._diagnostics import breadcrumb as _crumb
 except Exception:  # pragma: no cover
@@ -119,6 +126,249 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         self.view.addItem(item)
         self._overlays.append(item)
         _crumb("add_mask_overlay done")
+
+
+class Trajectory3DCanvas(QtWidgets.QWidget):
+    """Matplotlib diagnostic view for CCF shell and probe trajectories."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._plot_theme = "Light"
+        self._wire_cache_key: Optional[Tuple[str, Tuple[int, int, int]]] = None
+        self._wire_cache: List[np.ndarray] = []
+        self._last_atlas: Optional[hatlas.AllenCCFAtlas] = None
+        self._last_probes: Optional[List[dict]] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.figure = None
+        self.canvas = None
+        if Figure is None or FigureCanvasQTAgg is None:
+            lbl = QtWidgets.QLabel("Matplotlib is unavailable.")
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lbl.setObjectName("SectionHint")
+            layout.addWidget(lbl, 1)
+            return
+
+        self.figure = Figure(figsize=(4.2, 4.0), dpi=100)
+        self.figure.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        layout.addWidget(self.canvas, 1)
+        self.clear()
+
+    def set_theme(self, theme: str) -> None:
+        self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
+        if self._last_probes is not None:
+            self.render(self._last_atlas, self._last_probes)
+        else:
+            self.clear()
+
+    def clear(self, message: str = "Build probe_ccf to render trajectories.") -> None:
+        self._last_atlas = None
+        self._last_probes = None
+        if self.figure is None or self.canvas is None:
+            return
+        bg, fg, _wire = self._theme_colors()
+        self.figure.clear()
+        self.figure.patch.set_facecolor(bg)
+        ax = self.figure.add_subplot(111)
+        ax.set_facecolor(bg)
+        ax.text(0.5, 0.5, message, ha="center", va="center", color=fg, fontsize=9)
+        ax.set_axis_off()
+        self.canvas.draw_idle()
+
+    def render(self, atlas: Optional[hatlas.AllenCCFAtlas], probes) -> None:
+        self._last_atlas = atlas
+        self._last_probes = list(probes or [])
+        if self.figure is None or self.canvas is None:
+            return
+        if not self._last_probes:
+            self.clear("No probe trajectories to render.")
+            return
+
+        bg, fg, wire = self._theme_colors()
+        self.figure.clear()
+        self.figure.patch.set_facecolor(bg)
+        ax = self.figure.add_subplot(111, projection="3d")
+        ax.set_facecolor(bg)
+
+        plotted_anything = False
+        if atlas is not None:
+            for path in self._brain_wireframe_paths(atlas):
+                xyz = self._ccf_to_plot_mm(path)
+                ax.plot(
+                    xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                    color=wire, linewidth=0.35, alpha=0.50,
+                )
+                plotted_anything = True
+            self._set_atlas_limits(ax, atlas)
+
+        plotted_probe = False
+        for i, probe in enumerate(self._last_probes):
+            coords = np.asarray(probe.get("trajectory_coords", np.zeros((0, 3))), dtype=float)
+            if coords.ndim != 2 or coords.shape[0] < 2:
+                coords = np.asarray(probe.get("points", np.zeros((0, 3))), dtype=float)
+            if coords.ndim != 2 or coords.shape[1] < 3:
+                continue
+            coords = coords[:, :3]
+            coords = coords[np.isfinite(coords).all(axis=1)]
+            if coords.shape[0] < 2:
+                continue
+            coords = coords[np.argsort(coords[:, 1])]
+            xyz = self._ccf_to_plot_mm(coords)
+            color = self._probe_rgb(i)
+            ax.plot(
+                xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                color=color, linewidth=2.2, alpha=0.98,
+            )
+            ax.scatter(
+                xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                color=[color], s=18, depthshade=False,
+            )
+            ax.text(
+                xyz[0, 0], xyz[0, 1], xyz[0, 2],
+                f"P{i + 1}", color=color, fontsize=8,
+            )
+            plotted_anything = True
+            plotted_probe = True
+
+        if not plotted_probe:
+            ax.text2D(
+                0.5, 0.5, "No valid CCF trajectory points.",
+                transform=ax.transAxes, ha="center", va="center", color=fg, fontsize=9,
+            )
+        elif not plotted_anything:
+            ax.text2D(
+                0.5, 0.5, "No atlas shell available.",
+                transform=ax.transAxes, ha="center", va="center", color=fg, fontsize=9,
+            )
+
+        ax.view_init(elev=18, azim=-58)
+        ax.set_axis_off()
+        try:
+            ax.set_box_aspect((1.0, 1.15, 0.82))
+        except Exception:
+            pass
+        self.canvas.draw_idle()
+
+    def _theme_colors(self) -> Tuple[str, str, str]:
+        if self._plot_theme == "Dark":
+            return "#0b0f14", "#d7dde5", "#8b949e"
+        return "#ffffff", "#27313a", "#6f7882"
+
+    @staticmethod
+    def _probe_rgb(index: int) -> Tuple[float, float, float]:
+        q = PROBE_QCOLORS[index % len(PROBE_QCOLORS)]
+        return q.redF(), q.greenF(), q.blueF()
+
+    @staticmethod
+    def _ccf_to_plot_mm(points: np.ndarray) -> np.ndarray:
+        pts = np.asarray(points, dtype=float).reshape(-1, 3)
+        rel = (pts - hatlas.BREGMA_CCF[None, :]) * (hatlas.CCF_VOXEL_UM / 1000.0)
+        return np.column_stack([rel[:, 2], rel[:, 0], rel[:, 1]])
+
+    @staticmethod
+    def _boundary_mask(mask: np.ndarray) -> np.ndarray:
+        m = np.asarray(mask, dtype=bool)
+        if m.size == 0:
+            return m
+        p = np.pad(m, 1, mode="constant", constant_values=False)
+        interior = (
+            m
+            & p[1:-1, :-2]
+            & p[1:-1, 2:]
+            & p[:-2, 1:-1]
+            & p[2:, 1:-1]
+        )
+        return m & ~interior
+
+    @classmethod
+    def _contour_lines(cls, mask: np.ndarray, max_points: int = 180) -> List[Tuple[np.ndarray, np.ndarray]]:
+        m = np.asarray(mask, dtype=bool)
+        if not np.any(m):
+            return []
+
+        components: List[np.ndarray] = []
+        try:
+            from scipy import ndimage
+
+            labels, n_labels = ndimage.label(m)
+            if n_labels:
+                idx = np.arange(1, n_labels + 1)
+                sizes = ndimage.sum(m, labels, index=idx)
+                keep = idx[np.argsort(sizes)[-4:]]
+                components = [labels == int(label) for label in keep if sizes[int(label) - 1] > 8]
+        except Exception:
+            components = [m]
+
+        lines: List[Tuple[np.ndarray, np.ndarray]] = []
+        for comp in components or [m]:
+            yy, xx = np.nonzero(cls._boundary_mask(comp))
+            if yy.size < 5:
+                continue
+            cy = float(np.mean(yy))
+            cx = float(np.mean(xx))
+            order = np.argsort(np.arctan2(yy - cy, xx - cx))
+            if order.size > max_points:
+                take = np.linspace(0, order.size - 1, max_points, dtype=int)
+                order = order[take]
+            y = yy[order].astype(float)
+            x = xx[order].astype(float)
+            if y.size:
+                y = np.r_[y, y[0]]
+                x = np.r_[x, x[0]]
+            lines.append((y, x))
+        return lines
+
+    def _brain_wireframe_paths(self, atlas: hatlas.AllenCCFAtlas) -> List[np.ndarray]:
+        key = (str(atlas.atlas_path), tuple(atlas.shape))
+        if self._wire_cache_key == key:
+            return self._wire_cache
+
+        av = atlas.av
+        ap_n, dv_n, ml_n = atlas.shape
+        paths: List[np.ndarray] = []
+
+        for ap_i in np.unique(np.linspace(0, ap_n - 1, 18, dtype=int)):
+            mask = np.asarray(av[ap_i, :, :]) > 1
+            for y, x in self._contour_lines(mask):
+                paths.append(np.column_stack([
+                    np.full(y.shape, ap_i + 1.0), y + 1.0, x + 1.0,
+                ]))
+
+        for ml_i in np.unique(np.linspace(0, ml_n - 1, 12, dtype=int)):
+            mask = np.asarray(av[:, :, ml_i]) > 1
+            for y, x in self._contour_lines(mask):
+                paths.append(np.column_stack([
+                    y + 1.0, x + 1.0, np.full(y.shape, ml_i + 1.0),
+                ]))
+
+        for dv_i in np.unique(np.linspace(0, dv_n - 1, 7, dtype=int)):
+            mask = np.asarray(av[:, dv_i, :]) > 1
+            for y, x in self._contour_lines(mask, max_points=140):
+                paths.append(np.column_stack([
+                    y + 1.0, np.full(y.shape, dv_i + 1.0), x + 1.0,
+                ]))
+
+        self._wire_cache_key = key
+        self._wire_cache = [np.asarray(path, dtype=float) for path in paths if len(path) >= 2]
+        return self._wire_cache
+
+    def _set_atlas_limits(self, ax, atlas: hatlas.AllenCCFAtlas) -> None:
+        ap_n, dv_n, ml_n = atlas.shape
+        corners = np.array([
+            [1.0, 1.0, 1.0],
+            [float(ap_n), float(dv_n), float(ml_n)],
+        ])
+        xyz = self._ccf_to_plot_mm(corners)
+        ax.set_xlim(float(np.min(xyz[:, 0])), float(np.max(xyz[:, 0])))
+        ax.set_ylim(float(np.min(xyz[:, 1])), float(np.max(xyz[:, 1])))
+        ax.set_zlim(float(np.max(xyz[:, 2])), float(np.min(xyz[:, 2])))
 
 
 class HistologyTab(QtWidgets.QWidget):
@@ -418,9 +668,16 @@ class HistologyTab(QtWidgets.QWidget):
         self.canvas_trace = ImageCanvas()
         self.canvas_trace.clicked.connect(self._trace_click)
         body.addWidget(self._titled("Histology probe line", self.canvas_trace))
+
+        trajectory_panel = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.trace_areas = pg.GraphicsLayoutWidget()
-        body.addWidget(self._titled("Trajectory areas", self.trace_areas))
-        body.setSizes([700, 350])
+        self.trace_3d = Trajectory3DCanvas()
+        trajectory_panel.addWidget(self._titled("Trajectory areas", self.trace_areas))
+        trajectory_panel.addWidget(self._titled("3D trajectories", self.trace_3d))
+        trajectory_panel.setSizes([360, 440])
+
+        body.addWidget(trajectory_panel)
+        body.setSizes([620, 800])
         v.addWidget(body, 1)
 
         ctl = QtWidgets.QHBoxLayout()
@@ -494,15 +751,23 @@ class HistologyTab(QtWidgets.QWidget):
         b_ch.clicked.connect(self._gen_channels)
         b_all = QtWidgets.QPushButton("Run all (extract -> xyz -> channels)")
         b_all.clicked.connect(self._gen_all)
-        for b in [b_xyz, b_ch, b_all]:
+        b_units = QtWidgets.QPushButton("Plot unit distribution")
+        b_units.clicked.connect(self._plot_unit_distribution)
+        for b in [b_xyz, b_ch, b_all, b_units]:
             btns.addWidget(b)
         btns.addStretch(1)
         v.addLayout(btns)
 
+        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.units_plot = pg.GraphicsLayoutWidget()
+        self.units_plot.setBackground("w")
+        split.addWidget(self._titled("Unit distribution across regions", self.units_plot))
         self.tbl_channels = QtWidgets.QTableWidget(0, 4)
         self.tbl_channels.setHorizontalHeaderLabels(["channel", "axial", "lateral", "region"])
         self.tbl_channels.horizontalHeader().setStretchLastSection(True)
-        v.addWidget(self.tbl_channels, 1)
+        split.addWidget(self._titled("Per-channel region table", self.tbl_channels))
+        split.setSizes([520, 220])
+        v.addWidget(split, 1)
         return page
 
     # ---- IBL page ----
@@ -569,6 +834,9 @@ class HistologyTab(QtWidgets.QWidget):
         )]:
             if c is not None:
                 c.setBackground(bg)
+        trace_3d = getattr(self, "trace_3d", None)
+        if trace_3d is not None:
+            trace_3d.set_theme(self._plot_theme)
 
     def _run_bg(self, fn, on_done, *args, busy_msg: str = "", on_finished=None) -> None:
         if busy_msg:
@@ -708,6 +976,11 @@ class HistologyTab(QtWidgets.QWidget):
         self._load_match_specs()  # restore saved atlas matching for this run
         self.probe_points = {}
         self._load_probe_lines()  # restore drawn probe tracks for this run
+        try:
+            self.trace_areas.clear()
+            self.trace_3d.clear()
+        except Exception:
+            pass
         self._refresh_status()
         self._preproc_show()
         self._match_show()
@@ -1409,6 +1682,10 @@ class HistologyTab(QtWidgets.QWidget):
                 self._draw_one_trajectory(i, p)
             except Exception as exc:
                 self._log(f"Could not draw trajectory for probe {i + 1}: {exc}")
+        try:
+            self.trace_3d.render(self.atlas, probes)
+        except Exception as exc:
+            self._log(f"Could not draw 3D probe trajectories: {exc}")
 
     def _draw_one_trajectory(self, i: int, p: dict) -> None:
         ta = p.get("trajectory_areas")
@@ -1508,6 +1785,8 @@ class HistologyTab(QtWidgets.QWidget):
         self._log("Channel map generated.")
         self._refresh_status()
         self._load_channel_table()
+        if self.folder is not None and (self.folder / "clusters.channels.npy").exists():
+            self._plot_unit_distribution()  # auto-show the summary when units exist
 
     def _load_channel_table(self) -> None:
         import json
@@ -1523,6 +1802,146 @@ class HistologyTab(QtWidgets.QWidget):
             self.tbl_channels.setItem(r, 1, QtWidgets.QTableWidgetItem(str(v.get("axial", ""))))
             self.tbl_channels.setItem(r, 2, QtWidgets.QTableWidgetItem(str(v.get("lateral", ""))))
             self.tbl_channels.setItem(r, 3, QtWidgets.QTableWidgetItem(str(v.get("brain_region", ""))))
+
+    # ------------------------------------------------ Unit distribution plots
+    def _plot_unit_distribution(self) -> None:
+        if self.folder is None:
+            self._log("Load a session folder first.")
+            return
+        folder = self.folder
+        atlas_path = self.ed_atlas.text().strip() or None
+
+        def job():
+            return HistologyTab._compute_unit_distribution(folder, atlas_path)
+
+        def done(data):
+            if data is None:
+                self._log("Unit distribution needs ALF cluster files "
+                          "(clusters.channels.npy / clusters.depths.npy). Re-run the channel "
+                          "map with 'Run ALF extraction first' checked.")
+                return
+            self._draw_unit_distribution(data)
+            self._log(f"Plotted {data['n_units']} units across "
+                      f"{len(data['region_order'])} region(s).")
+
+        self._run_bg(job, done, busy_msg="Loading unit distribution...")
+
+    @staticmethod
+    def _compute_unit_distribution(folder, atlas_path):
+        """Load per-unit depth/region/firing from the ALF products (worker thread)."""
+        folder = Path(folder)
+        need = ["clusters.channels.npy", "clusters.depths.npy", "channel_locations_all_shanks.json"]
+        if not all((folder / f).exists() for f in need):
+            return None
+        ch = np.asarray(np.load(folder / "clusters.channels.npy")).astype(int)
+        depths = np.asarray(np.load(folder / "clusters.depths.npy")).astype(float)
+        n = int(min(len(ch), len(depths)))
+        ch, depths = ch[:n], depths[:n]
+        loc = json.loads((folder / "channel_locations_all_shanks.json").read_text())
+
+        acr = np.empty(n, dtype=object)
+        rid = np.full(n, -1, dtype=int)
+        lat = np.full(n, np.nan)
+        for c in range(n):
+            info = loc.get(str(int(ch[c])))
+            if info is None:
+                acr[c] = "?"
+                continue
+            acr[c] = str(info.get("brain_region", "?")) or "?"
+            rid[c] = int(info.get("brain_region_id", -1))
+            lat[c] = float(info.get("lateral", np.nan))
+
+        counts = np.ones(n, dtype=float)
+        sf = folder / "spikes.clusters.npy"
+        if sf.exists():
+            sclu = np.asarray(np.load(sf))
+            sclu = sclu[(sclu >= 0) & (sclu < n)].astype(int)
+            if sclu.size:
+                counts = np.bincount(sclu, minlength=n)[:n].astype(float)
+
+        id2col = {}
+        try:
+            base = hatlas.resolve_atlas_path(atlas_path)
+            st = hatlas.load_structure_tree(base / hatlas._STRUCTURE_FN)
+            for _, r in st.iterrows():
+                h = str(r["color_hex_triplet"])
+                try:
+                    id2col[int(r["id"])] = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+                except (ValueError, IndexError):
+                    pass
+        except Exception:
+            pass
+
+        regions: Dict[str, dict] = {}
+        for c in range(n):
+            d = regions.setdefault(str(acr[c]), {"count": 0, "rid": int(rid[c]), "depths": []})
+            d["count"] += 1
+            d["depths"].append(float(depths[c]))
+        region_order = sorted(regions, key=lambda a: float(np.mean(regions[a]["depths"])))
+        return {
+            "n_units": n, "depths": depths, "lateral": lat, "rid": rid, "counts": counts,
+            "id2col": id2col, "regions": regions, "region_order": region_order,
+        }
+
+    @staticmethod
+    def _style_plot(p, title: str) -> None:
+        p.setTitle(title, color=(30, 30, 30), size="10pt")
+        for axn in ("left", "bottom"):
+            ax = p.getAxis(axn)
+            ax.setPen(pg.mkPen((90, 90, 90)))
+            ax.setTextPen(pg.mkPen((40, 40, 40)))
+
+    def _draw_unit_distribution(self, data) -> None:
+        try:
+            self.units_plot.clear()
+        except Exception as exc:
+            self._log(f"Could not reset unit plot: {exc}")
+            return
+        id2col = data["id2col"]
+
+        def col(rid_val):
+            return id2col.get(int(rid_val), (120, 120, 120))
+
+        depths = data["depths"]
+        lat = np.nan_to_num(np.asarray(data["lateral"]), nan=0.0)
+        rid = data["rid"]
+        counts = np.asarray(data["counts"], float)
+        cmax = float(np.log10(counts.max() + 1)) if counts.size else 1.0
+        cmax = cmax if cmax > 0 else 1.0
+        sizes = (6.0 + 14.0 * (np.log10(counts + 1) / cmax)).tolist()
+
+        # Panel 1: spatial scatter (lateral vs depth), coloured by region.
+        p1 = self.units_plot.addPlot(row=0, col=0)
+        self._style_plot(p1, f"{data['n_units']} units  (size = firing)")
+        p1.setLabel("left", "depth (um)")
+        p1.setLabel("bottom", "lateral (um)")
+        p1.showGrid(x=False, y=True, alpha=0.15)
+        jitter = (np.random.default_rng(0).random(len(lat)) - 0.5) * 14.0
+        brushes = [pg.mkBrush(*col(rid[i]), 210) for i in range(len(depths))]
+        p1.addItem(pg.ScatterPlotItem(
+            x=(lat + jitter).tolist(), y=np.asarray(depths).tolist(),
+            size=sizes, brush=brushes, pen=pg.mkPen((40, 40, 40), width=0.4)))
+
+        # Panel 2: units per region (horizontal bars), in anatomical (depth) order.
+        order = data["region_order"]
+        if order:
+            p2 = self.units_plot.addPlot(row=0, col=1)
+            self._style_plot(p2, "units per region")
+            p2.setLabel("bottom", "# units")
+            ypos = np.arange(len(order))
+            widths = np.array([data["regions"][a]["count"] for a in order], float)
+            rids = [data["regions"][a]["rid"] for a in order]
+            p2.addItem(pg.BarGraphItem(
+                x0=np.zeros(len(order)), x1=widths, y=ypos, height=0.7,
+                brushes=[pg.mkBrush(*col(r), 235) for r in rids],
+                pen=pg.mkPen((70, 70, 70), width=0.5)))
+            p2.getAxis("left").setTicks([[(i, a) for i, a in enumerate(order)]])
+            wmax = float(widths.max()) if widths.size else 1.0
+            for i, wv in enumerate(widths):
+                t = pg.TextItem(str(int(wv)), color=(40, 40, 40), anchor=(0, 0.5))
+                t.setPos(wv + wmax * 0.02, i)
+                p2.addItem(t)
+            p2.setXRange(0, wmax * 1.15)
 
     def _launch_ibl(self) -> None:
         if self.folder is None:
