@@ -14,6 +14,120 @@ import pandas as pd
 from scipy import signal
 
 
+def cluster_synced_units(
+    units: Iterable[int],
+    matrix: np.ndarray,
+    threshold: Optional[float] = None,
+    min_group_size: int = 2,
+) -> Dict[str, np.ndarray | float]:
+    """Group and order units by high pairwise synchrony scores.
+
+    The input matrix is treated as a pairwise affinity matrix. Strong off-diagonal
+    edges define connected components; components are sorted by their internal
+    synchrony and units within each component are sorted by total synchrony.
+    Singleton or weakly connected units receive group id 0.
+    """
+    unit_arr = np.asarray([int(u) for u in units], dtype=np.int64)
+    mat = np.asarray(matrix, dtype=float)
+    n_units = int(unit_arr.size)
+    if n_units == 0:
+        return {
+            "order": np.asarray([], dtype=np.int64),
+            "sorted_units": np.asarray([], dtype=np.int64),
+            "group_labels": np.asarray([], dtype=np.int64),
+            "threshold": float("nan"),
+        }
+    if mat.shape != (n_units, n_units):
+        order = np.arange(n_units, dtype=np.int64)
+        return {
+            "order": order,
+            "sorted_units": unit_arr.copy(),
+            "group_labels": np.zeros(n_units, dtype=np.int64),
+            "threshold": float("nan"),
+        }
+
+    score = np.nan_to_num(0.5 * (mat + mat.T), nan=0.0, posinf=0.0, neginf=0.0)
+    np.fill_diagonal(score, 0.0)
+    tri = score[np.triu_indices(n_units, k=1)]
+    positive = tri[np.isfinite(tri) & (tri > 0.0)]
+    if positive.size == 0:
+        order = np.arange(n_units, dtype=np.int64)
+        return {
+            "order": order,
+            "sorted_units": unit_arr.copy(),
+            "group_labels": np.zeros(n_units, dtype=np.int64),
+            "threshold": float("nan"),
+        }
+
+    if threshold is None:
+        median = float(np.nanmedian(positive))
+        mad = float(np.nanmedian(np.abs(positive - median)))
+        robust_high = median + 1.4826 * mad
+        quantile_high = float(np.nanpercentile(positive, 75.0))
+        threshold_value = max(quantile_high, robust_high)
+    else:
+        threshold_value = float(threshold)
+    if not np.isfinite(threshold_value):
+        threshold_value = float(np.nanmax(positive))
+
+    adjacency = score >= threshold_value
+    np.fill_diagonal(adjacency, False)
+    visited = np.zeros(n_units, dtype=bool)
+    components: list[list[int]] = []
+    for start in range(n_units):
+        if visited[start]:
+            continue
+        stack = [start]
+        visited[start] = True
+        component: list[int] = []
+        while stack:
+            idx = stack.pop()
+            component.append(idx)
+            for neighbor in np.flatnonzero(adjacency[idx]):
+                ni = int(neighbor)
+                if not visited[ni]:
+                    visited[ni] = True
+                    stack.append(ni)
+        components.append(component)
+
+    def component_strength(component: list[int]) -> float:
+        if len(component) < 2:
+            return float(np.sum(score[component[0]]))
+        sub = score[np.ix_(component, component)]
+        vals = sub[np.triu_indices(len(component), k=1)]
+        return float(np.nanmean(vals)) if vals.size else 0.0
+
+    components.sort(
+        key=lambda comp: (
+            -int(len(comp) >= max(2, int(min_group_size))),
+            -component_strength(comp),
+            min(comp),
+        )
+    )
+
+    group_by_original = np.zeros(n_units, dtype=np.int64)
+    ordered: list[int] = []
+    next_group_id = 1
+    for component in components:
+        component = sorted(
+            component,
+            key=lambda idx: (-float(np.sum(score[idx, component])), idx),
+        )
+        if len(component) >= max(2, int(min_group_size)):
+            for idx in component:
+                group_by_original[idx] = next_group_id
+            next_group_id += 1
+        ordered.extend(component)
+
+    order = np.asarray(ordered, dtype=np.int64)
+    return {
+        "order": order,
+        "sorted_units": unit_arr[order],
+        "group_labels": group_by_original[order],
+        "threshold": float(threshold_value),
+    }
+
+
 def _parse_meta(meta_path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not meta_path.exists():

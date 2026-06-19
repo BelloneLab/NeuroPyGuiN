@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from neuropyguin.postproc_engine import NeuropixelsDataset
+from neuropyguin.postproc_engine import NeuropixelsDataset, cluster_synced_units
 from neuropyguin.postproc_events import inspect_event_csv, load_event_times
 
 
@@ -106,3 +106,21 @@ def test_psth_by_unit_averages_trials_within_each_unit(tmp_path: Path) -> None:
     assert unit_ids == [1, 2]
     assert np.allclose(mat[0], np.array([50.0, 50.0], dtype=float))
     assert np.allclose(mat[1], np.array([100.0, 0.0], dtype=float))
+
+
+def test_cluster_synced_units_groups_and_orders_strong_pairs() -> None:
+    mat = np.array(
+        [
+            [0.0, 9.0, 1.0, 0.0],
+            [8.0, 0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0, 7.0],
+            [0.0, 0.0, 6.0, 0.0],
+        ],
+        dtype=float,
+    )
+
+    grouped = cluster_synced_units([10, 11, 12, 13], mat, threshold=5.0)
+
+    assert grouped["sorted_units"].tolist() == [10, 11, 12, 13]
+    assert grouped["group_labels"].tolist() == [1, 1, 2, 2]
+    assert grouped["threshold"] == 5.0

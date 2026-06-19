@@ -12,7 +12,7 @@ from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
 from ..postproc_events import inspect_event_csv, load_event_times
-from ..postproc_engine import NeuropixelsDataset, export_units_h5
+from ..postproc_engine import NeuropixelsDataset, cluster_synced_units, export_units_h5
 from ..npyx_corr_bridge import PAIRWISE_ONLY_METHODS, method_metadata, method_options, run_method
 
 
@@ -24,6 +24,13 @@ def _is_bombcell_good_label(value: object) -> bool:
     while "__" in normalized:
         normalized = normalized.replace("__", "_")
     return normalized in {"good", "non_soma", "non_soma_good", "nonsoma", "nonsomagood"}
+
+
+def _sync_group_color(group_id: int, alpha: int = 220) -> tuple[int, int, int, int]:
+    if int(group_id) <= 0:
+        return (120, 132, 150, alpha)
+    color = pg.intColor(int(group_id) - 1, hues=10, values=1, maxValue=235)
+    return (int(color.red()), int(color.green()), int(color.blue()), int(alpha))
 
 
 class PostProcessingTab(QtWidgets.QWidget):
@@ -1402,11 +1409,21 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._set_progress(10)
         try:
             mat = self.dataset.ccg_matrix(units, bin_ms=float(self.sp_net_bin.value()), win_ms=float(self.sp_net_win.value()))
+            grouping = cluster_synced_units(units, mat)
             self._set_progress(60)
             t_s, idx = self.dataset.synchrony_over_time(
                 bin_ms=float(self.sp_sync_bin.value()), window_s=float(self.sp_sync_win.value()), step_s=float(self.sp_sync_step.value())
             )
-            self.results["network"] = {"mat": mat, "t_s": t_s, "idx": idx}
+            self.results["network"] = {
+                "mat": mat,
+                "t_s": t_s,
+                "idx": idx,
+                "units": np.asarray(units, dtype=int),
+                "order": grouping["order"],
+                "sorted_units": grouping["sorted_units"],
+                "group_labels": grouping["group_labels"],
+                "sync_group_threshold": grouping["threshold"],
+            }
             self._set_progress(100)
             self._log("Network metrics computed.")
             self._show_network()
@@ -2135,25 +2152,108 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.plot_net_matrix.clear()
         self.plot_net_sync.clear()
         mat = np.asarray(r.get("mat", []), dtype=float)
+        order = np.asarray(r.get("order", []), dtype=int)
+        sorted_units = np.asarray(r.get("sorted_units", []), dtype=int)
+        group_labels = np.asarray(r.get("group_labels", []), dtype=int)
         t_s = np.asarray(r.get("t_s", []), dtype=float)
         idx = np.asarray(r.get("idx", []), dtype=float)
         if mat.size:
-            img = pg.ImageItem(mat)
+            if (
+                order.size == mat.shape[0]
+                and sorted_units.size == mat.shape[0]
+                and group_labels.size == mat.shape[0]
+            ):
+                display_mat = mat[np.ix_(order, order)]
+            else:
+                display_mat = mat
+                sorted_units = np.asarray(self._selected_units(), dtype=int)
+                group_labels = np.zeros(display_mat.shape[0], dtype=int)
+            self.plot_net_matrix.setTitle("Pairwise CCG matrix | synced units clustered row-wise")
+            img = pg.ImageItem(display_mat)
+            img.setRect(QtCore.QRectF(0, 0, display_mat.shape[1], display_mat.shape[0]))
             cm = pg.colormap.get("CET-L9" if self._plot_theme == "Dark" else "CET-L4")
             if cm is not None:
                 img.setLookupTable(cm.getLookupTable(nPts=256))
             self.plot_net_matrix.addItem(img)
+            n_rows = int(display_mat.shape[0])
+            n_cols = int(display_mat.shape[1])
+            for row, group_id in enumerate(group_labels):
+                gid = int(group_id)
+                if gid <= 0:
+                    continue
+                stripe = QtWidgets.QGraphicsRectItem(0, row, n_cols, 1.0)
+                stripe.setBrush(pg.mkBrush(_sync_group_color(gid, alpha=38)))
+                stripe.setPen(pg.mkPen((0, 0, 0, 0)))
+                stripe.setZValue(5)
+                self.plot_net_matrix.addItem(stripe)
+                bar = QtWidgets.QGraphicsRectItem(-0.55, row, 0.35, 1.0)
+                bar.setBrush(pg.mkBrush(_sync_group_color(gid, alpha=235)))
+                bar.setPen(pg.mkPen((0, 0, 0, 0)))
+                bar.setZValue(6)
+                self.plot_net_matrix.addItem(bar)
+            for gid in sorted(int(v) for v in np.unique(group_labels) if int(v) > 0):
+                rows = np.flatnonzero(group_labels == gid)
+                if rows.size == 0:
+                    continue
+                label = pg.TextItem(f"G{gid}", color=_sync_group_color(gid, alpha=255), anchor=(1.0, 0.5))
+                label.setPos(-0.64, float(rows.mean()) + 0.5)
+                label.setZValue(7)
+                self.plot_net_matrix.addItem(label)
+            unit_ticks = [(i + 0.5, str(int(unit))) for i, unit in enumerate(sorted_units)]
+            if len(unit_ticks) <= 60:
+                self.plot_net_matrix.getAxis("left").setTicks([unit_ticks])
+                self.plot_net_matrix.getAxis("bottom").setTicks([unit_ticks])
+            else:
+                self.plot_net_matrix.getAxis("left").setTicks([])
+                self.plot_net_matrix.getAxis("bottom").setTicks([])
+            self.plot_net_matrix.setLabel("left", "Unit (clustered)")
+            self.plot_net_matrix.setLabel("bottom", "Unit (clustered)")
+            self.plot_net_matrix.setXRange(-0.75, n_cols, padding=0.02)
+            self.plot_net_matrix.setYRange(0, n_rows, padding=0.02)
             self.plot_net_matrix.getViewBox().invertY(True)
         if t_s.size:
             self.plot_net_sync.plot(t_s, idx, pen=pg.mkPen((180, 120, 255), width=1.7))
         net_rows = []
         if mat.size:
-            for i in range(mat.shape[0]):
-                for j in range(mat.shape[1]):
-                    net_rows.append({"row": int(i), "col": int(j), "value": float(mat[i, j])})
+            if order.size == mat.shape[0] and sorted_units.size == mat.shape[0]:
+                export_order = order
+                export_units = sorted_units
+                export_groups = group_labels
+                export_mat = mat[np.ix_(export_order, export_order)]
+            else:
+                export_order = np.arange(mat.shape[0], dtype=int)
+                export_units = np.asarray(self._selected_units(), dtype=int)
+                export_groups = np.zeros(mat.shape[0], dtype=int)
+                export_mat = mat
+            for i in range(export_mat.shape[0]):
+                for j in range(export_mat.shape[1]):
+                    net_rows.append(
+                        {
+                            "row": int(i),
+                            "col": int(j),
+                            "unit_a": int(export_units[i]) if i < export_units.size else int(i),
+                            "unit_b": int(export_units[j]) if j < export_units.size else int(j),
+                            "group_a": int(export_groups[i]) if i < export_groups.size else 0,
+                            "group_b": int(export_groups[j]) if j < export_groups.size else 0,
+                            "value": float(export_mat[i, j]),
+                        }
+                    )
+            group_rows = [
+                {
+                    "sorted_row": int(i),
+                    "source_row": int(export_order[i]) if i < export_order.size else int(i),
+                    "unit_id": int(export_units[i]) if i < export_units.size else int(i),
+                    "sync_group": int(export_groups[i]) if i < export_groups.size else 0,
+                    "sync_group_threshold": float(r.get("sync_group_threshold", np.nan)),
+                }
+                for i in range(export_units.size)
+            ]
+        else:
+            group_rows = []
         sync_rows = [{"time_s": float(tv), "synchrony_index": float(iv)} for tv, iv in zip(t_s, idx)] if t_s.size else []
         self._export_payloads["network"] = [
             ("network_matrix.csv", pd.DataFrame(net_rows)),
+            ("network_sync_groups.csv", pd.DataFrame(group_rows)),
             ("network_synchrony.csv", pd.DataFrame(sync_rows)),
         ]
         self.view_tabs.setCurrentIndex(4)
