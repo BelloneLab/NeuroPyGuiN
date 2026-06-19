@@ -32,9 +32,11 @@ from ..histology import atlas as hatlas
 from ..histology import io_formats, matching, tracing, alignment, slice_prep, ibl_launch
 
 try:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
     from matplotlib.figure import Figure
 except Exception:  # pragma: no cover
+    FigureCanvasAgg = None  # type: ignore[assignment]
     FigureCanvasQTAgg = None  # type: ignore[assignment]
     Figure = None  # type: ignore[assignment]
 
@@ -191,37 +193,97 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
             self.clear("No probe trajectories to render.")
             return
 
-        bg, fg, wire = self._theme_colors()
         self.figure.clear()
-        self.figure.patch.set_facecolor(bg)
-        ax = self.figure.add_subplot(111, projection="3d")
+        wire_paths = self._brain_wireframe_paths(atlas) if atlas is not None else []
+        self._draw_scene(
+            self.figure,
+            atlas,
+            self._last_probes,
+            self._plot_theme,
+            azim=-58.0,
+            wire_paths=wire_paths,
+        )
+        self.canvas.draw_idle()
+
+    @classmethod
+    def save_gif(
+        cls,
+        path: str | Path,
+        atlas: Optional[hatlas.AllenCCFAtlas],
+        probes,
+        theme: str = "Light",
+        frames: int = 36,
+        fps: int = 12,
+    ) -> Path:
+        if Figure is None or FigureCanvasAgg is None:
+            raise RuntimeError("Matplotlib is unavailable.")
+        try:
+            from PIL import Image
+        except Exception as exc:
+            raise RuntimeError("Pillow is required to save trajectory GIFs.") from exc
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        probes = list(probes or [])
+        frames = max(int(frames), 2)
+        fps = max(int(fps), 1)
+        wire_paths = cls._build_brain_wireframe_paths(atlas) if atlas is not None else []
+
+        fig = Figure(figsize=(5.6, 5.2), dpi=100)
+        fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
+        canvas = FigureCanvasAgg(fig)
+        images = []
+        for azim in np.linspace(-68.0, 292.0, frames, endpoint=False):
+            fig.clear()
+            cls._draw_scene(fig, atlas, probes, theme, azim=float(azim), wire_paths=wire_paths)
+            canvas.draw()
+            rgba = np.asarray(canvas.buffer_rgba()).copy()
+            images.append(Image.fromarray(rgba[:, :, :3]))
+        if not images:
+            raise RuntimeError("No GIF frames were generated.")
+        images[0].save(
+            path,
+            save_all=True,
+            append_images=images[1:],
+            duration=int(1000 / fps),
+            loop=0,
+            optimize=True,
+        )
+        return path
+
+    @classmethod
+    def _draw_scene(
+        cls,
+        figure,
+        atlas: Optional[hatlas.AllenCCFAtlas],
+        probes,
+        theme: str,
+        azim: float,
+        wire_paths: Optional[List[np.ndarray]] = None,
+    ) -> None:
+        bg, fg, wire = cls._theme_colors_for(theme)
+        figure.patch.set_facecolor(bg)
+        ax = figure.add_subplot(111, projection="3d")
         ax.set_facecolor(bg)
 
         plotted_anything = False
         if atlas is not None:
-            for path in self._brain_wireframe_paths(atlas):
-                xyz = self._ccf_to_plot_mm(path)
+            for path in wire_paths if wire_paths is not None else cls._build_brain_wireframe_paths(atlas):
+                xyz = cls._ccf_to_plot_mm(path)
                 ax.plot(
                     xyz[:, 0], xyz[:, 1], xyz[:, 2],
                     color=wire, linewidth=0.35, alpha=0.50,
                 )
                 plotted_anything = True
-            self._set_atlas_limits(ax, atlas)
+            cls._set_atlas_limits(ax, atlas)
 
         plotted_probe = False
-        for i, probe in enumerate(self._last_probes):
-            coords = np.asarray(probe.get("trajectory_coords", np.zeros((0, 3))), dtype=float)
-            if coords.ndim != 2 or coords.shape[0] < 2:
-                coords = np.asarray(probe.get("points", np.zeros((0, 3))), dtype=float)
-            if coords.ndim != 2 or coords.shape[1] < 3:
-                continue
-            coords = coords[:, :3]
-            coords = coords[np.isfinite(coords).all(axis=1)]
+        for i, probe in enumerate(probes):
+            coords = cls._probe_coords(probe)
             if coords.shape[0] < 2:
                 continue
-            coords = coords[np.argsort(coords[:, 1])]
-            xyz = self._ccf_to_plot_mm(coords)
-            color = self._probe_rgb(i)
+            xyz = cls._ccf_to_plot_mm(coords)
+            color = cls._probe_rgb(i)
             ax.plot(
                 xyz[:, 0], xyz[:, 1], xyz[:, 2],
                 color=color, linewidth=2.2, alpha=0.98,
@@ -248,23 +310,40 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                 transform=ax.transAxes, ha="center", va="center", color=fg, fontsize=9,
             )
 
-        ax.view_init(elev=18, azim=-58)
+        ax.view_init(elev=18, azim=azim)
         ax.set_axis_off()
         try:
             ax.set_box_aspect((1.0, 1.15, 0.82))
         except Exception:
             pass
-        self.canvas.draw_idle()
 
     def _theme_colors(self) -> Tuple[str, str, str]:
-        if self._plot_theme == "Dark":
+        return self._theme_colors_for(self._plot_theme)
+
+    @staticmethod
+    def _theme_colors_for(theme: str) -> Tuple[str, str, str]:
+        if str(theme).lower().startswith("dark"):
             return "#0b0f14", "#d7dde5", "#8b949e"
         return "#ffffff", "#27313a", "#6f7882"
 
     @staticmethod
     def _probe_rgb(index: int) -> Tuple[float, float, float]:
-        q = PROBE_QCOLORS[index % len(PROBE_QCOLORS)]
-        return q.redF(), q.greenF(), q.blueF()
+        colors = tracing.probe_colormap(index + 1)
+        rgb = colors[index % len(colors)]
+        return float(rgb[0]), float(rgb[1]), float(rgb[2])
+
+    @staticmethod
+    def _probe_coords(probe: dict) -> np.ndarray:
+        coords = np.asarray(probe.get("trajectory_coords", np.zeros((0, 3))), dtype=float)
+        if coords.ndim != 2 or coords.shape[0] < 2:
+            coords = np.asarray(probe.get("points", np.zeros((0, 3))), dtype=float)
+        if coords.ndim != 2 or coords.shape[1] < 3:
+            return np.zeros((0, 3), dtype=float)
+        coords = coords[:, :3]
+        coords = coords[np.isfinite(coords).all(axis=1)]
+        if coords.shape[0] < 2:
+            return np.zeros((0, 3), dtype=float)
+        return coords[np.argsort(coords[:, 1])]
 
     @staticmethod
     def _ccf_to_plot_mm(points: np.ndarray) -> np.ndarray:
@@ -329,43 +408,47 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         key = (str(atlas.atlas_path), tuple(atlas.shape))
         if self._wire_cache_key == key:
             return self._wire_cache
+        self._wire_cache_key = key
+        self._wire_cache = self._build_brain_wireframe_paths(atlas)
+        return self._wire_cache
 
+    @classmethod
+    def _build_brain_wireframe_paths(cls, atlas: hatlas.AllenCCFAtlas) -> List[np.ndarray]:
         av = atlas.av
         ap_n, dv_n, ml_n = atlas.shape
         paths: List[np.ndarray] = []
 
         for ap_i in np.unique(np.linspace(0, ap_n - 1, 18, dtype=int)):
             mask = np.asarray(av[ap_i, :, :]) > 1
-            for y, x in self._contour_lines(mask):
+            for y, x in cls._contour_lines(mask):
                 paths.append(np.column_stack([
                     np.full(y.shape, ap_i + 1.0), y + 1.0, x + 1.0,
                 ]))
 
         for ml_i in np.unique(np.linspace(0, ml_n - 1, 12, dtype=int)):
             mask = np.asarray(av[:, :, ml_i]) > 1
-            for y, x in self._contour_lines(mask):
+            for y, x in cls._contour_lines(mask):
                 paths.append(np.column_stack([
                     y + 1.0, x + 1.0, np.full(y.shape, ml_i + 1.0),
                 ]))
 
         for dv_i in np.unique(np.linspace(0, dv_n - 1, 7, dtype=int)):
             mask = np.asarray(av[:, dv_i, :]) > 1
-            for y, x in self._contour_lines(mask, max_points=140):
+            for y, x in cls._contour_lines(mask, max_points=140):
                 paths.append(np.column_stack([
                     y + 1.0, np.full(y.shape, dv_i + 1.0), x + 1.0,
                 ]))
 
-        self._wire_cache_key = key
-        self._wire_cache = [np.asarray(path, dtype=float) for path in paths if len(path) >= 2]
-        return self._wire_cache
+        return [np.asarray(path, dtype=float) for path in paths if len(path) >= 2]
 
-    def _set_atlas_limits(self, ax, atlas: hatlas.AllenCCFAtlas) -> None:
+    @classmethod
+    def _set_atlas_limits(cls, ax, atlas: hatlas.AllenCCFAtlas) -> None:
         ap_n, dv_n, ml_n = atlas.shape
         corners = np.array([
             [1.0, 1.0, 1.0],
             [float(ap_n), float(dv_n), float(ml_n)],
         ])
-        xyz = self._ccf_to_plot_mm(corners)
+        xyz = cls._ccf_to_plot_mm(corners)
         ax.set_xlim(float(np.min(xyz[:, 0])), float(np.max(xyz[:, 0])))
         ax.set_ylim(float(np.min(xyz[:, 1])), float(np.max(xyz[:, 1])))
         ax.set_zlim(float(np.max(xyz[:, 2])), float(np.min(xyz[:, 2])))
@@ -408,6 +491,9 @@ class HistologyTab(QtWidgets.QWidget):
         self._trace_updating_roi = False
         self._trace_updating_controls = False
         self._trace_coord_spins: Dict[str, QtWidgets.QDoubleSpinBox] = {}
+        self._trajectory_3d_dialog: Optional[QtWidgets.QDialog] = None
+        self._trajectory_3d_popup: Optional[Trajectory3DCanvas] = None
+        self._trajectory_3d_status: Optional[QtWidgets.QLabel] = None
 
         self._build_ui()
         self._restore_settings()
@@ -756,7 +842,9 @@ class HistologyTab(QtWidgets.QWidget):
         b_all.clicked.connect(self._gen_all)
         b_units = QtWidgets.QPushButton("Plot unit distribution")
         b_units.clicked.connect(self._plot_unit_distribution)
-        for b in [b_xyz, b_ch, b_all, b_units]:
+        b_prop = QtWidgets.QPushButton("Propose alignment (auto)")
+        b_prop.clicked.connect(self._propose_alignment)
+        for b in [b_xyz, b_ch, b_all, b_units, b_prop]:
             btns.addWidget(b)
         btns.addStretch(1)
         v.addLayout(btns)
@@ -1659,6 +1747,8 @@ class HistologyTab(QtWidgets.QWidget):
             self._log(f"Saved probe_ccf.mat ({len(probes)} probes) + CSV.")
             self._refresh_status()
             self._draw_trajectory_areas(probes)
+            self._show_trajectory_3d_popup(probes)
+            self._save_trajectory_3d_gif(probes)
 
         def finished(_payload):
             if hasattr(self, "btn_trace_build"):
@@ -1720,6 +1810,77 @@ class HistologyTab(QtWidgets.QWidget):
                     txt.setPos(0.05, (d0 + d1) / 2.0)
                     plt.addItem(txt)
         _crumb(f"draw_trajectory probe {i} done")
+
+    def _show_trajectory_3d_popup(self, probes) -> None:
+        if self.atlas is None:
+            return
+        if self._trajectory_3d_dialog is None:
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Probe trajectories 3D")
+            dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+            dlg.resize(760, 680)
+
+            layout = QtWidgets.QVBoxLayout(dlg)
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(8)
+
+            canvas = Trajectory3DCanvas()
+            status = QtWidgets.QLabel("")
+            status.setObjectName("SectionHint")
+            status.setWordWrap(True)
+
+            layout.addWidget(canvas, 1)
+            layout.addWidget(status, 0)
+
+            self._trajectory_3d_dialog = dlg
+            self._trajectory_3d_popup = canvas
+            self._trajectory_3d_status = status
+
+        if self._trajectory_3d_popup is not None:
+            self._trajectory_3d_popup.set_theme(self._plot_theme)
+            self._trajectory_3d_popup.render(self.atlas, probes)
+        if self._trajectory_3d_status is not None and self.folder is not None:
+            self._trajectory_3d_status.setText(
+                f"GIF: {self.folder / 'probe_trajectories_3d.gif'}"
+            )
+        self._trajectory_3d_dialog.show()
+        self._trajectory_3d_dialog.raise_()
+        self._trajectory_3d_dialog.activateWindow()
+
+    @staticmethod
+    def _copy_probe_geometry_for_gif(probes) -> List[dict]:
+        copied = []
+        for probe in probes or []:
+            copied.append({
+                "trajectory_coords": np.asarray(
+                    probe.get("trajectory_coords", np.zeros((0, 3))), dtype=float
+                ).copy(),
+                "points": np.asarray(probe.get("points", np.zeros((0, 3))), dtype=float).copy(),
+            })
+        return copied
+
+    def _save_trajectory_3d_gif(self, probes) -> None:
+        if self.folder is None or self.atlas is None:
+            return
+        out_path = self.folder / "probe_trajectories_3d.gif"
+        atlas_path = str(self.atlas.atlas_path)
+        probes_copy = self._copy_probe_geometry_for_gif(probes)
+        theme = self._plot_theme
+
+        def job():
+            at = hatlas.AllenCCFAtlas(atlas_path)
+            return Trajectory3DCanvas.save_gif(out_path, at, probes_copy, theme=theme)
+
+        def done(path):
+            self._log(f"Saved 3D trajectory GIF: {path}")
+            if self._trajectory_3d_status is not None:
+                self._trajectory_3d_status.setText(f"GIF saved: {path}")
+
+        self._run_bg(
+            job,
+            done,
+            busy_msg=f"Saving 3D trajectory GIF to {out_path}...",
+        )
 
     # --------------------------------------------------- Channel map / IBL
     def _ibl_kwargs(self) -> dict:
@@ -1792,6 +1953,35 @@ class HistologyTab(QtWidgets.QWidget):
         self._load_channel_table()
         if self.folder is not None and (self.folder / "clusters.channels.npy").exists():
             self._plot_unit_distribution()  # auto-show the summary when units exist
+
+    def _propose_alignment(self) -> None:
+        if self.folder is None:
+            self._log("Load a session folder first.")
+            return
+        if not (self.folder / "clusters.channels.npy").exists():
+            self._log("Propose alignment needs ALF cluster files. Run the channel map "
+                      "with 'Run ALF extraction first' checked.")
+            return
+        args = ["propose_align", str(self.folder)]
+        atlas = self.ed_atlas.text().strip()
+        if atlas:
+            args += ["--atlas", atlas]
+        kw = self._ibl_kwargs()
+
+        def job():
+            return ibl_launch.run_bridge(args, **kw)[0]
+
+        def done(rc):
+            if rc != 0:
+                self._log("Alignment proposal failed.")
+                return
+            self._log(f"Alignment proposal written. Report: "
+                      f"{self.folder / 'alignment_report.md'}")
+            self._log("In the IBL GUI, pick the 'auto_...' entry from the alignment "
+                      "drop-down and press Get Data to review it.")
+
+        self._run_bg(job, done,
+                     busy_msg="Proposing alignment from firing vs atlas structure...")
 
     def _load_channel_table(self) -> None:
         import json

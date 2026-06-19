@@ -326,6 +326,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
     p_all.add_argument("--rms", action="store_true",
                        help="also compute the slow RMS/QC map (streams the whole raw AP binary)")
 
+    p_prop = sub.add_parser("propose_align")
+    p_prop.add_argument("hist_folder")
+    p_prop.add_argument("--atlas", default=None)
+
     args = parser.parse_args(argv)
 
     if args.cmd == "xyz_picks":
@@ -346,6 +350,18 @@ def _main(argv: Optional[List[str]] = None) -> int:
         compute_xyz_picks(hf / "probe_ccf.mat", hf)
         out = compute_channel_locations(hf, alignment=args.alignment, ks_dir=args.ks)
         print(json.dumps({k: str(v) for k, v in out.items()}))
+    elif args.cmd == "propose_align":
+        from .auto_align import propose_alignment
+        out = propose_alignment(args.hist_folder, atlas_path=args.atlas)
+        for s in out["shanks"]:
+            print(f"shank {s['shank']}: offset {s['offset_um']:+.0f} um  "
+                  f"(conf {s['confidence']:.2f}, peak {s['peak_corr']:.2f})  "
+                  f"{'GOOD' if s['good'] else 'low confidence'}")
+        if not out["pairing_ok"]:
+            print(f"WARNING: {out['n_recorded_shanks']} recorded shanks vs "
+                  f"{out['n_xyz_picks']} xyz_picks tracks - check pairing")
+        print(json.dumps({"report": out.get("report", ""),
+                          "pairing_ok": out["pairing_ok"]}))
     return 0
 
 
