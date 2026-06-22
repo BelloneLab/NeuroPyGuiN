@@ -26,7 +26,7 @@ from __future__ import annotations
 import datetime
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List
 
 import numpy as np
 
@@ -57,6 +57,7 @@ def _tissue_classifier(atlas_path):
 
 
 def _z(a: np.ndarray) -> np.ndarray:
+    """Z-score an array (mean 0, unit std); pass through unchanged if std is 0."""
     a = np.asarray(a, float)
     a = a - a.mean()
     s = a.std()
@@ -64,6 +65,7 @@ def _z(a: np.ndarray) -> np.ndarray:
 
 
 def _corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation of two arrays (0.0 if either is constant)."""
     a, b = np.asarray(a, float), np.asarray(b, float)
     if a.std() == 0 or b.std() == 0:
         return 0.0
@@ -229,6 +231,10 @@ def _write_proposals(hist_folder: Path, shanks: List[dict]) -> None:
 
 
 def _write_figures(hist_folder: Path, shanks: List[dict], weight_fn, ba) -> None:
+    """Save a per-shank diagnostic PNG (firing profile + offset-vs-correlation).
+
+    Silently returns if matplotlib is unavailable so the proposal still completes.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -257,6 +263,7 @@ def _write_figures(hist_folder: Path, shanks: List[dict], weight_fn, ba) -> None
 
 
 def _write_report(hist_folder: Path, summary: dict) -> Path:
+    """Write the human-readable ``alignment_report.md`` and return its path."""
     lines = ["# Probe alignment proposal", "",
              f"_Generated {datetime.datetime.now().replace(microsecond=0).isoformat()}_", "",
              "Objective offset that best matches firing to atlas gray/white structure ",

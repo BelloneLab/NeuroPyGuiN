@@ -1,4 +1,13 @@
-﻿from __future__ import annotations
+﻿"""Background worker runnables for the NeuroPyGuiN processing pipeline.
+
+These QRunnable subclasses run long tasks (generic shell pipelines, AP-binary
+concatenation, and the ecephys_spike_sorting / Kilosort pipeline) off the GUI
+thread and report progress back to the UI through a shared WorkerSignals object.
+All signal emission goes through _safe_emit so a deleted receiver during shutdown
+or tab switches does not crash the worker.
+"""
+
+from __future__ import annotations
 
 import ast
 import re
@@ -17,6 +26,11 @@ from .processes import tracked_popen, unregister_process
 
 
 def _safe_emit(signal, *args) -> None:
+    """Emit a Qt signal, ignoring the RuntimeError raised if it is already gone.
+
+    The receiver or source QObject may have been deleted during shutdown or a
+    tab switch, in which case emitting would raise; we swallow only that case.
+    """
     try:
         signal.emit(*args)
     except RuntimeError:
@@ -26,12 +40,16 @@ def _safe_emit(signal, *args) -> None:
 
 @dataclass
 class PipelineStep:
+    """One step of a generic shell pipeline: a label, an on/off flag, and a command template."""
+
     name: str
     enabled: bool
     command_template: str
 
 
 class WorkerSignals(QtCore.QObject):
+    """Qt signals shared by all workers to report logs, progress, and results to the GUI."""
+
     log = QtCore.Signal(str)
     progress = QtCore.Signal(int)
     finished = QtCore.Signal(dict)
@@ -42,6 +60,8 @@ class WorkerSignals(QtCore.QObject):
 
 
 class PipelineWorker(QtCore.QRunnable):
+    """Run a sequence of enabled shell steps for one job, streaming their output as log lines."""
+
     def __init__(self, job: Dict[str, str], steps: List[PipelineStep], placeholders: Dict[str, str]) -> None:
         super().__init__()
         self.job = job
@@ -98,6 +118,8 @@ class PipelineWorker(QtCore.QRunnable):
 
 @dataclass
 class ConcatenationConfig:
+    """Settings for fusing several SpikeGLX AP binaries into one target file."""
+
     bin_files: List[str]
     meta_files: List[str]
     target_bin: str
@@ -169,6 +191,8 @@ class ConcatenationWorker(QtCore.QRunnable):
 
 
 class FunctionWorker(QtCore.QRunnable):
+    """Run an arbitrary callable off the GUI thread and report its result or error."""
+
     def __init__(self, fn, *args, **kwargs) -> None:
         super().__init__()
         self.fn = fn
@@ -189,6 +213,8 @@ class FunctionWorker(QtCore.QRunnable):
 
 @dataclass
 class EcephysPipelineConfig:
+    """All knobs for one ecephys_spike_sorting run: stage toggles, CatGT/TPrime/Kilosort params, and tool paths."""
+
     output_root: str
     json_root: str
     mirror_raw_hierarchy_output: bool
@@ -228,6 +254,8 @@ class EcephysPipelineConfig:
 
 
 class EcephysPipelineWorker(QtCore.QRunnable):
+    """Drive the full CatGT -> Kilosort -> postprocessing -> TPrime -> bombcell pipeline for one recording."""
+
     def __init__(self, job: Dict[str, str], cfg: EcephysPipelineConfig) -> None:
         super().__init__()
         self.job = job
@@ -249,6 +277,10 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             self._active_step_key = None
 
     def _emit_step_progress_from_line(self, line: str) -> None:
+        """Scrape a trailing ``NN%`` token from a log line and forward it as step progress.
+
+        Only emits when the value changed, so repeated identical percentages do not spam the UI.
+        """
         step_key = self._active_step_key
         if not step_key:
             return
@@ -410,6 +442,11 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         return meta.exists()
 
     def _build_catgt_trials(self, run_name: str, bin_file: Path, gate_string: str, trigger_string: str, probe_string: str) -> List[Dict[str, str]]:
+        """Enumerate up to 10 candidate (directory, run, gate, trigger, probe) combos to try with CatGT.
+
+        Combinations whose meta file actually exists on disk are preferred; otherwise a
+        best-effort fallback list is returned so CatGT can still be attempted.
+        """
         dirs = self._trial_dirs(bin_file)
         parts = self._parse_bin_parts(bin_file)
         # Prefer SpikeGLX-standard root folder first: .../<session_root>
@@ -955,11 +992,9 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 catgt_extract_stream_selection,
                 catgt_stream_string,
                 default_kilosort_output_name,
-                default_pipeline_output_dir,
                 default_pipeline_ks_output_dir,
                 default_pipeline_raw_output_layout,
                 expected_ni_catgt_output_patterns,
-                extractor_label_rename_map,
                 is_catgt_processed_bin,
                 is_concatenated_run_bin,
                 has_ni_catgt_extractors,
@@ -1534,6 +1569,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
 
 
 def ensure_job_dirs(output_root: Path, run_name: str) -> Dict[str, Path]:
+    """Create the per-run output folder and return the standard CatGT/TPrime/KS JSON paths inside it."""
     job_root = output_root / run_name
     job_root.mkdir(parents=True, exist_ok=True)
     paths = {

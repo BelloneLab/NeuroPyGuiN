@@ -1,3 +1,13 @@
+"""Bridge between the GUI and the npyx.corr correlation toolbox.
+
+This module exposes a small, stable surface (method listing, per-method
+metadata, and a single dispatcher) that wraps the many correlation routines
+in ``npyx.corr``. ``run_method`` resolves the datapath, computes the requested
+analysis, and returns a plain dict ("payload") describing how to render the
+result. The npyx package itself is imported lazily so the GUI can start even
+when npyx (or its heavy dependencies) is not yet importable.
+"""
+
 from __future__ import annotations
 
 from itertools import islice
@@ -143,6 +153,12 @@ PAIRWISE_ONLY_METHODS = {
 
 
 def _ensure_npyx():
+    """Import and return ``npyx.corr``, adding npyx to ``sys.path`` if needed.
+
+    Prefers an npyx package vendored next to NeuroPyGuiN and falls back to a
+    sibling NeuroPyxels checkout. Imported lazily so app startup does not depend
+    on npyx being importable.
+    """
     import sys
 
     # Prefer vendored npyx package bundled inside NeuroPyGuiN for standalone use.
@@ -166,6 +182,7 @@ def _ensure_npyx():
 
 
 def _has_metadata_folder(dp: Path) -> bool:
+    """Return True if ``dp`` holds SpikeGLX (.ap/.lf.meta) or OpenEphys (.oebin) metadata."""
     if not dp.exists() or not dp.is_dir():
         return False
     if any(dp.glob("*.ap.meta")) or any(dp.glob("*.lf.meta")):
@@ -176,6 +193,7 @@ def _has_metadata_folder(dp: Path) -> bool:
 
 
 def _has_spike_sorting_outputs(dp: Path) -> bool:
+    """Return True if ``dp`` contains Kilosort/phy spike_times.npy and spike_clusters.npy."""
     return dp.exists() and dp.is_dir() and (dp / "spike_times.npy").exists() and (dp / "spike_clusters.npy").exists()
 
 
@@ -250,10 +268,17 @@ def resolve_analysis_datapath(dp: str) -> str:
 
 
 def method_options() -> List[Tuple[str, str]]:
+    """Return the ``(method_key, human_label)`` pairs for populating the method picker."""
     return METHOD_LABELS
 
 
 def method_metadata(method_key: str) -> Dict[str, object]:
+    """Return UI metadata (``description`` and default ``params``) for a method.
+
+    Starts from the shared ``default`` entry, overlays any explicit ``METHOD_META``
+    entry, and for methods without an explicit entry infers default params and a
+    one-line description from the npyx function signature and docstring.
+    """
     meta = METHOD_META.get("default", {}).copy()
     specific = METHOD_META.get(method_key, {})
     meta.update(specific)
@@ -291,16 +316,23 @@ def method_metadata(method_key: str) -> Dict[str, object]:
 
 
 def _meta_payload(payload: Dict[str, object], requested_dp: str, resolved_dp: str) -> Dict[str, object]:
+    """Annotate a render payload in place with the requested and resolved datapaths."""
     payload["requested_dp"] = requested_dp
     payload["resolved_dp"] = resolved_dp
     return payload
 
 
 def _samples_from_ms(ms: float, fs: int = 30000) -> int:
+    """Convert a duration in milliseconds to a sample count (at least 1) at rate ``fs``."""
     return int(max(1, round(float(ms) * float(fs) / 1000.0)))
 
 
 def _lag_axis(cbin_ms: float, cwin_ms: float, n_bins: int) -> np.ndarray:
+    """Build a symmetric lag axis (in ms) of length ``n_bins`` for a correlogram.
+
+    Uses the natural bin edges when they are long enough, otherwise synthesizes
+    an evenly spaced, zero-centred axis from the bin step.
+    """
     x = np.arange(-float(cwin_ms) / 2.0, float(cwin_ms) / 2.0 + float(cbin_ms), float(cbin_ms), dtype=float)
     if x.size >= n_bins:
         return x[:n_bins]
@@ -312,19 +344,29 @@ def _lag_axis(cbin_ms: float, cwin_ms: float, n_bins: int) -> np.ndarray:
 
 
 def _train(corr, dp: str, u: int) -> np.ndarray:
+    """Return unit ``u``'s spike train (sample indices) as an int64 array."""
     return np.asarray(corr.trn(dp, int(u)), dtype=np.int64)
 
 
 def _train_list(corr, dp: str, units: List[int]) -> List[np.ndarray]:
+    """Return the spike trains for ``units`` in order."""
     return [_train(corr, dp, int(u)) for u in units]
 
 
 def _cross_counts(corr, dp: str, u0: int, u1: int, cbin: float, cwin: float) -> np.ndarray:
+    """Return the count-normalized cross-correlogram of (u0, u1) as a 1D array."""
     m = np.asarray(corr.ccg(dp, [int(u0), int(u1)], cbin, cwin, normalize="Counts"), dtype=float)
     return m[0, 1] if m.ndim == 3 and m.shape[0] > 1 else np.ravel(m)
 
 
 def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms: float, params: Dict[str, object] | None = None) -> Dict[str, object]:
+    """Dispatch a single npyx.corr analysis and return a render payload.
+
+    Resolves the datapath, de-duplicates ``units`` (preserving order), validates
+    the selection, then routes to the per-method branch matching ``method_key``.
+    Each branch returns a dict (via ``_meta_payload``) describing the result and
+    how to render it; an unrecognized ``method_key`` returns a fallback text payload.
+    """
     corr = _ensure_npyx()
     requested_dp = dp
     dp = resolve_analysis_datapath(dp)
@@ -512,7 +554,8 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
         return _meta_payload({"kind": "scalar", "title": "Can use 3-bin significance triplets", "value": float(ok)}, requested_dp, dp)
 
     if method_key == "make_phy_like_spikeClustersTimes":
-        times, clusters = corr.make_phy_like_spikeClustersTimes(dp, units)
+        # Only cluster ids are needed here; the spike times are intentionally discarded.
+        _times, clusters = corr.make_phy_like_spikeClustersTimes(dp, units)
         clusters = np.asarray(clusters, dtype=int)
         uniq, counts = np.unique(clusters, return_counts=True)
         return _meta_payload({"kind": "hist", "title": "Phy-like spike cluster counts", "x": uniq.astype(float), "y": counts.astype(float), "w": np.ones_like(uniq, dtype=float)}, requested_dp, dp)

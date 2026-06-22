@@ -43,6 +43,12 @@ from ..workers import FunctionWorker
 
 
 def _find_modules_input_json(json_root: Path, ks_folder: Path) -> Optional[Path]:
+    """Locate the ecephys *_modules-input.json whose KS output matches ks_folder.
+
+    Searches the legacy flat json_root plus each run's 'pipeline_json' folder so
+    quality-metrics recompute keeps working under both layouts. Returns the
+    matching JSON path, or None when no entry points at the same KS directory.
+    """
     target_dir = find_kilosort_output_dir(ks_folder, max_depth=4) or ks_folder
     target = target_dir.resolve().as_posix().lower()
     # Per-run JSONs now live in a 'pipeline_json' folder inside the run's mirrored
@@ -74,6 +80,12 @@ def _find_modules_input_json(json_root: Path, ks_folder: Path) -> Optional[Path]
 
 
 def _recompute_quality_metrics(ks_folder: str, json_root: str) -> str:
+    """Re-run the ecephys quality_metrics module for a Kilosort folder.
+
+    Runs in a background worker. Returns a status message when no matching
+    modules-input.json is found, raises RuntimeError if the subprocess fails,
+    and otherwise returns a success message.
+    """
     folder = Path(ks_folder)
     jr = Path(json_root)
     inp = _find_modules_input_json(jr, folder)
@@ -99,6 +111,12 @@ def _recompute_quality_metrics(ks_folder: str, json_root: str) -> str:
 
 
 def _parse_phy_dat_path(params_path: Path) -> object | None:
+    """Read the dat_path value from a Phy params.py file.
+
+    Returns the literal-parsed value (str, list, or tuple) when present, the raw
+    quote-stripped string if it is not a valid literal, or None when params.py is
+    missing or has no dat_path line.
+    """
     if not params_path.exists():
         return None
     text = params_path.read_text(encoding="utf-8", errors="ignore")
@@ -113,6 +131,12 @@ def _parse_phy_dat_path(params_path: Path) -> object | None:
 
 
 def _resolve_phy_dat_candidate(ks_folder: Path, raw_value: object | None) -> Optional[Path]:
+    """Resolve a usable .bin path for Phy from a params.py dat_path value.
+
+    Tries the recorded path(s) first, then sibling *.ap.bin files next to the KS
+    folder, then a recursive search by basename up a few parent levels. Returns
+    the first existing path (resolved), or None when nothing matches.
+    """
     raw_candidates: List[str] = []
     if isinstance(raw_value, (list, tuple)):
         raw_candidates.extend(str(value).strip() for value in raw_value if str(value).strip())
@@ -152,6 +176,11 @@ def _resolve_phy_dat_candidate(ks_folder: Path, raw_value: object | None) -> Opt
 
 
 def _repair_phy_params_path(ks_folder: Path) -> Optional[str]:
+    """Rewrite params.py dat_path to an absolute, existing .bin before opening Phy.
+
+    Returns None when params.py is missing or already correct, otherwise a status
+    message describing the repair or why it could not be resolved.
+    """
     params_path = ks_folder / "params.py"
     if not params_path.exists():
         return None
@@ -186,6 +215,11 @@ def _repair_phy_params_path(ks_folder: Path) -> Optional[str]:
 
 
 def _preferred_metrics_file(ks_folder: Path) -> Optional[Path]:
+    """Pick the metrics CSV to load, preferring py_bombcell output when present.
+
+    Falls back to the generic ecephys metrics file search when no bombcell
+    qMetrics CSV exists.
+    """
     bombcell_metrics = ks_folder / "bombcell" / "templates._bc_qMetrics.csv"
     if bombcell_metrics.exists():
         return bombcell_metrics
@@ -193,6 +227,12 @@ def _preferred_metrics_file(ks_folder: Path) -> Optional[Path]:
 
 
 class PyBombcellSettingsDialog(QtWidgets.QDialog):
+    """Modal editor for py_bombcell default parameters.
+
+    Presents the bundled settings schema in a table, validates edited values by
+    type, and exposes the merged result through `values()`.
+    """
+
     def __init__(self, settings: Dict[str, object], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._values = normalize_pybombcell_settings(settings)
@@ -308,6 +348,14 @@ class PyBombcellSettingsDialog(QtWidgets.QDialog):
 
 
 class CurationTab(QtWidgets.QWidget):
+    """Curation tab: manage Kilosort folders, run py_bombcell QC, and launch Phy.
+
+    Holds a working list of Kilosort output folders, runs py_bombcell (single or
+    batch) via background workers, loads and previews quality metrics with
+    interactive thresholds and per-metric distribution plots, and drives the Phy
+    template-gui as a child process.
+    """
+
     def __init__(self, thread_pool: QtCore.QThreadPool) -> None:
         super().__init__()
         self.pool = thread_pool
@@ -744,6 +792,7 @@ class CurationTab(QtWidgets.QWidget):
         bomb_subsections.currentChanged.connect(lambda _idx: self._persist_splitter_sizes())
 
     def show_phy_page(self) -> None:
+        """Switch the tab to the Phy section (index 0)."""
         if hasattr(self, "_main_sections"):
             self._main_sections.setCurrentIndex(0)
 
@@ -899,6 +948,12 @@ class CurationTab(QtWidgets.QWidget):
         return str(resolved.resolve())
 
     def set_ks_folders(self, folders: List[str], *, preserve_existing: bool = False) -> None:
+        """Set (or extend) the Kilosort folder list, de-duplicating case-insensitively.
+
+        Each folder is coerced to its resolved KS output directory; invalid entries
+        are skipped. With preserve_existing the current list is kept and new folders
+        are appended. The list view is then refreshed and a folder is selected.
+        """
         base = list(self.ks_folders) if preserve_existing else []
         seen = {folder.lower() for folder in base}
         selected_folder: Optional[str] = None
@@ -1201,11 +1256,13 @@ class CurationTab(QtWidgets.QWidget):
             self._log("Failed to start phy: " + self.phy_process.errorString())
 
     def set_ks_folder(self, folder: str) -> None:
+        """Replace the folder list with a single folder and show the Bombcell section."""
         self.set_ks_folders([folder])
         if hasattr(self, "_main_sections"):
             self._main_sections.setCurrentIndex(1)
 
     def open_ks_folder(self, folder: str) -> None:
+        """Select a single folder, switch to the Phy section, and launch Phy on it."""
         self.set_ks_folder(folder)
         if hasattr(self, "_main_sections"):
             self._main_sections.setCurrentIndex(0)
@@ -1446,18 +1503,24 @@ class CurationTab(QtWidgets.QWidget):
         n_bins = max(n_bins, 2)
         nperseg = min(1024, n_bins)
 
+        def empty_psd_row() -> Dict[str, float]:
+            # Fresh all-NaN row used whenever a unit has too few spikes or the PSD
+            # cannot be computed. Returns a new dict each call (matches the inline
+            # literals it replaces), so callers can safely store it without sharing.
+            return {
+                "psd_peak_hz": np.nan,
+                "psd_peak_power": np.nan,
+                "psd_band_0_4": np.nan,
+                "psd_band_4_12": np.nan,
+                "psd_band_12_30": np.nan,
+                "psd_band_30_80": np.nan,
+            }
+
         rows: Dict[int, Dict[str, float]] = {}
         for u in unit_ids:
             st_u = spike_times[spike_clusters == int(u)]
             if st_u.size < 5:
-                rows[int(u)] = {
-                    "psd_peak_hz": np.nan,
-                    "psd_peak_power": np.nan,
-                    "psd_band_0_4": np.nan,
-                    "psd_band_4_12": np.nan,
-                    "psd_band_12_30": np.nan,
-                    "psd_band_30_80": np.nan,
-                }
+                rows[int(u)] = empty_psd_row()
                 continue
             b = (st_u // bin_samples).astype(np.int64)
             b = b[(b >= 0) & (b < n_bins)]
@@ -1465,25 +1528,11 @@ class CurationTab(QtWidgets.QWidget):
             try:
                 f, pxx = sps.welch(x, fs=fs_bin, nperseg=nperseg, detrend="constant", scaling="density")
             except Exception:
-                rows[int(u)] = {
-                    "psd_peak_hz": np.nan,
-                    "psd_peak_power": np.nan,
-                    "psd_band_0_4": np.nan,
-                    "psd_band_4_12": np.nan,
-                    "psd_band_12_30": np.nan,
-                    "psd_band_30_80": np.nan,
-                }
+                rows[int(u)] = empty_psd_row()
                 continue
             mpos = f > 0
             if not np.any(mpos):
-                rows[int(u)] = {
-                    "psd_peak_hz": np.nan,
-                    "psd_peak_power": np.nan,
-                    "psd_band_0_4": np.nan,
-                    "psd_band_4_12": np.nan,
-                    "psd_band_12_30": np.nan,
-                    "psd_band_30_80": np.nan,
-                }
+                rows[int(u)] = empty_psd_row()
                 continue
             fp = f[mpos]
             pp = pxx[mpos]
@@ -1982,6 +2031,7 @@ class CurationTab(QtWidgets.QWidget):
         self._log("Curation log copied to clipboard.")
 
     def set_plot_preferences(self, theme: str, show_grid: bool) -> None:
+        """Apply theme (Light/Dark) and grid visibility, then redraw the plots."""
         self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
         self._show_grid = bool(show_grid)
         bg = "#0b0f14" if self._plot_theme == "Dark" else "#ffffff"
@@ -2031,6 +2081,7 @@ class CurationTab(QtWidgets.QWidget):
         self._log(f"Exported curation plotted data: {base}")
 
     def is_busy(self) -> bool:
+        """Return True while any background curation worker is still running."""
         return self._busy_count > 0
 
     def _toggle_plot_detach(self, checked: bool) -> None:

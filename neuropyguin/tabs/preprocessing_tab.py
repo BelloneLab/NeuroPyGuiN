@@ -1,4 +1,13 @@
-﻿from __future__ import annotations
+﻿"""Preprocessing tab for the NeuroPyGuiN GUI.
+
+Builds the queue-based SpikeGLX/Kilosort preprocessing UI: a drop-and-scan run
+queue, the per-step configuration form, optional multi-session concatenation,
+and a completed-runs history. Pipeline execution itself is delegated to the
+worker classes in ``..workers``; this module only wires the widgets, persists
+settings via ``QSettings``, and reflects worker progress in the step panel.
+"""
+
+from __future__ import annotations
 
 from dataclasses import asdict, replace
 from datetime import datetime
@@ -42,6 +51,12 @@ from ..workers import (
 
 
 class BinDropList(QtWidgets.QListWidget):
+    """List widget that accepts file drops and re-emits them as local paths.
+
+    Dropped URLs are filtered to local files and forwarded via ``filesDropped``
+    so the owning tab can validate and queue SpikeGLX AP bins.
+    """
+
     filesDropped = QtCore.Signal(list)
 
     def __init__(self) -> None:
@@ -67,6 +82,13 @@ class BinDropList(QtWidgets.QListWidget):
 
 
 class StepStatusItem(QtWidgets.QWidget):
+    """One pipeline step row in the live status panel.
+
+    Shows a title, an icon (animated while running), a percent label, and a
+    progress bar. The ``set_*`` methods switch between the pending, running,
+    progressing, finished, and failed visual states.
+    """
+
     _ASSET_ROOT = Path(__file__).resolve().parents[1] / "assets"
     _OK_ICON = _ASSET_ROOT / "ok-icon.png"
     _LOADING_ICON = _ASSET_ROOT / "loading-icon.gif"
@@ -162,6 +184,13 @@ class StepStatusItem(QtWidgets.QWidget):
 
 
 class Ks4AdvancedDialog(QtWidgets.QDialog):
+    """Form dialog for the advanced Kilosort 4 parameters.
+
+    Builds one editor per entry in ``PARAM_SPECS`` (grouped by ``PARAM_GROUPS``)
+    and exposes the edited values via ``values()``. Blank float fields default to
+    the spec default, with NaN defaults mapped to ``None`` to request auto-estimation.
+    """
+
     PARAM_SPECS = [
         ("n_chan_bin", int, 385, "Total channels in the binary file (including non-ephys channels)."),
         ("batch_size", int, 60000, "Number of samples per sorting batch."),
@@ -293,6 +322,12 @@ class Ks4AdvancedDialog(QtWidgets.QDialog):
         main.addWidget(btns)
 
     def values(self) -> Dict[str, object]:
+        """Collect the edited parameters, coercing each field to its spec type.
+
+        Empty fields fall back to the spec default (NaN float defaults become
+        ``None``). For floats, ``inf`` maps to ``-1.0`` (full session) and
+        ``nan``/``none``/``auto`` map to ``None``. Unparsable input keeps the default.
+        """
         out: Dict[str, object] = {}
         for key, typ, default, _desc in self.PARAM_SPECS:
             ed = self._editors[key]
@@ -457,6 +492,14 @@ class ConcatenateDialog(QtWidgets.QDialog):
 
 
 class PreprocessingTab(QtWidgets.QWidget):
+    """Main preprocessing tab: queue, settings, run control, and history.
+
+    Owns the run queue and raw-run catalog, the per-step configuration widgets,
+    and the completed-runs list. Submits jobs to the shared thread pool through
+    ``EcephysPipelineWorker`` (and ``ConcatenationWorker`` for fused runs), and
+    emits the ``open*Requested`` signals so the host window can switch tabs.
+    """
+
     openCurationRequested = QtCore.Signal(list)
     openPostProcessingRequested = QtCore.Signal(str)
     openHistologyRequested = QtCore.Signal(str)
@@ -1331,6 +1374,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         return str(self.cb_queue_filter.currentData() or "non_processed")
 
     def _completed_entry_for_job(self, job: Dict[str, str]) -> Dict[str, object] | None:
+        """Find the completed-history entry matching a queue job, or None.
+
+        Matches first on normalized bin path, then falls back to matching the
+        run name plus gate and probe strings so completed runs scanned from a
+        different root still pair with their queued counterpart.
+        """
         job_bin = self._normalized_path(str(job.get("bin_file") or ""))
         job_run = str(job.get("name") or "")
         job_gate = str(job.get("gate_string") or "")
@@ -1396,6 +1445,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._update_concat_button_state()
 
     def _ingest_bins(self, bins: List[str], *, queue_completed: bool) -> tuple[int, int, int]:
+        """Validate AP bins and register them in the catalog and queue.
+
+        Every valid bin is recorded in the raw-run catalog; it is also appended
+        to the queue unless it is already queued, or it is already completed and
+        ``queue_completed`` is False. Returns ``(added_to_catalog, queued, completed)``.
+        """
         added_catalog = 0
         queued = 0
         completed = 0
@@ -1974,6 +2029,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
 
     def _resolve_completed_entry_bin_file(self, entry: Dict[str, object]) -> str:
+        """Locate the source AP bin for a completed run on disk, or "".
+
+        Tries the snapshot and entry bin paths; relative candidates are also
+        resolved against the params-file folder and the scanned source root.
+        Returns the first existing path as a string, or empty if none resolve.
+        """
         params_file_raw = str(entry.get("params_file") or "").strip()
         source_root_raw = str(entry.get("source_root") or "").strip()
         params_file = Path(params_file_raw).expanduser() if params_file_raw else None
@@ -2231,6 +2292,12 @@ class PreprocessingTab(QtWidgets.QWidget):
     def _planned_step_definitions(
         self, cfg: EcephysPipelineConfig, *, is_concat_run: bool = False
     ) -> List[tuple[str, str]]:
+        """List the (step_key, label) pairs the worker will run for this config.
+
+        Order mirrors the worker's execution order so the status panel lines up
+        with reported step progress. TPrime is omitted for concatenated runs
+        because they have no continuous sync stream to align against.
+        """
         steps: List[tuple[str, str]] = []
         if cfg.run_catgt:
             if cfg.run_catgt_extract_only:
@@ -2520,6 +2587,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._settings_sync_timer.start()
 
     def save_settings(self) -> None:
+        """Persist the current widget state as the defaults for the next launch."""
         self._persist_settings()
         self.settings.sync()
         self._append_log("Preprocessing settings saved as defaults for the next app launch.")
@@ -2589,6 +2657,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             self.openHistologyRequested.emit(folder)
 
     def clear_completed_history(self) -> None:
+        """Drop the completed-runs history from the list, memory, and settings."""
         self.completed_runs.clear()
         self.list_completed.clear()
         self.settings.remove("preproc/completed_runs_history_json")
@@ -2596,6 +2665,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._refresh_queue_summary()
 
     def is_busy(self) -> bool:
+        """Return True while a queue run or a concatenation is in progress."""
         return bool(self._running or self._concatenating)
 
     def _open_ks4_advanced(self) -> None:

@@ -56,6 +56,7 @@ def resolve_atlas_path(atlas_path: Optional[str] = None) -> Path:
 
 
 def atlas_files_present(atlas_path: Optional[str] = None) -> bool:
+    """Return True only if all three required atlas files exist in the folder."""
     base = resolve_atlas_path(atlas_path)
     return all((base / fn).exists() for fn in (_TEMPLATE_FN, _ANNOTATION_FN, _STRUCTURE_FN))
 
@@ -133,6 +134,7 @@ class AllenCCFAtlas:
 
     @property
     def st_rgb(self) -> np.ndarray:
+        """Cached (N, 3) float RGB array (0..1) aligned with the structure tree."""
         return self._st_rgb  # type: ignore[return-value]
 
     # -- structure-tree lookups ---------------------------------------------
@@ -143,6 +145,7 @@ class AllenCCFAtlas:
         return self.structure_tree.iloc[int(av_index) - 1]
 
     def acronym(self, av_index: int) -> str:
+        """Acronym for an annotation value, or "" if it is out of range."""
         row = self.region_row(av_index)
         return "" if row is None else str(row["acronym"])
 

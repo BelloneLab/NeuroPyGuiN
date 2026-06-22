@@ -1,4 +1,13 @@
-﻿from __future__ import annotations
+﻿"""Post-processing tab for the NeuroPyGuiN GUI.
+
+Provides the "Post Processing" page where a curated Kilosort/SpikeGLX dataset is
+loaded and explored: unit basics (raster, ACG, ISI, waveform), a raw-signal
+explorer, correlograms, condition PSTHs, network synchrony, and the advanced
+correlation methods exposed through the npyx bridge. Each analysis page also
+records the plotted values so they can be exported to CSV.
+"""
+
+from __future__ import annotations
 
 import json
 import math
@@ -17,6 +26,11 @@ from ..npyx_corr_bridge import PAIRWISE_ONLY_METHODS, method_metadata, method_op
 
 
 def _is_bombcell_good_label(value: object) -> bool:
+    """Return True if a Bombcell label string denotes a usable ("good") unit.
+
+    Handles the various spellings produced by Bombcell (for example "good",
+    "non-soma", "non_soma_good") by lower-casing and collapsing separators.
+    """
     text = str(value).strip().lower()
     if not text or text == "nan":
         return False
@@ -27,6 +41,11 @@ def _is_bombcell_good_label(value: object) -> bool:
 
 
 def _sync_group_color(group_id: int, alpha: int = 220) -> tuple[int, int, int, int]:
+    """Return an RGBA color for a synchrony group id.
+
+    Group ids of zero or below (ungrouped units) get a neutral gray; positive
+    ids map to distinct hues so clustered rows are easy to tell apart.
+    """
     if int(group_id) <= 0:
         return (120, 132, 150, alpha)
     color = pg.intColor(int(group_id) - 1, hues=10, values=1, maxValue=235)
@@ -34,6 +53,13 @@ def _sync_group_color(group_id: int, alpha: int = 220) -> tuple[int, int, int, i
 
 
 class PostProcessingTab(QtWidgets.QWidget):
+    """Qt widget that hosts the post-processing analysis pages.
+
+    Owns the loaded dataset plus the per-page controls and plot widgets, and
+    coordinates loading, plotting, and CSV/H5 export. Analysis pages are kept in
+    sync with their plot views via the analysis-tab index.
+    """
+
     def __init__(self, thread_pool: QtCore.QThreadPool) -> None:
         super().__init__()
         self.pool = thread_pool
@@ -545,6 +571,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._update_psth_trial_status()
         self._update_npyx_method_ui()
     def set_plot_preferences(self, theme: str, show_grid: bool) -> None:
+        """Apply the global plot theme (Light/Dark) and grid visibility."""
         self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
         self._show_grid = bool(show_grid)
         self._apply_plot_style()
@@ -656,6 +683,12 @@ class PostProcessingTab(QtWidgets.QWidget):
             self._show_psth()
 
     def _condition_trial_slice(self, total_trials: int) -> tuple[slice, dict]:
+        """Resolve the user's 1-based trial-range spinboxes into a 0-based slice.
+
+        Returns the slice to apply to a trial matrix plus an info dict describing
+        what was actually used (clamped to the available trial count). A stop
+        value of 0 or below means "through the last trial".
+        """
         total = max(0, int(total_trials))
         requested_start = max(1, int(self.sp_psth_trial_from.value()))
         requested_stop_raw = int(self.sp_psth_trial_to.value())
@@ -696,6 +729,12 @@ class PostProcessingTab(QtWidgets.QWidget):
         return int(np.nanargmax(peaks))
 
     def _waveform_support_indices(self, waveform: Optional[np.ndarray], limit: int = 24) -> np.ndarray:
+        """Pick the channel indices that carry the unit's waveform energy.
+
+        Keeps channels whose peak amplitude is at least 10% of the strongest
+        channel, then clamps the count to a sensible min/max around `limit`.
+        Returns a sorted int array (empty when the waveform is unusable).
+        """
         if waveform is None or waveform.ndim != 2 or waveform.shape[1] == 0:
             return np.array([], dtype=int)
         peaks = np.nanmax(np.abs(waveform), axis=0)
@@ -713,6 +752,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         return np.sort(support.astype(int))
 
     def _nice_scale_value(self, value: float) -> float:
+        """Round a magnitude up to a "nice" 1/2/5 x 10^n value for scale bars."""
         value = float(abs(value))
         if value <= 0.0 or not np.isfinite(value):
             return 1.0
@@ -892,6 +932,11 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.tbl_npyx_params.blockSignals(False)
 
     def _collect_npyx_params(self) -> Dict[str, object]:
+        """Read the editable npyx parameter table into a typed dict.
+
+        Each cell value is coerced to bool, then int or float, falling back to
+        the raw string when it cannot be parsed as a number.
+        """
         out: Dict[str, object] = {}
         for r in range(self.tbl_npyx_params.rowCount()):
             k_item = self.tbl_npyx_params.item(r, 0)
@@ -1014,9 +1059,11 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_detach_plots.setText("Detach plots")
 
     def set_ks_folder(self, folder: str) -> None:
+        """Populate the curated-folder field without loading the dataset."""
         self.ed_folder.setText(folder)
 
     def open_ks_folder(self, folder: str) -> None:
+        """Set the curated folder and immediately load it as the dataset."""
         self.set_ks_folder(folder)
         self._load_dataset()
 
@@ -1150,6 +1197,12 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._refresh_current_page()
 
     def _unit_is_good(self, unit: int) -> bool:
+        """Decide whether a unit is "good" under the selected label source.
+
+        In "Auto" mode the first available source (Bombcell, then Phy, then
+        KSLabel) that has a row for this unit decides the verdict; if no source
+        is present at all the unit is treated as good.
+        """
         src = self.cb_good_source.currentText().strip()
         if src == "Auto":
             # Priority: Bombcell -> Phy -> KSLabel
@@ -1265,6 +1318,11 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._refresh_current_page()
 
     def _refresh_current_page(self) -> None:
+        """Re-render whichever analysis page is currently selected.
+
+        Render errors are caught and logged so a single bad page cannot break
+        the rest of the GUI.
+        """
         if self.dataset is None:
             return
         idx = self.analysis_tabs.currentIndex()
@@ -2430,6 +2488,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.log.appendPlainText(str(msg))
 
     def _export_plotted_data(self) -> None:
+        """Write the current page's recorded plot data to CSV files in a folder."""
         idx = self.view_tabs.currentIndex()
         key = ["basic", "raw", "corr", "psth", "network", "npyx"][idx] if 0 <= idx < 6 else ""
         payloads = self._export_payloads.get(key, [])
@@ -2533,6 +2592,7 @@ class PostProcessingTab(QtWidgets.QWidget):
             self._busy = False
 
     def is_busy(self) -> bool:
+        """Return True while a compute/export task is running on this tab."""
         return bool(self._busy)
 
 

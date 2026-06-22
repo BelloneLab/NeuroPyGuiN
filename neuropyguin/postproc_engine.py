@@ -1,3 +1,11 @@
+"""Post-processing analysis engine for Kilosort/SpikeGLX recordings.
+
+This module provides the :class:`NeuropixelsDataset` loader plus pure-computation
+helpers (correlograms, PSTHs, synchrony, raw-trace extraction) and an HDF5 unit
+exporter. It performs no GUI work, so functions here are safe to call from worker
+threads. Per-dataset results are cached on disk under ``NeuroPyGuiN_cache``.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -129,6 +137,7 @@ def cluster_synced_units(
 
 
 def _parse_meta(meta_path: Path) -> Dict[str, str]:
+    """Parse a SpikeGLX ``.meta`` file into a key=value string mapping."""
     out: Dict[str, str] = {}
     if not meta_path.exists():
         return out
@@ -141,6 +150,7 @@ def _parse_meta(meta_path: Path) -> Dict[str, str]:
 
 
 def _parse_params_py(params_path: Path) -> Dict[str, str]:
+    """Extract the handful of fields we need from a Phy/Kilosort ``params.py``."""
     out: Dict[str, str] = {}
     if not params_path.exists():
         return out
@@ -153,12 +163,19 @@ def _parse_params_py(params_path: Path) -> Dict[str, str]:
 
 
 def _hash_payload(payload: Dict) -> str:
+    """Return a short, deterministic hash of a JSON-serializable cache key."""
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
 @dataclass
 class NeuropixelsDataset:
+    """In-memory view of a Kilosort output folder plus its SpikeGLX metadata.
+
+    Spike arrays are memory-mapped where possible; analysis methods return plain
+    NumPy arrays and cache expensive results under :pyattr:`cache_dir`.
+    """
+
     ks_folder: Path
     sample_rate: float
     n_channels: int
@@ -174,6 +191,7 @@ class NeuropixelsDataset:
 
     @property
     def cache_dir(self) -> Path:
+        """Return (creating if needed) the per-dataset on-disk cache directory."""
         p = self.ks_folder / "NeuroPyGuiN_cache"
         p.mkdir(parents=True, exist_ok=True)
         return p
@@ -193,6 +211,11 @@ class NeuropixelsDataset:
 
     @classmethod
     def load(cls, ks_folder: str) -> "NeuropixelsDataset":
+        """Build a dataset from a Kilosort folder, reading params.py and the AP meta.
+
+        Sample rate, channel count, and bit-to-microvolt scaling are taken from the
+        SpikeGLX ``.ap.meta`` when available, falling back to ``params.py`` defaults.
+        """
         root = Path(ks_folder)
         if not root.exists():
             raise RuntimeError(f"Folder does not exist: {root}")
@@ -258,10 +281,12 @@ class NeuropixelsDataset:
         )
 
     def unit_spike_times_s(self, unit: int) -> np.ndarray:
+        """Return the spike times of one unit, in seconds."""
         m = self.spike_clusters == int(unit)
         return self.spike_times[m].astype(float) / float(self.sample_rate)
 
     def isi_hist(self, unit: int, max_ms: float, bins: int = 80) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (bin edges, counts) for a unit's inter-spike-interval histogram."""
         t = self.unit_spike_times_s(unit)
         if t.size < 2:
             return np.array([]), np.array([])
@@ -270,6 +295,11 @@ class NeuropixelsDataset:
         return edges, hist.astype(float)
 
     def correlogram(self, unit_a: int, unit_b: int, bin_ms: float, win_ms: float, remove_zero: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (bin centers in ms, counts) for the cross/auto-correlogram of two units.
+
+        Result is cached on disk. ``remove_zero`` drops the exact-zero lag, which is
+        used for autocorrelograms to suppress the trivial self-coincidence peak.
+        """
         payload = {"ua": int(unit_a), "ub": int(unit_b), "bin_ms": float(bin_ms), "win_ms": float(win_ms), "rz": bool(remove_zero)}
         cached = self._cache_get("corr", payload)
         if cached is not None:
@@ -302,6 +332,11 @@ class NeuropixelsDataset:
         return centers, out_counts
 
     def mean_template_waveform(self, unit: int) -> Optional[np.ndarray]:
+        """Return the unit's dominant Kilosort template (in microvolts), or None.
+
+        The template most frequently assigned to the unit's spikes is selected and
+        scaled by ``bit_uV``. Returns None when templates are unavailable.
+        """
         if self.templates is None or self.spike_templates is None:
             return None
         m = self.spike_clusters == int(unit)
@@ -316,6 +351,10 @@ class NeuropixelsDataset:
         return w * float(self.bit_uV)
 
     def population_synchrony(self, bin_ms: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (bin centers in ms, total spike counts) binning all units together.
+
+        Result is cached on disk.
+        """
         payload = {"bin_ms": float(bin_ms)}
         cached = self._cache_get("sync", payload)
         if cached is not None:
@@ -340,6 +379,7 @@ class NeuropixelsDataset:
         post_s: float,
         bin_ms: float,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Per-trial PSTH for one unit: return (bin centers in ms, trials x bins firing rate)."""
         ev = np.asarray(event_times_s, dtype=float)
         ev = ev[np.isfinite(ev)]
         if ev.size == 0:
@@ -362,6 +402,7 @@ class NeuropixelsDataset:
         return centers_ms, trial_mat
 
     def psth(self, units: Iterable[int], event_times_s: np.ndarray, pre_s: float, post_s: float, bin_ms: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Pooled PSTH across units and events: return (bin centers in ms, mean firing rate)."""
         units = list(units)
         ev = np.asarray(event_times_s, dtype=float)
         ev = ev[np.isfinite(ev)]
@@ -394,6 +435,7 @@ class NeuropixelsDataset:
         post_s: float,
         bin_ms: float,
     ) -> Tuple[np.ndarray, List[int], np.ndarray]:
+        """Per-unit PSTH: return (bin centers in ms, unit ids, units x bins mean firing rate)."""
         unit_ids = [int(u) for u in units]
         ev = np.asarray(event_times_s, dtype=float)
         ev = ev[np.isfinite(ev)]
@@ -424,6 +466,12 @@ class NeuropixelsDataset:
         max_channels: int = 24,
         center_channel: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Read a raw AP-band chunk in microvolts from the memory-mapped binary.
+
+        Returns (time vector in s, samples x channels data, file channel ids, channel
+        order indices). Selects up to ``max_channels`` channels centered on
+        ``center_channel`` when given.
+        """
         if self.ap_bin_path is None or not self.ap_bin_path.exists():
             raise RuntimeError("AP binary file not found from params/meta.")
         t0_s = max(0.0, float(t0_s))
@@ -470,6 +518,12 @@ class NeuropixelsDataset:
         downsample: int = 1,
         center_channel: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Raw chunk for the explorer view: load, optionally band-filter, and downsample.
+
+        Wraps :pymeth:`load_raw_chunk_uv`, applies an optional Butterworth filter
+        (high-pass, low-pass, or band-pass depending on ``hp_hz``/``lp_hz``), then
+        decimates by ``downsample``. Result is cached on disk.
+        """
         payload = {
             "t0": float(t0_s),
             "dur": float(dur_s),
@@ -528,6 +582,7 @@ class NeuropixelsDataset:
         post_s: float,
         bin_ms: float,
     ) -> Tuple[np.ndarray, List[str], np.ndarray]:
+        """Pooled PSTH per named condition: return (bin centers in ms, labels, conditions x bins)."""
         labels = list(condition_events.keys())
         all_rows: List[np.ndarray] = []
         t_ref: Optional[np.ndarray] = None
@@ -548,6 +603,7 @@ class NeuropixelsDataset:
         return t_ref, labels, mat
 
     def ccg_matrix(self, units: Iterable[int], bin_ms: float, win_ms: float) -> np.ndarray:
+        """Return an N x N matrix of peak correlogram counts between every unit pair."""
         u = [int(v) for v in units]
         n = len(u)
         if n == 0:
@@ -563,6 +619,11 @@ class NeuropixelsDataset:
         return mat
 
     def synchrony_over_time(self, bin_ms: float = 10.0, window_s: float = 2.0, step_s: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (window centers in s, synchrony index) using a sliding coefficient of variation.
+
+        Within each sliding window the index is std/mean of the population spike-count
+        histogram (0 where the mean is non-positive).
+        """
         t_ms, counts = self.population_synchrony(bin_ms=bin_ms)
         if t_ms.size == 0:
             return np.array([]), np.array([])
@@ -587,6 +648,7 @@ _H5_TEXT_DTYPE = h5py.string_dtype(encoding="utf-8")
 
 
 def _is_missing_value(value: object) -> bool:
+    """Return True for None or pandas/NumPy NaN-like scalars (array-likes count as present)."""
     if value is None:
         return True
     try:
@@ -596,6 +658,7 @@ def _is_missing_value(value: object) -> bool:
 
 
 def _unit_row_dict(df: Optional[pd.DataFrame], unit: int) -> Dict[str, object]:
+    """Look up a unit's row (by int or str index) and return its non-missing fields as a dict."""
     if df is None or df.empty:
         return {}
     row = None
@@ -622,6 +685,7 @@ def _unit_row_dict(df: Optional[pd.DataFrame], unit: int) -> Dict[str, object]:
 
 
 def _h5_safe_name(name: str, used: set[str]) -> str:
+    """Sanitize a name into a unique HDF5-safe dataset key, recording it in ``used``."""
     base = re.sub(r"[^\w.-]+", "_", str(name)).strip("._")
     if not base:
         base = "field"
@@ -635,6 +699,7 @@ def _h5_safe_name(name: str, used: set[str]) -> str:
 
 
 def _value_to_text(value: object) -> str:
+    """Render an arbitrary value as a stable text string (JSON for containers/arrays)."""
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     if isinstance(value, np.ndarray):
@@ -652,10 +717,17 @@ def _value_to_text(value: object) -> str:
 
 
 def _write_text_array(group: h5py.Group, name: str, values: List[str]) -> None:
+    """Write a list of strings as a variable-length UTF-8 dataset."""
     group.create_dataset(name, data=np.asarray(values, dtype=object), dtype=_H5_TEXT_DTYPE)
 
 
 def _write_scalar_dataset(group: h5py.Group, name: str, value: object, original_name: Optional[str] = None) -> None:
+    """Write one value to ``group`` using an HDF5-native dtype, falling back to text.
+
+    Scalars use the closest native type (bool/int/float/str); arrays and numeric
+    sequences are stored gzip-compressed; anything else is serialized via
+    :func:`_value_to_text`. The pre-sanitization key is recorded in ``original_name``.
+    """
     if isinstance(value, np.ndarray):
         if value.ndim == 0:
             value = value.item()
@@ -689,6 +761,11 @@ def _write_scalar_dataset(group: h5py.Group, name: str, value: object, original_
 
 
 def _write_mapping_group(group: h5py.Group, mapping: Dict[str, object]) -> int:
+    """Write a mapping as an HDF5 group and return the number of non-missing entries.
+
+    Each value is stored under an ``entries`` subgroup (native dtype where possible),
+    alongside parallel ``fields`` and ``values_as_text`` arrays for easy inspection.
+    """
     fields: List[str] = []
     values_as_text: List[str] = []
     entries_group = group.create_group("entries")
@@ -709,6 +786,10 @@ def _write_mapping_group(group: h5py.Group, mapping: Dict[str, object]) -> int:
 
 
 def _best_channel_info(dataset: NeuropixelsDataset, unit: int) -> Tuple[Optional[int], Optional[int]]:
+    """Return (template channel index, mapped channel id) of the unit's peak-amplitude channel.
+
+    Returns (None, None) when no usable mean template waveform is available.
+    """
     waveform = dataset.mean_template_waveform(unit)
     if waveform is None or waveform.ndim != 2 or waveform.shape[1] == 0:
         return None, None
@@ -732,6 +813,13 @@ def export_units_h5(
     export_mode: str = "all",
     progress_callback: Optional[Callable[[int], None]] = None,
 ) -> Dict[str, int]:
+    """Export the selected units to a structured HDF5 file.
+
+    Each unit group holds its spike times (samples and seconds), derived fields,
+    combined and per-source labels, metrics, and the mean template waveform.
+    ``progress_callback`` (if given) is invoked with an integer percentage from 5
+    to 100. Returns a small summary dict of exported and good unit counts.
+    """
     units_list = [int(u) for u in units]
     good_unit_set = {int(u) for u in good_units or []}
     label_sources = label_sources or {}

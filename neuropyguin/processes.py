@@ -1,3 +1,11 @@
+"""Child-process tracking and shutdown helpers.
+
+Long-running children (Kilosort, IBL, etc.) are registered here so that the app
+can terminate every live subprocess on shutdown instead of leaking orphans. A
+psutil create-time stamp is recorded per pid so a recycled pid is never mistaken
+for the original child.
+"""
+
 from __future__ import annotations
 
 import os
@@ -69,6 +77,7 @@ def tracked_run(*popenargs, input=None, capture_output: bool = False, timeout=No
 
 
 def unregister_process(proc_or_pid: subprocess.Popen | int | None) -> None:
+    """Drop a process from the tracking table, by Popen or pid (no-op if absent)."""
     if proc_or_pid is None:
         return
     try:
@@ -80,6 +89,11 @@ def unregister_process(proc_or_pid: subprocess.Popen | int | None) -> None:
 
 
 def _matching_psutil_process(pid: int, create_time: float | None):
+    """Return the live psutil.Process for pid, or None if it is gone or recycled.
+
+    When create_time is known, a process whose create time differs by more than
+    one second is treated as a different (pid-reused) process and rejected.
+    """
     import psutil
 
     try:
@@ -92,6 +106,7 @@ def _matching_psutil_process(pid: int, create_time: float | None):
 
 
 def _unique_processes(processes: Iterable) -> List:
+    """De-duplicate processes by pid, preserving order and excluding this process."""
     seen: set[int] = set()
     out = []
     current_pid = os.getpid()
@@ -108,6 +123,7 @@ def _unique_processes(processes: Iterable) -> List:
 
 
 def _tracked_psutil_processes() -> List:
+    """Resolve tracked entries to live psutil.Process objects, pruning dead pids."""
     with _TRACKED_LOCK:
         tracked = list(_TRACKED_PROCESSES.items())
     out = []
@@ -129,6 +145,7 @@ def terminate_child_processes(timeout: float = 1.5, kill_timeout: float = 0.75) 
     try:
         import psutil
     except Exception:
+        # Fallback path: no psutil, so act only on the Popen objects we tracked.
         with _TRACKED_LOCK:
             tracked = list(_TRACKED_PROCESSES.values())
         popens = [popen_proc for popen_proc, _create_time in tracked]
@@ -164,6 +181,8 @@ def terminate_child_processes(timeout: float = 1.5, kill_timeout: float = 0.75) 
                 pass
         return {"terminated": terminated, "killed": killed, "alive": alive}
 
+    # psutil path: terminate tracked children plus any recursive child of this
+    # process, then escalate survivors to kill().
     candidates = []
     candidates.extend(_tracked_psutil_processes())
     try:

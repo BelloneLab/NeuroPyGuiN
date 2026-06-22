@@ -13,7 +13,7 @@ TV-AV colour) for display on the canvas.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Sequence
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -39,6 +39,11 @@ def build_histology_ccf(
 
 
 def _normalize_uint8(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Scale ``arr`` from the ``[lo, hi]`` range into ``[0, 255]`` uint8.
+
+    NaNs are treated as 0 and values outside ``[lo, hi]`` are clipped. The
+    ``hi - lo`` divisor is floored at a tiny epsilon to avoid division by zero.
+    """
     a = np.nan_to_num(arr.astype(np.float64), nan=0.0)
     a = np.clip((a - lo) / max(hi - lo, 1e-9), 0, 1)
     return (a * 255).astype(np.uint8)
@@ -79,6 +84,11 @@ def render_atlas_slice(
 
 
 def _av_boundaries(av: np.ndarray) -> np.ndarray:
+    """Return a boolean mask of region boundaries in an annotation slice.
+
+    A 2x2 uniform filter is rounded and compared against the original label
+    values; pixels where the smoothed value differs sit on a region edge.
+    """
     av0 = np.nan_to_num(av, nan=0.0)
     smoothed = np.round(ndi.uniform_filter(av0, size=2))
     return smoothed != av0

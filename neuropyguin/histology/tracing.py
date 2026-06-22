@@ -25,8 +25,13 @@ import pandas as pd
 from .atlas import AllenCCFAtlas
 
 
-# Probe colour map mirroring annotate_neuropixels.m (lines(7) recombined).
 def probe_colormap(n: int = 30) -> np.ndarray:
+    """Probe colour map mirroring ``annotate_neuropixels.m`` (``lines(7)`` recombined).
+
+    Returns an (M, 3) RGB array with at least ``max(n, base_rows)`` rows. The
+    seven MATLAB ``lines`` colours are recombined by channel permutation so that
+    many probes stay visually distinct.
+    """
     base = np.array([
         [0.0000, 0.4470, 0.7410],
         [0.8500, 0.3250, 0.0980],

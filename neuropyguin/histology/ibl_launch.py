@@ -52,6 +52,7 @@ def resolve_ibl_python(configured: Optional[str] = None) -> str:
 
 
 def _has_iblatlas(python_exe: str) -> bool:
+    """Return True if ``python_exe`` can import the ``iblatlas`` package."""
     try:
         r = tracked_run(
             [python_exe, "-c", "import iblatlas"],
@@ -63,6 +64,9 @@ def _has_iblatlas(python_exe: str) -> bool:
 
 
 def _child_env(iblapps_path: Optional[str]) -> dict:
+    """Copy the current environment with the repo root (and optional iblapps path)
+    prepended to ``PYTHONPATH`` so the child can import the bridge modules.
+    """
     env = os.environ.copy()
     extra = [str(_REPO_ROOT)]
     if iblapps_path:
@@ -91,9 +95,10 @@ def run_bridge(
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
-            lines.append(line.rstrip("\n"))
+            stripped = line.rstrip("\n")
+            lines.append(stripped)
             if log:
-                log(line.rstrip("\n"))
+                log(stripped)
         proc.wait(timeout=timeout)
     finally:
         unregister_process(proc)

@@ -16,7 +16,7 @@ live in the tab; this module holds the deterministic image operations.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -67,6 +67,7 @@ def _read_tiff_with_pillow(path: Path) -> np.ndarray:
 
 
 def _missing_imagecodecs_error(exc: Exception) -> bool:
+    """True if ``exc`` looks like a tifffile failure caused by a missing imagecodecs."""
     msg = str(exc).lower()
     return "imagecodecs" in msg or ("compression" in msg and "requires" in msg)
 
@@ -108,6 +109,7 @@ def downsample(image: np.ndarray, factor: float) -> np.ndarray:
 
 
 def is_rgb(image: np.ndarray) -> bool:
+    """True if ``image`` is an (H, W, 3) uint8 RGB array."""
     return image.ndim == 3 and image.shape[-1] == 3 and image.dtype == np.uint8
 
 

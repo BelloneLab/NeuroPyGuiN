@@ -1,3 +1,12 @@
+"""Lightweight BombCell-style unit quality labelling.
+
+Given a Kilosort/phy output folder containing a ``metrics.csv`` table, this
+module classifies each unit as ``good``, ``noise``, ``mua`` (multi-unit
+activity), or ``non_soma`` (non-somatic) by applying per-metric min/max
+thresholds. It also writes the resulting labels back out and syncs them into a
+phy ``cluster_group.tsv`` so the curation GUI picks them up.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,10 +17,17 @@ import pandas as pd
 
 
 def is_threshold_disabled(value) -> bool:
+    """Return True when a threshold is unset (None) or NaN, meaning "do not apply"."""
     return value is None or (isinstance(value, float) and np.isnan(value))
 
 
 def bombcell_get_default_thresholds() -> dict:
+    """Return the default per-category metric thresholds used for labelling.
+
+    The mapping is keyed by category ("noise", "mua", "non-somatic"), then by
+    metric name, then by bound ("min"/"max", optional "abs"). A missing or None
+    bound is treated as disabled (see is_threshold_disabled).
+    """
     return {
         "noise": {
             "num_positive_peaks": {"min": None, "max": 2},
@@ -41,6 +57,11 @@ def bombcell_get_default_thresholds() -> dict:
 
 
 def _label_by_thresholds(metrics: pd.DataFrame, thresholds: Dict[str, Dict], pass_label: str, fail_label: str) -> pd.Series:
+    """Assign fail_label to any row that violates one or more thresholds, else pass_label.
+
+    A row fails a metric when its value is NaN, below an active "min", or above
+    an active "max". Metrics absent from the DataFrame are skipped.
+    """
     labels = pd.Series(pass_label, index=metrics.index, dtype=object)
     if metrics.empty:
         return labels
@@ -67,6 +88,13 @@ def _label_by_thresholds(metrics: pd.DataFrame, thresholds: Dict[str, Dict], pas
 
 
 def bombcell_label_units_from_metrics(metrics: pd.DataFrame, thresholds: Optional[dict] = None) -> pd.DataFrame:
+    """Label each unit in metrics as good / noise / mua / non_soma.
+
+    Labelling is hierarchical: noise is decided first, then mua is applied only
+    to non-noise units, and finally non-somatic units are reclassified as
+    "non_soma" unless they were already flagged as noise. Returns a single-column
+    DataFrame ("bombcell_label") indexed like metrics.
+    """
     thresholds = thresholds or bombcell_get_default_thresholds()
 
     labels = _label_by_thresholds(metrics, thresholds.get("noise", {}), "good", "noise")
@@ -108,10 +136,17 @@ def bombcell_label_units_from_metrics(metrics: pd.DataFrame, thresholds: Optiona
 
 
 def run_bombcell_on_folder(folder: str) -> Dict:
+    """Run labelling on a Kilosort folder using the default thresholds."""
     return run_bombcell_on_folder_with_thresholds(folder=folder, thresholds=None)
 
 
 def _normalize_label_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return df re-indexed by a numeric cluster/unit id, dropping non-numeric rows.
+
+    Picks the index column by name ("cluster_id", "unit_id", or a leading
+    id-like/unnamed column), then coerces the index to int and keeps only the
+    rows whose id parsed cleanly.
+    """
     out = df.copy()
     cols = [str(c) for c in out.columns]
     if "cluster_id" in cols:
@@ -134,6 +169,7 @@ def _normalize_label_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _labels_to_phy_groups(labels: pd.Series) -> pd.Series:
+    """Normalize free-form label strings to phy group names (lowercased, non_soma unified)."""
     out = labels.astype(str).str.strip().str.lower()
     remap = {
         "non-soma": "non_soma",
@@ -145,6 +181,11 @@ def _labels_to_phy_groups(labels: pd.Series) -> pd.Series:
 
 
 def _read_label_source_for_phy(ks_folder: Path) -> Tuple[Optional[pd.Series], str]:
+    """Find the best available label source for phy, preferring BombCell over KSLabel.
+
+    Returns a (phy-group series, source filename) pair, or (None, "") when no
+    usable source is present. Read errors fall through to the next candidate.
+    """
     bombcell_csv = ks_folder / "bombcell_labels.csv"
     if bombcell_csv.exists():
         try:
@@ -167,6 +208,13 @@ def _read_label_source_for_phy(ks_folder: Path) -> Tuple[Optional[pd.Series], st
 
 
 def sync_phy_cluster_group(ks_folder: str | Path, force: bool = False) -> Dict[str, object]:
+    """Write a phy cluster_group.tsv from the best label source, conservatively.
+
+    When force is False, an existing cluster_group.tsv is only overwritten if it
+    looks like an uninformative placeholder (no "good" units, all "noise") while
+    the source actually has non-noise labels. Returns a status dict describing
+    whether and why the file was (not) updated.
+    """
     folder = Path(ks_folder)
     source_labels, source_name = _read_label_source_for_phy(folder)
     if source_labels is None or source_labels.empty:
@@ -215,6 +263,11 @@ def sync_phy_cluster_group(ks_folder: str | Path, force: bool = False) -> Dict[s
 
 
 def run_bombcell_on_folder_with_thresholds(folder: str, thresholds: Optional[dict] = None) -> Dict:
+    """Label units in a folder's metrics.csv, write bombcell_labels.csv, and sync phy.
+
+    Raises RuntimeError if metrics.csv is missing. Returns a summary dict with the
+    output path, unit count, per-label counts, and the phy sync result.
+    """
     ks_folder = Path(folder)
     metrics_path = ks_folder / "metrics.csv"
     if not metrics_path.exists():

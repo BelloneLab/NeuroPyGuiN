@@ -1,3 +1,11 @@
+"""Application entry point for NeuroPyGuiN.
+
+Wires together the four workflow tabs (Preprocessing, Curation, Post
+Processing, Histology) inside a single PySide6 main window, installs a few
+process-wide safety nets (a Qt message filter and a global excepthook), and
+drives a clean shutdown that terminates child processes and thread pools.
+"""
+
 from __future__ import annotations
 
 import os
@@ -21,6 +29,12 @@ _QT_MODE_LABELS = {
 
 
 def _qt_message_filter(mode, context, message) -> None:
+    """Drop a known-harmless Qt warning, otherwise pass the message through.
+
+    Suppresses the noisy "unique connections require a pointer to member
+    function" warning and forwards everything else to the previous handler (if
+    any) or to stdout/stderr with a severity label.
+    """
     text = str(message)
     if any(snippet in text for snippet in _KNOWN_QT_WARNING_SNIPPETS):
         return
@@ -33,6 +47,7 @@ def _qt_message_filter(mode, context, message) -> None:
 
 
 def _install_qt_message_filter() -> None:
+    """Install the Qt message filter once, remembering the prior handler."""
     global _PREVIOUS_QT_MESSAGE_HANDLER
     if _PREVIOUS_QT_MESSAGE_HANDLER is None:
         _PREVIOUS_QT_MESSAGE_HANDLER = QtCore.qInstallMessageHandler(_qt_message_filter)
@@ -129,6 +144,7 @@ WINDOWS_APP_ID = "BelloneLab.NeuroPyGuiN"
 
 
 def _load_app_icon() -> QtGui.QIcon:
+    """Return the window/taskbar icon, or an empty icon if the asset is missing."""
     pixmap = QtGui.QPixmap(str(SMALL_APP_ICON_PATH))
     if pixmap.isNull():
         return QtGui.QIcon()
@@ -136,6 +152,7 @@ def _load_app_icon() -> QtGui.QIcon:
 
 
 def _load_splash_pixmap() -> QtGui.QPixmap:
+    """Return the splash image, downscaled to at most 960 px wide if larger."""
     pixmap = QtGui.QPixmap(str(BIG_SPLASH_IMAGE_PATH))
     if pixmap.isNull():
         return QtGui.QPixmap()
@@ -146,6 +163,7 @@ def _load_splash_pixmap() -> QtGui.QPixmap:
 
 
 def _set_windows_taskbar_app_id() -> None:
+    """Group the app under its own Windows taskbar identity (no-op elsewhere)."""
     if not sys.platform.startswith("win"):
         return
     try:
@@ -157,6 +175,12 @@ def _set_windows_taskbar_app_id() -> None:
 
 
 class PreferencesDialog(QtWidgets.QDialog):
+    """Modal Settings dialog for theme, plot grid, startup tab, and geometry.
+
+    Holds no persistence logic of its own: it presents the current values and
+    exposes the edited ones through ``values()`` for the caller to store.
+    """
+
     def __init__(
         self,
         theme: str,
@@ -260,6 +284,7 @@ class PreferencesDialog(QtWidgets.QDialog):
         self.ck_remember_geometry.setChecked(True)
 
     def values(self) -> dict[str, object]:
+        """Return the currently selected settings as a plain dict."""
         return {
             "theme": self.cb_theme.currentText(),
             "show_grid": bool(self.ck_grid.isChecked()),
@@ -269,6 +294,13 @@ class PreferencesDialog(QtWidgets.QDialog):
 
 
 class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
+    """Top-level window hosting the four workflow tabs and the menu bar.
+
+    Owns the QSettings store, the plot theme/grid preferences, the bottom
+    busy-indicator timer, and the shutdown sequence that stops background work
+    on close.
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self._shutdown_started = False
@@ -888,6 +920,11 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         os._exit(int(exit_code))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Run the shutdown sequence and force the process to exit.
+
+        A hard exit is used because lingering worker threads or child processes
+        can otherwise keep the interpreter alive after the window closes.
+        """
         event.accept()
         self._shutdown_for_exit()
         try:
@@ -914,6 +951,7 @@ def _final_process_exit(win: NeuroPyGuiNMainWindow, exit_code: int) -> None:
 
 
 def main() -> int:
+    """Build the QApplication, show the main window, and run the event loop."""
     try:
         from neuropyguin._diagnostics import install_crash_logging
         install_crash_logging()

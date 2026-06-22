@@ -1,4 +1,11 @@
-﻿from __future__ import annotations
+﻿"""Quality-metrics tab: recompute/load Kilosort cluster metrics and plot distributions.
+
+Provides a Qt widget that runs the ecephys quality_metrics module (or py_bombcell)
+on a Kilosort output folder, loads the resulting metrics CSV into a DataFrame, and
+shows a filterable table plus a per-metric histogram (with a detachable plot panel).
+"""
+
+from __future__ import annotations
 
 import json
 import sys
@@ -18,6 +25,12 @@ from ..workers import FunctionWorker
 
 
 def _find_modules_input_json(json_root: Path, ks_folder: Path) -> Optional[Path]:
+    """Return the *_modules-input.json whose KS output directory matches ks_folder.
+
+    Searches the legacy flat json_root plus the per-run 'pipeline_json' folders that
+    live alongside (or in ancestors of) the Kilosort folder. Returns None if no file
+    points at the same resolved Kilosort output directory.
+    """
     target_dir = find_kilosort_output_dir(ks_folder, max_depth=4) or ks_folder
     target = target_dir.resolve().as_posix().lower()
     # Per-run JSONs now live in a 'pipeline_json' folder inside the run's mirrored
@@ -49,6 +62,12 @@ def _find_modules_input_json(json_root: Path, ks_folder: Path) -> Optional[Path]
 
 
 def _recompute_quality_metrics(ks_folder: str, json_root: str) -> str:
+    """Run the ecephys quality_metrics module for ks_folder in a subprocess.
+
+    Locates the matching modules-input.json, invokes the module to write a
+    *-qm-output.json next to it, and returns a human-readable status string.
+    Raises RuntimeError if the subprocess exits non-zero.
+    """
     folder = Path(ks_folder)
     jr = Path(json_root)
     inp = _find_modules_input_json(jr, folder)
@@ -74,6 +93,8 @@ def _recompute_quality_metrics(ks_folder: str, json_root: str) -> str:
 
 
 class QualityMetricsTab(QtWidgets.QWidget):
+    """Tab widget for recomputing/loading cluster quality metrics and plotting them."""
+
     def __init__(self, thread_pool: QtCore.QThreadPool) -> None:
         super().__init__()
         self.pool = thread_pool
@@ -160,9 +181,11 @@ class QualityMetricsTab(QtWidgets.QWidget):
         self.metric_combo.currentTextChanged.connect(self._refresh_plot)
 
     def set_ks_folder(self, folder: str) -> None:
+        """Set the Kilosort folder path shown in the input field."""
         self.ed_folder.setText(folder)
 
     def open_ks_folder(self, folder: str) -> None:
+        """Set the Kilosort folder and immediately recompute/load its quality metrics."""
         self.set_ks_folder(folder)
         self._run_reprocess_and_load()
 
@@ -210,14 +233,7 @@ class QualityMetricsTab(QtWidgets.QWidget):
             self._log(f"metrics.csv not found: {metrics_path}")
             return
 
-        self.df = pd.read_csv(metrics_path)
-        if self.df.columns.size > 0 and str(self.df.columns[0]).lower().startswith("unnamed"):
-            self.df = self.df.drop(columns=[self.df.columns[0]])
-        self.metric_combo.clear()
-        numeric_cols = [c for c in self.df.columns if np.issubdtype(self.df[c].dtype, np.number)]
-        self.metric_combo.addItems(numeric_cols)
-        self._refresh_table()
-        self._refresh_plot()
+        self._load_metrics_into_view(metrics_path)
         self._log(f"Loaded {metrics_path}")
 
     def _run_pybombcell(self) -> None:
@@ -248,6 +264,15 @@ class QualityMetricsTab(QtWidgets.QWidget):
         if not metrics_path.exists():
             self._log("py_bombcell finished but metrics file was not found.")
             return
+        self._load_metrics_into_view(metrics_path)
+        self._log(f"Loaded py_bombcell metrics: {metrics_path}")
+
+    def _load_metrics_into_view(self, metrics_path: Path) -> None:
+        """Read metrics_path into self.df and refresh the metric combo, table, and plot.
+
+        Drops a leading 'Unnamed' index column (as written by pandas to_csv) and
+        repopulates the metric selector with the numeric columns only.
+        """
         self.df = pd.read_csv(metrics_path)
         if self.df.columns.size > 0 and str(self.df.columns[0]).lower().startswith("unnamed"):
             self.df = self.df.drop(columns=[self.df.columns[0]])
@@ -256,7 +281,6 @@ class QualityMetricsTab(QtWidgets.QWidget):
         self.metric_combo.addItems(numeric_cols)
         self._refresh_table()
         self._refresh_plot()
-        self._log(f"Loaded py_bombcell metrics: {metrics_path}")
 
     def _filtered_df(self) -> pd.DataFrame:
         if self.df.empty:
@@ -300,6 +324,7 @@ class QualityMetricsTab(QtWidgets.QWidget):
             self.ed_folder.setText(str(folder))
 
     def set_plot_preferences(self, theme: str, show_grid: bool) -> None:
+        """Apply the given color theme and grid visibility to the histogram plot."""
         self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
         self._show_grid = bool(show_grid)
         bg = "#0b0f14" if self._plot_theme == "Dark" else "#ffffff"
@@ -315,6 +340,7 @@ class QualityMetricsTab(QtWidgets.QWidget):
         self.log.appendPlainText(str(msg))
 
     def is_busy(self) -> bool:
+        """Return True while a background recompute/py_bombcell worker is running."""
         return bool(self._busy)
 
     def _export_plotted_data(self) -> None:

@@ -45,6 +45,12 @@ def _auto_load(win, folder: Path) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """Build the offline IBL GUI, auto-load the given folder, and run the app.
+
+    Parses the histology folder from ``argv`` (or ``sys.argv`` when ``None``),
+    constructs ``MainWindow(offline=True)``, attempts the programmatic auto-load,
+    and starts the Qt event loop. Returns the application's exit code.
+    """
     parser = argparse.ArgumentParser(description="Auto-load the IBL alignment GUI")
     parser.add_argument("folder", help="Histology session folder to load")
     args = parser.parse_args(argv)

@@ -1,3 +1,12 @@
+"""Helpers for inspecting and loading behavioral event CSV files.
+
+These utilities heuristically detect which column holds event times and which
+column holds event labels, then extract event times (optionally filtered by a
+selected label). Column detection is tolerant of varied naming conventions by
+matching against priority lists of common column names before falling back to
+keyword and numeric-content heuristics.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -30,6 +39,10 @@ _LABEL_COLUMN_PRIORITY = (
 
 
 def _normalized_column_map(df: pd.DataFrame) -> Dict[str, str]:
+    """Map each lowercased, stripped column name to its original column name.
+
+    The first original column wins when several normalize to the same key.
+    """
     out: Dict[str, str] = {}
     for col in df.columns:
         key = str(col).strip().lower()
@@ -39,6 +52,10 @@ def _normalized_column_map(df: pd.DataFrame) -> Dict[str, str]:
 
 
 def _numeric_score(series: pd.Series) -> int:
+    """Return the count of values in the series that parse as numbers.
+
+    A higher score means the column is more likely to hold numeric data.
+    """
     try:
         numeric = pd.to_numeric(series, errors="coerce")
     except Exception:
@@ -47,6 +64,12 @@ def _numeric_score(series: pd.Series) -> int:
 
 
 def detect_event_time_column(df: pd.DataFrame) -> Optional[str]:
+    """Detect the column most likely to contain event times.
+
+    Detection order: known time column names (by priority), then any column
+    whose name contains a time-related keyword, then the sole numeric column,
+    then any numeric column. Returns None when no numeric column is found.
+    """
     if df is None or df.empty or df.shape[1] == 0:
         return None
     normalized = _normalized_column_map(df)
@@ -63,13 +86,18 @@ def detect_event_time_column(df: pd.DataFrame) -> Optional[str]:
     if keyword_hits:
         return keyword_hits[0]
 
+    # Fall back to the first column that contains numeric values, if any.
     numeric_cols = [str(col) for col in df.columns if _numeric_score(df[col]) > 0]
-    if len(numeric_cols) == 1:
-        return numeric_cols[0]
     return numeric_cols[0] if numeric_cols else None
 
 
 def detect_event_label_column(df: pd.DataFrame, time_column: Optional[str] = None) -> Optional[str]:
+    """Detect the column most likely to contain event labels.
+
+    A valid label column is non-numeric, has at least one non-empty value, is
+    not the detected time column, and contains more than one distinct label.
+    Known label names are tried first (by priority), then every column in order.
+    """
     if df is None or df.empty or df.shape[1] == 0:
         return None
 
@@ -101,6 +129,7 @@ def detect_event_label_column(df: pd.DataFrame, time_column: Optional[str] = Non
 
 
 def event_label_values(df: pd.DataFrame, label_column: Optional[str]) -> List[str]:
+    """Return the distinct, non-empty label values in order of first appearance."""
     if not label_column or label_column not in df.columns:
         return []
     values = [str(v).strip() for v in df[label_column].dropna().tolist()]
@@ -108,6 +137,11 @@ def event_label_values(df: pd.DataFrame, label_column: Optional[str]) -> List[st
 
 
 def inspect_event_csv(path: str | Path) -> Dict[str, object]:
+    """Read an event CSV and report the detected time and label columns.
+
+    Returns a dict with the resolved path, the loaded DataFrame, the detected
+    time and label column names (or None), and the list of distinct labels.
+    """
     csv_path = Path(path)
     df = pd.read_csv(csv_path)
     time_column = detect_event_time_column(df)
@@ -127,6 +161,12 @@ def load_event_times(
     *,
     selected_label: Optional[str] = None,
 ) -> pd.Series:
+    """Load numeric event times from a CSV, optionally filtered by label.
+
+    When selected_label is given and a label column was detected, only rows
+    whose label matches (after stripping whitespace) are kept. Returns an empty
+    float Series when no usable time column is present.
+    """
     info = inspect_event_csv(path)
     df = info["dataframe"]
     time_column = str(info.get("time_column") or "")

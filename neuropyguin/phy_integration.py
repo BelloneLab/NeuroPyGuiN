@@ -1,3 +1,12 @@
+"""Install and register NeuroPyGuiN's phy plugins into the user's phy home.
+
+This module writes two plugin source files (a "split short ISI" context-menu
+plugin and a gamepad controller plugin) into ``~/.phy/plugins`` and patches
+``~/.phy/phy_config.py`` so phy loads them. The plugin source is emitted as a
+string literal because phy imports these files from its own configuration
+directory, not from this package.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,6 +27,7 @@ _REGISTRATION_END = "# <<< NeuroPyGuiN auto plugin registration <<<"
 
 
 def _plugin_source() -> str:
+    """Return the Python source for the split-short-ISI context-menu plugin."""
     return dedent(
         """
         from phy import IPlugin, connect
@@ -284,6 +294,11 @@ def _plugin_source() -> str:
 
 
 def _registration_block(plugin_dir: Path) -> str:
+    """Return the phy_config.py snippet that registers the plugin dir and classes.
+
+    The snippet is delimited by the begin/end marker comments so it can later be
+    located and replaced idempotently by _upsert_registration_block.
+    """
     plugin_dir = plugin_dir.resolve()
     return dedent(
         f"""
@@ -311,6 +326,7 @@ def _registration_block(plugin_dir: Path) -> str:
 
 
 def _ensure_default_phy_config(config_path: Path) -> None:
+    """Create a minimal phy_config.py if one does not already exist."""
     if config_path.exists():
         return
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -330,6 +346,12 @@ def _ensure_default_phy_config(config_path: Path) -> None:
 
 
 def _upsert_registration_block(config_text: str, block: str) -> str:
+    """Insert or replace the registration block within existing phy_config text.
+
+    If the exact block is already present it is left untouched. If an older block
+    (matched by its begin/end markers) is found it is replaced in place,
+    otherwise the new block is appended.
+    """
     if block in config_text:
         return config_text
 
@@ -353,6 +375,14 @@ def _upsert_registration_block(config_text: str, block: str) -> str:
 
 
 def ensure_phy_short_isi_plugin(phy_home: Path | None = None) -> Dict[str, object]:
+    """Write the NeuroPyGuiN phy plugins and register them in phy_config.py.
+
+    Files are only rewritten when their content changes, so calling this on every
+    launch is cheap and idempotent. ``phy_home`` defaults to ``~/.phy``.
+
+    Returns a dict with the resolved file paths and per-file "updated" flags
+    indicating whether anything was written this call.
+    """
     home = Path(phy_home) if phy_home is not None else (Path.home() / ".phy")
     plugins_dir = home / "plugins"
     plugins_dir.mkdir(parents=True, exist_ok=True)

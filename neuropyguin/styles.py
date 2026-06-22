@@ -1,3 +1,11 @@
+"""Light/dark theme tokens and Qt style-sheet/palette builders for the app.
+
+Each theme is a flat mapping of token name to color string. The QSS template
+references those tokens by name via printf-style substitution, so the same
+template renders both themes. Callers use ``build_app_qss`` and
+``build_app_palette`` to apply a theme to the running QApplication.
+"""
+
 from __future__ import annotations
 
 from typing import Dict
@@ -609,16 +617,24 @@ QLabel#StepStatusPercent {
 
 
 def _theme_tokens(theme: str) -> Dict[str, str]:
+    """Return a fresh copy of the token map for ``theme``.
+
+    Any theme name starting with "dark" (case-insensitive) selects the dark
+    palette; anything else falls back to the light palette. A copy is returned
+    so callers cannot mutate the module-level dictionaries.
+    """
     if str(theme).lower().startswith("dark"):
         return dict(_DARK_THEME)
     return dict(_LIGHT_THEME)
 
 
 def build_app_qss(theme: str) -> str:
+    """Render the application style sheet for ``theme`` as a QSS string."""
     return _APP_QSS_TEMPLATE % _theme_tokens(theme)
 
 
 def build_app_palette(theme: str) -> QtGui.QPalette:
+    """Build a QPalette matching ``theme`` (complements the QSS style sheet)."""
     tokens = _theme_tokens(theme)
     palette = QtGui.QPalette()
     palette.setColor(QtGui.QPalette.Window, QtGui.QColor(tokens["window_bg"]))

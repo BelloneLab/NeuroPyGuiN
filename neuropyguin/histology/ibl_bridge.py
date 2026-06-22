@@ -29,9 +29,7 @@ dispatch it to the right interpreter via subprocess::
 from __future__ import annotations
 
 import argparse
-import glob
 import json
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -315,6 +313,7 @@ def compute_channel_locations(
 # ---------------------------------------------------------------------------
 
 def _main(argv: Optional[List[str]] = None) -> int:
+    """Parse the CLI subcommand and dispatch to the matching bridge function."""
     parser = argparse.ArgumentParser(description="AP_histology -> IBL bridge")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

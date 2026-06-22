@@ -25,6 +25,7 @@ _LOG_FILE = None  # keep a module-level reference so the handle is not GC'd/clos
 
 
 def crash_log_path() -> Path:
+    """Return the crash-log path, honoring the NPG_CRASH_LOG override if set."""
     env = os.environ.get("NPG_CRASH_LOG")
     if env:
         return Path(env)
@@ -32,6 +33,12 @@ def crash_log_path() -> Path:
 
 
 def _write_build_header(fh) -> None:
+    """Stamp a session header (timestamp, pid, interpreter, package, build probes).
+
+    The build probes confirm which copy of the code is running after a crash, so a
+    stale install can be ruled out. Probing is best effort: any failure is recorded
+    inline rather than raised.
+    """
     fh.write(
         f"\n==== NeuroPyGuiN session {datetime.datetime.now().isoformat()} "
         f"pid={os.getpid()} ====\n"

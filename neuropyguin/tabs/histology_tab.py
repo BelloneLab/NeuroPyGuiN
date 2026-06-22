@@ -677,6 +677,13 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
 
 
 class HistologyTab(QtWidgets.QWidget):
+    """Probe-localization tab driving the AP_histology pipeline plus the IBL bridge.
+
+    Walks the user through Setup, Preprocess, Match, Align, Trace, Channel map and
+    IBL refine (see the module docstring). Heavy work runs on a dedicated thread
+    pool so histology stays responsive while other tabs run long sorting jobs.
+    """
+
     #: Emitted from worker threads so log lines reach the GUI thread safely.
     log_requested = QtCore.Signal(str)
 
@@ -1140,9 +1147,11 @@ class HistologyTab(QtWidgets.QWidget):
         self.log.appendPlainText(str(msg))
 
     def is_busy(self) -> bool:
+        """True while any background histology worker is still running."""
         return self._busy_count > 0
 
     def set_plot_preferences(self, theme: str, show_grid: bool) -> None:
+        """Apply the app-wide light/dark theme to every canvas in this tab."""
         self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
         bg = "#0b0f14" if self._plot_theme == "Dark" else "#ffffff"
         for c in [getattr(self, n, None) for n in (
@@ -1203,6 +1212,7 @@ class HistologyTab(QtWidgets.QWidget):
             self._load_session()
 
     def open_histology_folder(self, folder: str) -> None:
+        """Point the tab at ``folder`` and load any existing session products."""
         self.ed_folder.setText(str(folder))
         self._load_session()
 
@@ -1302,7 +1312,6 @@ class HistologyTab(QtWidgets.QWidget):
         self._preproc_show()
         self._match_show()
         self._align_show()
-        self._trace_show()
         self._trace_show()
         self._log(f"Loaded session: {self.folder}")
 
@@ -2132,7 +2141,7 @@ class HistologyTab(QtWidgets.QWidget):
         kw = self._ibl_kwargs()
 
         def job():
-            rc, out = ibl_launch.run_bridge(["xyz_picks", str(self.folder)], **kw)
+            rc, _ = ibl_launch.run_bridge(["xyz_picks", str(self.folder)], **kw)
             return rc
 
         self._run_bg(job, lambda rc: self._log("xyz_picks done." if rc == 0 else "xyz_picks failed."),
@@ -2149,7 +2158,7 @@ class HistologyTab(QtWidgets.QWidget):
             args += ["--ks", ks]  # lets the bridge reuse channel_positions.npy
 
         def job():
-            rc, out = ibl_launch.run_bridge(args, **kw)
+            rc, _ = ibl_launch.run_bridge(args, **kw)
             return rc
 
         self._run_bg(job, lambda rc: self._on_channels_done(rc),
@@ -2230,7 +2239,6 @@ class HistologyTab(QtWidgets.QWidget):
                      busy_msg="Proposing alignment from firing vs atlas structure...")
 
     def _load_channel_table(self) -> None:
-        import json
         fn = self.folder / "channel_locations_all_shanks.json"
         if not fn.exists():
             return

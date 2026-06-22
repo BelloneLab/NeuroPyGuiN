@@ -1,9 +1,23 @@
+"""Side navigation widgets: a vertical-rail stacked-page container.
+
+Provides ``SideNavStack``, a QStackedWidget paired with a column of nav
+buttons, plus ``VerticalNavButton``, a push button that paints its label
+rotated 90 degrees for use in a narrow vertical rail.
+"""
+
 from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
 
 class VerticalNavButton(QtWidgets.QPushButton):
+    """Push button that draws its label rotated 90 degrees (bottom-to-top).
+
+    Used in the compact vertical rail where horizontal space is scarce. The
+    label text is rendered by ``paintEvent`` rather than the default button
+    layout, and is exposed as the tooltip and accessible name.
+    """
+
     def __init__(self, label: str, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__("", parent)
         self._label = label
@@ -38,6 +52,14 @@ class VerticalNavButton(QtWidgets.QPushButton):
 
 
 class SideNavStack(QtWidgets.QWidget):
+    """A stacked-page container with a left navigation rail.
+
+    Each page added via ``add_page`` gets a checkable nav button. Selecting a
+    button (or calling ``setCurrentIndex``) switches the visible page and emits
+    ``currentChanged``. The rail can render either standard horizontal buttons
+    or rotated vertical-label buttons in a narrow compact rail.
+    """
+
     currentChanged = QtCore.Signal(int)
 
     def __init__(
@@ -103,6 +125,10 @@ class SideNavStack(QtWidgets.QWidget):
         self._buttons: list[QtWidgets.QPushButton] = []
 
     def add_page(self, label: str, page: QtWidgets.QWidget) -> int:
+        """Add a page and its nav button; return the page's stack index.
+
+        The first page added is selected automatically.
+        """
         index = self.stack.addWidget(page)
         if self._vertical_labels:
             button = VerticalNavButton(label)
@@ -123,12 +149,20 @@ class SideNavStack(QtWidgets.QWidget):
         return index
 
     def currentIndex(self) -> int:
+        """Return the index of the currently visible page."""
         return self.stack.currentIndex()
 
     def currentWidget(self) -> QtWidgets.QWidget | None:
+        """Return the currently visible page widget, or None if empty."""
         return self.stack.currentWidget()
 
     def setCurrentIndex(self, index: int) -> None:
+        """Show the page at ``index`` and sync the nav buttons.
+
+        Out-of-range indices are ignored. Buttons are toggled with signals
+        blocked so updating their checked state does not re-trigger selection.
+        ``currentChanged`` is emitted once the page is switched.
+        """
         if index < 0 or index >= self.stack.count():
             return
         self.stack.setCurrentIndex(index)
@@ -139,4 +173,5 @@ class SideNavStack(QtWidgets.QWidget):
         self.currentChanged.emit(index)
 
     def setCurrentWidget(self, widget: QtWidgets.QWidget) -> None:
+        """Show the page matching ``widget`` (by its stack index)."""
         self.setCurrentIndex(self.stack.indexOf(widget))

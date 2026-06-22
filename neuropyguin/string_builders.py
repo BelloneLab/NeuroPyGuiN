@@ -1,3 +1,12 @@
+"""Builders and parsers for SpikeGLX/CatGT/TPrime command-string fragments.
+
+This module converts between human-readable spec dataclasses and the raw flag
+strings consumed by CatGT and TPrime (for example ``-apfilter=...``,
+``-xd=...``, and ``-bf=...``), and provides the Qt dialogs that let users edit
+those fragments through tables and form fields. The build/parse helpers are
+pure functions with no Qt dependency; the dialog classes wrap them for the GUI.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,6 +30,8 @@ _STREAM_TO_JS = {
 
 @dataclass
 class CatGTCommandSpec:
+    """Editable view of a CatGT command fragment (folders, AP filter, gfix, extras)."""
+
     use_probe_folders: bool = True
     use_output_probe_folders: bool = True
     allow_missing_probes: bool = False
@@ -40,6 +51,8 @@ class CatGTCommandSpec:
 
 @dataclass
 class TPrimeExtractorSpec:
+    """One CatGT event extractor (-xd/-xid/-xa/-xia) used by TPrime alignment."""
+
     mode: str = "xd"
     stream_kind: str = "ni"
     stream_index: int = 0
@@ -52,6 +65,8 @@ class TPrimeExtractorSpec:
 
 @dataclass
 class BitFieldExtractorSpec:
+    """One CatGT bit-field extractor (-bf=js,ip,word,startbit,nbits,inarow)."""
+
     stream_kind: str = "ni"
     stream_index: int = 0
     word: int = 0
@@ -61,23 +76,28 @@ class BitFieldExtractorSpec:
 
 
 def _split_flags(raw: str) -> List[str]:
+    """Split a flag string on runs of whitespace, dropping empty tokens."""
     return [part for part in re.split(r"\s+", str(raw).strip()) if part]
 
 
 def _is_extractor_token(token: str) -> bool:
+    """Return True if the token is a CatGT extractor flag (xd/xid/xa/xia/bf)."""
     clean = re.sub(r"\[.*?\]$", "", str(token).strip())
     return bool(re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", clean, flags=re.IGNORECASE))
 
 
 def _is_bf_token(token: str) -> bool:
+    """Return True if the token is a CatGT bit-field extractor flag (-bf=...)."""
     return bool(re.fullmatch(r"-bf=(.+)", str(token).strip(), flags=re.IGNORECASE))
 
 
 def _stream_kind_from_js(js: int) -> str:
+    """Map a CatGT stream selector (js: 0/1/2) back to its stream-kind name."""
     return {0: "ni", 1: "obx", 2: "imec"}.get(int(js), "ni")
 
 
 def _fmt_number(value: float, decimals: int = 3) -> str:
+    """Format a float with up to ``decimals`` places, trimming trailing zeros."""
     txt = f"{float(value):.{decimals}f}"
     txt = txt.rstrip("0").rstrip(".")
     if txt == "-0":
@@ -86,6 +106,7 @@ def _fmt_number(value: float, decimals: int = 3) -> str:
 
 
 def parse_channel_spec(raw: str) -> List[int]:
+    """Parse a channel spec like ``"0-2,4"`` into a de-duplicated, ordered list."""
     values: List[int] = []
     for part in [chunk.strip() for chunk in str(raw).split(",") if chunk.strip()]:
         if "-" in part:
@@ -105,6 +126,7 @@ def parse_channel_spec(raw: str) -> List[int]:
 
 
 def build_catgt_command_string(spec: CatGTCommandSpec) -> str:
+    """Render a CatGTCommandSpec into a space-joined CatGT flag string."""
     parts: List[str] = []
     if spec.use_probe_folders:
         parts.append("-prb_fld")
@@ -136,6 +158,7 @@ def build_catgt_command_string(spec: CatGTCommandSpec) -> str:
 
 
 def parse_catgt_command_string(raw: str) -> CatGTCommandSpec:
+    """Parse a CatGT flag string into a CatGTCommandSpec, keeping unknown flags as extras."""
     spec = CatGTCommandSpec()
     extras: List[str] = []
     tokens = _split_flags(raw)
@@ -185,6 +208,7 @@ def parse_catgt_command_string(raw: str) -> CatGTCommandSpec:
 
 
 def build_tostream_sync_params(stream_kind: str, stream_index: int) -> str:
+    """Build a TPrime toStream sync-param token (``ni`` or ``imec0``/``obx0`` style)."""
     kind = str(stream_kind).strip().lower()
     if kind == "ni":
         return "ni"
@@ -192,6 +216,7 @@ def build_tostream_sync_params(stream_kind: str, stream_index: int) -> str:
 
 
 def parse_tostream_sync_params(raw: str) -> Tuple[str, int]:
+    """Parse a TPrime toStream token into (stream_kind, stream_index)."""
     text = str(raw).strip().lower()
     if text == "ni":
         return "ni", 0
@@ -202,6 +227,7 @@ def parse_tostream_sync_params(raw: str) -> Tuple[str, int]:
 
 
 def build_tprime_extractor_string(specs: Sequence[TPrimeExtractorSpec], extra_flags: str = "") -> str:
+    """Render extractor specs into CatGT -xd/-xid/-xa/-xia flags, appending raw extras."""
     parts: List[str] = []
     for spec in specs:
         mode = str(spec.mode).strip().lower()
@@ -229,6 +255,7 @@ def build_tprime_extractor_string(specs: Sequence[TPrimeExtractorSpec], extra_fl
 
 
 def parse_tprime_extractor_string(raw: str) -> Tuple[List[TPrimeExtractorSpec], str]:
+    """Parse -xd/-xid/-xa/-xia flags into specs; return (specs, leftover-extras-string)."""
     specs: List[TPrimeExtractorSpec] = []
     extras: List[str] = []
     for token in _split_flags(raw):
@@ -281,26 +308,32 @@ def parse_tprime_extractor_string(raw: str) -> Tuple[List[TPrimeExtractorSpec], 
 
 
 def strip_extractor_labels(raw: str) -> str:
+    """Remove the trailing ``[label]`` annotations from an extractor string."""
     return re.sub(r"\[[^\]]*\]", "", raw)
 
 
 def catgt_command_extractors(raw: str) -> str:
+    """Return only the extractor flags (xd/xid/xa/xia/bf) from a CatGT command."""
     return " ".join([token for token in _split_flags(raw) if _is_extractor_token(token)])
 
 
 def catgt_command_bf_extractors(raw: str) -> str:
+    """Return only the bit-field (-bf) flags from a CatGT command."""
     return " ".join([token for token in _split_flags(raw) if _is_bf_token(token)])
 
 
 def strip_catgt_extractors(raw: str) -> str:
+    """Return the CatGT command with all extractor flags removed."""
     return " ".join([token for token in _split_flags(raw) if not _is_extractor_token(token)])
 
 
 def strip_catgt_bf_extractors(raw: str) -> str:
+    """Return the CatGT command with all bit-field (-bf) flags removed."""
     return " ".join([token for token in _split_flags(raw) if not _is_bf_token(token)])
 
 
 def merge_extractors_into_catgt_command(raw_command: str, extractor_string: str) -> str:
+    """Replace any existing extractor flags in the command with label-stripped ones."""
     base = strip_catgt_extractors(raw_command)
     clean_extractors = strip_extractor_labels(extractor_string.strip())
     parts = [part for part in [base.strip(), clean_extractors] if part]
@@ -308,6 +341,7 @@ def merge_extractors_into_catgt_command(raw_command: str, extractor_string: str)
 
 
 def build_bitfield_extractor_string(specs: Sequence[BitFieldExtractorSpec], extra_flags: str = "") -> str:
+    """Render bit-field specs into CatGT -bf flags, appending raw extras."""
     parts: List[str] = []
     for spec in specs:
         js = _STREAM_TO_JS.get(str(spec.stream_kind).strip().lower(), 0)
@@ -322,6 +356,7 @@ def build_bitfield_extractor_string(specs: Sequence[BitFieldExtractorSpec], extr
 
 
 def parse_bitfield_extractor_string(raw: str) -> Tuple[List[BitFieldExtractorSpec], str]:
+    """Parse -bf flags into specs; return (specs, leftover-extras-string)."""
     specs: List[BitFieldExtractorSpec] = []
     extras: List[str] = []
     for token in _split_flags(raw):
@@ -351,12 +386,15 @@ def parse_bitfield_extractor_string(raw: str) -> Tuple[List[BitFieldExtractorSpe
 
 
 def merge_bitfields_into_catgt_command(raw_command: str, bitfield_string: str) -> str:
+    """Replace any existing -bf flags in the command with the given bit-field string."""
     base = strip_catgt_bf_extractors(raw_command)
     parts = [part for part in [base.strip(), bitfield_string.strip()] if part]
     return " ".join(parts)
 
 
 class BitFieldBuilderDialog(QtWidgets.QDialog):
+    """Dialog for building CatGT bit-field (-bf) extractor flags from a table."""
+
     def __init__(self, initial_bitfields: str, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Build CatGT bit-field (-bf) extractors")
@@ -507,6 +545,7 @@ class BitFieldBuilderDialog(QtWidgets.QDialog):
         self.preview.setText(self.value())
 
     def value(self) -> str:
+        """Return the generated -bf extractor string for the current table state."""
         specs: List[BitFieldExtractorSpec] = []
         for row in range(self.tbl.rowCount()):
             spec = self._row_spec(row)
@@ -516,6 +555,8 @@ class BitFieldBuilderDialog(QtWidgets.QDialog):
 
 
 class CatGTStringBuilderDialog(QtWidgets.QDialog):
+    """Dialog for building a CatGT command fragment from readable form fields."""
+
     def __init__(self, initial_command: str, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Build CatGT command string")
@@ -656,6 +697,7 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
         self.preview.setPlainText(build_catgt_command_string(self.spec()))
 
     def spec(self) -> CatGTCommandSpec:
+        """Collect the current widget values into a CatGTCommandSpec."""
         return CatGTCommandSpec(
             use_probe_folders=self.ck_probe_folders.isChecked(),
             use_output_probe_folders=self.ck_output_probe_folders.isChecked(),
@@ -675,10 +717,13 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
         )
 
     def value(self) -> str:
+        """Return the generated CatGT command fragment for the current form state."""
         return build_catgt_command_string(self.spec())
 
 
 class TPrimeStringBuilderDialog(QtWidgets.QDialog):
+    """Dialog for building the TPrime reference stream and event-extractor strings."""
+
     def __init__(
         self,
         initial_to_stream: str,
@@ -1213,6 +1258,7 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         self.ed_extract_preview.setPlainText(ex_string)
 
     def values(self) -> Tuple[str, str]:
+        """Return (toStream_sync_params, extractor_string) for the current dialog state."""
         specs: List[TPrimeExtractorSpec] = []
         for row in range(self.tbl.rowCount()):
             spec = self._row_spec(row)

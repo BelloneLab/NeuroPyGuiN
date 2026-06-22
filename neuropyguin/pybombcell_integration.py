@@ -1,3 +1,18 @@
+"""Integration layer between NeuroPyGuiN and the py_bombcell quality-metrics tool.
+
+This module wraps py_bombcell to compute and persist Kilosort unit quality
+metrics and labels (good / mua / noise / non-soma). It owns:
+
+- the default settings schema and helpers to normalize / hash settings,
+- reading and writing the BombCell manifest / metadata sidecar files,
+- a fast path that reclassifies units from previously saved metrics, and
+- a full-run path that invokes py_bombcell from scratch (optionally with raw
+  waveform / SNR extraction), plus a Jupyter launcher for the BombCell GUI.
+
+It performs no Qt work; callers (e.g. the curation tab) drive it from worker
+threads.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -75,10 +90,12 @@ PYBOMBCELL_SETTINGS_SCHEMA: List[tuple[str, object]] = [
 
 
 def pybombcell_default_settings() -> Dict[str, object]:
+    """Return a fresh dict of default BombCell settings keyed by setting name."""
     return {key: value for key, value in PYBOMBCELL_SETTINGS_SCHEMA}
 
 
 def pybombcell_setting_keys() -> List[str]:
+    """Return the ordered list of recognized BombCell setting keys."""
     return [key for key, _value in PYBOMBCELL_SETTINGS_SCHEMA]
 
 
@@ -98,6 +115,11 @@ def _jsonable_setting_value(value: object) -> object:
 
 
 def normalize_pybombcell_settings(settings: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    """Merge user-supplied settings onto the defaults, keeping only known keys.
+
+    Unknown keys in ``settings`` are ignored and missing keys fall back to their
+    defaults, so the result always contains exactly the recognized setting keys.
+    """
     defaults = pybombcell_default_settings()
     if not settings:
         return dict(defaults)
@@ -109,6 +131,11 @@ def normalize_pybombcell_settings(settings: Optional[Dict[str, object]] = None) 
 
 
 def pybombcell_settings_signature(settings: Optional[Dict[str, object]] = None) -> str:
+    """Return a stable SHA-256 hash of the normalized settings.
+
+    Used to decide whether previously saved metrics were computed with the same
+    settings and can be reused.
+    """
     normalized = normalize_pybombcell_settings(settings)
     payload = {key: _jsonable_setting_value(value) for key, value in normalized.items()}
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -116,10 +143,12 @@ def pybombcell_settings_signature(settings: Optional[Dict[str, object]] = None) 
 
 
 def pybombcell_manifest_path(ks_folder: str | Path) -> Path:
+    """Return the path to the legacy BombCell manifest JSON for a KS folder."""
     return Path(ks_folder) / "bombcell" / "pybombcell_manifest.json"
 
 
 def pybombcell_metadata_path(ks_folder: str | Path) -> Path:
+    """Return the path to the current BombCell metadata JSON for a KS folder."""
     return Path(ks_folder) / "bombcell" / "bombcell_metadata.json"
 
 
@@ -134,6 +163,11 @@ def _read_json_object(path: Path) -> Dict[str, object]:
 
 
 def load_pybombcell_manifest(ks_folder: str | Path) -> Dict[str, object]:
+    """Load the BombCell manifest, preferring the metadata file over the legacy one.
+
+    Returns the first non-empty JSON object found, or an empty dict if neither
+    sidecar exists or parses.
+    """
     for path in (pybombcell_metadata_path(ks_folder), pybombcell_manifest_path(ks_folder)):
         data = _read_json_object(path)
         if data:
@@ -312,6 +346,12 @@ def summarize_saved_pybombcell_results(
     *,
     settings: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
+    """Summarize on-disk BombCell results for a KS folder without recomputing.
+
+    Inspects saved metrics, labels, plots, and the manifest to report counts,
+    unit totals, and whether the cached metrics can be reused for the given
+    ``settings`` (via ``can_reuse`` / ``cache_reason``).
+    """
     ks = Path(ks_folder)
     save_dir = ks / "bombcell"
     metrics_path = _saved_metrics_path(ks)
@@ -340,6 +380,11 @@ def summarize_saved_pybombcell_results(
     manifest_signature = str(manifest.get("settings_signature") or "")
     default_signature = pybombcell_settings_signature(pybombcell_default_settings())
 
+    # Decide whether the saved metrics can be reused as-is. With no metrics on
+    # disk we cannot reuse anything. With a recorded signature we reuse only on
+    # an exact match. Legacy results predate signature tracking, so we assume
+    # they used the defaults and reuse only when the requested settings are the
+    # defaults too.
     if metrics_path is None:
         can_reuse = False
         cache_reason = "missing_metrics"
@@ -662,6 +707,12 @@ def _write_bombcell_gui_notebook(ks_folder: str | Path) -> Path:
 
 
 def launch_pybombcell_gui(ks_folder: str | Path) -> Dict[str, object]:
+    """Write a launcher notebook and open the py_bombcell GUI in Jupyter.
+
+    Requires saved metrics to exist for ``ks_folder``. Tries several Jupyter
+    launchers in turn and returns the one that started, raising RuntimeError if
+    none is available.
+    """
     ks = Path(ks_folder)
     summary = summarize_saved_pybombcell_results(ks)
     if not summary.get("has_metrics", False):
@@ -709,6 +760,13 @@ def run_pybombcell_on_folder(
     settings: Optional[Dict[str, object]] = None,
     extract_raw: bool = False,
 ) -> Dict:
+    """Run (or reuse) BombCell quality metrics for a single Kilosort folder.
+
+    When cached metrics match the settings and no raw extraction is requested,
+    units are reclassified from the saved metrics; otherwise py_bombcell is run
+    from scratch. Writes metrics, labels, plots, and a manifest, syncs the phy
+    cluster groups, and returns a result dict describing the outputs.
+    """
     normalized_settings = normalize_pybombcell_settings(settings)
     ks = Path(ks_folder)
     if not ks.exists():
@@ -808,6 +866,12 @@ def run_pybombcell_on_folders(
     settings: Optional[Dict[str, object]] = None,
     extract_raw: bool = False,
 ) -> Dict[str, object]:
+    """Run BombCell over many Kilosort folders, de-duplicating the input list.
+
+    Folders are processed in first-seen order (case-insensitive de-dup). Failures
+    are captured per folder rather than aborting the batch. Returns the per-folder
+    results plus an aggregate summary (run/reuse/fail counts and label totals).
+    """
     normalized_settings = normalize_pybombcell_settings(settings)
     seen: set[str] = set()
     ordered_folders: List[str] = []

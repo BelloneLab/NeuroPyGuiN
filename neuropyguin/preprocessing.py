@@ -1,3 +1,13 @@
+"""Pure helpers for the SpikeGLX / Kilosort preprocessing pipeline.
+
+This module is deliberately GUI-free: it holds the filesystem, naming, and
+metadata logic that the tabs and worker threads call into (discovering AP
+binaries, parsing SpikeGLX run names, building CatGT command/stream strings,
+laying out Kilosort output folders, and concatenating then re-splitting
+multi-session recordings). Keeping these functions free of Qt makes them easy
+to reason about and unit-test in isolation.
+"""
+
 from __future__ import annotations
 
 import json
@@ -6,10 +16,15 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
 
 def discover_bin_files(paths: List[str]) -> List[str]:
+    """Find SpikeGLX AP binaries among the given file/directory paths.
+
+    Directories are searched recursively. Returns the resolved paths of all
+    matching ``*.imecN.ap.bin`` files, de-duplicated and sorted.
+    """
     found: List[Path] = []
     ap_pat = re.compile(r".*\.imec\d+\.ap\.bin$", re.IGNORECASE)
     for p in paths:
@@ -25,6 +40,11 @@ def discover_bin_files(paths: List[str]) -> List[str]:
 
 
 def build_run_name(bin_file: str) -> str:
+    """Derive the SpikeGLX run name from an AP bin filename.
+
+    Strips the ``_gN_tN.imecK.ap`` (or ``_tcat``) suffix when present and
+    replaces spaces with underscores; falls back to the bare stem otherwise.
+    """
     p = Path(bin_file)
     stem = p.name
     if stem.lower().endswith(".bin"):
@@ -39,6 +59,12 @@ def build_run_name(bin_file: str) -> str:
 
 
 def parse_spikeglx_bin_name(bin_file: str) -> Dict[str, str]:
+    """Parse a SpikeGLX AP bin filename into CatGT-style fields.
+
+    Returns the run name, gate, trigger, and probe strings. For names that do
+    not match the SpikeGLX pattern, returns sensible defaults built from
+    :func:`build_run_name`.
+    """
     p = Path(bin_file)
     name = p.name[:-4] if p.name.lower().endswith(".bin") else p.name
     m = re.match(r"(?P<run>.+)_g(?P<gate>\d+)_t(?P<trig>\d+)\.imec(?P<probe>\d+)\.ap$", name, re.IGNORECASE)
@@ -70,10 +96,16 @@ def _is_catgt_extractor_flag(token: str) -> bool:
 
 
 def strip_catgt_extractor_flags(catgt_command: str) -> str:
+    """Return the CatGT command with all event-extractor flags removed."""
     return " ".join(token for token in _split_catgt_flags(catgt_command) if not _is_catgt_extractor_flag(token))
 
 
 def merge_extractors_into_catgt_command(catgt_command: str, extractor_string: str) -> str:
+    """Replace any extractor flags in the command with ``extractor_string``.
+
+    The label brackets (``[label]``) in ``extractor_string`` are stripped, since
+    labels are a NeuroPyGuiN convention CatGT itself does not understand.
+    """
     base = strip_catgt_extractor_flags(catgt_command)
     clean_extractors = re.sub(r"\[[^\]]*\]", "", str(extractor_string).strip())
     parts = [part for part in [base.strip(), clean_extractors] if part]
@@ -126,6 +158,7 @@ def _catgt_extractor_streams(catgt_command: str) -> List[str]:
 
 
 def has_ni_catgt_extractors(catgt_command: str) -> bool:
+    """True if the command requests any NI-stream (``js=0``) extractor."""
     return any(_is_ni_catgt_extractor_flag(token) for token in _split_catgt_flags(catgt_command))
 
 
@@ -137,6 +170,13 @@ def _fmt_catgt_output_token(value: str) -> str:
 
 
 def expected_ni_catgt_output_patterns(catgt_command: str, run_name: str, gate_string: str) -> List[str]:
+    """Predict the NI event-file names CatGT will write for ``js=0`` extractors.
+
+    Mirrors CatGT's own output-naming rules (including the ``-1`` word wildcard
+    and the dotted-value ``p`` substitution) so the GUI can verify that the
+    expected files were produced. Returns the patterns in command order, with
+    duplicates removed.
+    """
     base = f"{str(run_name).strip()}_g{str(gate_string).strip()}_tcat.nidq."
     patterns: List[str] = []
     for token in _split_catgt_flags(catgt_command):
@@ -207,6 +247,11 @@ def extractor_label_rename_map(
 
 
 def catgt_stream_string(catgt_command: str, ni_extract_string: str = "", include_ap: bool = True) -> str:
+    """Build the CatGT stream selector (``-ap``/``-ni``) for a full run.
+
+    Includes ``-ap`` unless ``include_ap`` is False, and adds ``-ni`` when the
+    command or ``ni_extract_string`` references the NI stream in any form.
+    """
     tokens = _split_catgt_flags(catgt_command)
     parts: List[str] = []
     if include_ap:
@@ -225,6 +270,11 @@ def catgt_stream_string(catgt_command: str, ni_extract_string: str = "", include
 
 
 def catgt_extract_only_stream_string(catgt_command: str, ni_extract_string: str = "") -> str:
+    """Build the stream selector for an extract-only CatGT pass.
+
+    Selects only the streams (``-ap``/``-ni``/``-obx``) that actually carry an
+    extractor flag (or an explicit stream token), so no stream is read needlessly.
+    """
     tokens = [token.lower() for token in _split_catgt_flags(catgt_command)]
     streams = _catgt_extractor_streams(catgt_command)
     parts: List[str] = []
@@ -242,12 +292,24 @@ def catgt_extract_only_stream_string(catgt_command: str, ni_extract_string: str 
 
 
 def catgt_extract_command_string(catgt_command: str, *, save_ap_bin: bool = False) -> str:
+    """Return the CatGT flags to use for extraction.
+
+    When ``save_ap_bin`` is set the original command is kept verbatim (so the
+    filtered AP binary is still written); otherwise it is reduced to the
+    extract-only flag set from :func:`catgt_extract_only_flags`.
+    """
     if save_ap_bin:
         return str(catgt_command).strip()
     return catgt_extract_only_flags(catgt_command)
 
 
 def catgt_extract_stream_selection(catgt_command: str, ni_extract_string: str = "", *, save_ap_bin: bool = False) -> str:
+    """Stream selector for extraction, forcing ``-ap`` when the AP bin is saved.
+
+    Builds on :func:`catgt_extract_only_stream_string` and, when ``save_ap_bin``
+    is set, ensures ``-ap`` is present (and first) so the filtered AP file is
+    actually produced.
+    """
     stream = catgt_extract_only_stream_string(catgt_command, ni_extract_string)
     if not save_ap_bin:
         return stream
@@ -263,6 +325,12 @@ def catgt_extract_stream_selection(catgt_command: str, ni_extract_string: str = 
 
 
 def catgt_extract_only_flags(catgt_command: str) -> str:
+    """Reduce a CatGT command to the flags needed for extract-only runs.
+
+    Keeps the probe/trial folder and miss-tolerance flags plus every extractor
+    flag, drops filtering/output options, and guarantees ``-prb_fld`` is present
+    and ``-no_tshift`` is appended.
+    """
     keep_exact = {"-prb_fld", "-out_prb_fld", "-prb_miss_ok", "-t_miss_ok", "-no_auto_sync"}
     parts: List[str] = []
     for token in _split_catgt_flags(catgt_command):
@@ -277,6 +345,7 @@ def catgt_extract_only_flags(catgt_command: str) -> str:
 
 
 def is_catgt_processed_bin(bin_file: str) -> bool:
+    """True if the filename marks it as a CatGT-processed (``tcat``) AP bin."""
     name = Path(bin_file).name.lower()
     return "catgt" in name or "tcat" in name
 
@@ -286,6 +355,11 @@ def _is_kilosort_output_dir_name(name: str) -> bool:
 
 
 def parse_kilosort_params_dat_path(params_file: str | Path) -> str:
+    """Read the ``dat_path`` recorded in a Kilosort ``params.py``.
+
+    Returns the absolute path to the source binary (resolving relative paths
+    against the params file's folder), or an empty string when it cannot be read.
+    """
     path = Path(params_file)
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
@@ -306,6 +380,11 @@ def parse_kilosort_params_dat_path(params_file: str | Path) -> str:
 
 
 def infer_completed_run_name(ks_folder: str | Path) -> str:
+    """Recover the run name from a Kilosort folder's parent directory names.
+
+    Walks the ancestors looking for a ``catgt_<run>_gN`` or ``<run>_gN_imecK``
+    folder; falls back to the immediate parent's name when none match.
+    """
     folder = Path(ks_folder)
     for parent in [folder.parent, *folder.parents]:
         match = re.fullmatch(r"catgt_(?P<run>.+)_g\d+", parent.name, flags=re.IGNORECASE)
@@ -318,6 +397,12 @@ def infer_completed_run_name(ks_folder: str | Path) -> str:
 
 
 def discover_completed_runs(root_path: str | Path) -> List[Dict[str, str]]:
+    """Scan a folder tree for completed Kilosort sorts.
+
+    Finds every ``params.py`` living in a recognised Kilosort output folder,
+    de-duplicates by resolved folder, and returns one descriptor dict per sort
+    (run name, KS folder, source bin, label, finish time, etc.), newest first.
+    """
     root = Path(root_path).expanduser()
     if not root.is_dir():
         return []
@@ -354,6 +439,11 @@ def discover_completed_runs(root_path: str | Path) -> List[Dict[str, str]]:
 
 
 def completed_run_target_folders(entries: Iterable[Dict[str, object]]) -> List[str]:
+    """Extract the unique ``ks_folder`` paths from completed-run descriptors.
+
+    Preserves first-seen order and treats paths case-insensitively for the
+    uniqueness check while keeping the original casing in the result.
+    """
     out: List[str] = []
     seen: set[str] = set()
     for entry in entries:
@@ -369,12 +459,14 @@ def completed_run_target_folders(entries: Iterable[Dict[str, object]]) -> List[s
 
 
 def default_kilosort_output_name(ks_tag: str, probe_string: str) -> str:
+    """Build the KS output folder name, e.g. ``imec0_ks4`` (or just the tag)."""
     probe = str(probe_string).strip()
     tag = str(ks_tag).strip()
     return f"imec{probe}_{tag}" if probe else tag
 
 
 def default_local_ks_output_dir(bin_file: str, ks_tag: str, probe_string: str) -> Path:
+    """KS output folder placed directly beside the source binary."""
     return Path(bin_file).resolve().parent / default_kilosort_output_name(ks_tag, probe_string)
 
 
@@ -423,6 +515,12 @@ def default_pipeline_output_dir(
     run_name: str,
     mirror_raw_hierarchy: bool = False,
 ) -> Path:
+    """Choose the extracted-data folder for a run under the output root.
+
+    Defaults to ``<output_root>/<run_name>``; when ``mirror_raw_hierarchy`` is
+    set and the raw layout can be resolved, mirrors the rawData session tree and
+    appends a ``spike_sorting`` level instead.
+    """
     root = Path(output_root).expanduser()
     if not mirror_raw_hierarchy:
         return root / str(run_name).strip()
@@ -441,6 +539,7 @@ def default_pipeline_raw_output_layout(
     run_name: str,
     mirror_raw_hierarchy: bool = False,
 ) -> Tuple[Path, Path]:
+    """Return the ``(extracted_data_root, ks_folder)`` pair for a pipeline run."""
     extracted_data_root = default_pipeline_output_dir(
         bin_file,
         output_root,
@@ -452,6 +551,12 @@ def default_pipeline_raw_output_layout(
 
 
 def parse_catgt_processed_bin_context(bin_file: str) -> Dict[str, str]:
+    """Recover CatGT run context from a processed bin's ``catgt_<run>_gN`` folder.
+
+    Returns the destination/run directories, run and gate strings, probe index,
+    and a ``trigger_string`` of ``"cat"``. Returns an empty dict when the bin is
+    not inside a ``catgt_`` folder.
+    """
     path = Path(bin_file).resolve()
     probe_match = re.search(r"\.imec(?P<probe>\d+)\.ap\.bin$", path.name, flags=re.IGNORECASE)
     probe_string = probe_match.group("probe") if probe_match else ""
@@ -478,6 +583,7 @@ def parse_catgt_processed_bin_context(bin_file: str) -> Dict[str, str]:
 
 
 def resolve_labelled_output_context(processing_bin: str, fallback_context: Dict[str, str] | None = None) -> Dict[str, str]:
+    """CatGT context parsed from the bin, or a copy of ``fallback_context``."""
     resolved = parse_catgt_processed_bin_context(processing_bin)
     if resolved:
         return resolved
@@ -494,6 +600,12 @@ def default_pipeline_ks_output_dir(
     store_next_to_bin: bool = False,
     mirror_raw_hierarchy: bool = False,
 ) -> Path:
+    """Resolve the KS output folder for a pipeline run.
+
+    Uses the folder beside the bin when ``store_next_to_bin`` is set or the bin
+    is already CatGT-processed; otherwise derives it from the pipeline output
+    layout under ``output_root``.
+    """
     if store_next_to_bin or is_catgt_processed_bin(bin_file):
         return default_local_ks_output_dir(bin_file, ks_tag, probe_string)
     _, ks_folder = default_pipeline_raw_output_layout(
@@ -508,11 +620,13 @@ def default_pipeline_ks_output_dir(
 
 
 def write_step_json(path: Path, payload: Dict) -> None:
+    """Write ``payload`` to ``path`` as indented UTF-8 JSON."""
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
 def default_json_payload(bin_file: str, output_dir: str, run_name: str) -> Dict:
+    """Build the default per-step JSON descriptor for a run."""
     return {
         "run_name": run_name,
         "bin_file": bin_file,
@@ -523,6 +637,11 @@ def default_json_payload(bin_file: str, output_dir: str, run_name: str) -> Dict:
 
 
 def find_meta_for_bin(bin_file: str) -> Path:
+    """Locate the SpikeGLX ``.meta`` sidecar for an AP ``.bin``.
+
+    Prefers the ``.ap.meta`` companion; otherwise returns the ``.meta``
+    suffix path (which may not exist).
+    """
     p = Path(bin_file)
     candidate = Path(str(p).replace(".ap.bin", ".ap.meta"))
     if candidate.exists():
@@ -544,6 +663,11 @@ def _read_meta_keyvals(meta_path: Path) -> Dict[str, str]:
 
 
 def validate_spikeglx_ap_bin(bin_file: str) -> Tuple[bool, str]:
+    """Check that an AP bin has a readable meta and real AP channels.
+
+    Returns ``(ok, message)``; ``ok`` is False (with an explanatory message)
+    when the meta is missing/empty or the recording looks calibration/sync-only.
+    """
     meta_path = find_meta_for_bin(bin_file)
     if not meta_path.exists():
         return False, f"Missing meta file next to bin ({meta_path.name})."

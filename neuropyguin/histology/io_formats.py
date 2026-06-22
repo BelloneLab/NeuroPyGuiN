@@ -79,10 +79,10 @@ def load_histology_ccf(path: str | Path) -> List[Dict[str, np.ndarray]]:
             n = first.shape[0]
             out: List[Dict[str, np.ndarray]] = []
             for i in range(n):
-                sl = {}
-                for fld in _HCCF_FIELDS:
-                    ref = grp[fld][i, 0]
-                    sl[fld] = np.asarray(f[ref]).T.astype(np.float64)
+                sl = {
+                    fld: np.asarray(f[grp[fld][i, 0]]).T.astype(np.float64)
+                    for fld in _HCCF_FIELDS
+                }
                 out.append(sl)
             return out
         # Single scalar struct: each field a direct dataset.
@@ -122,18 +122,12 @@ def load_tforms(path: str | Path) -> List[np.ndarray]:
     try:
         mat = sio.loadmat(str(path))
         cell = mat["atlas2histology_tform"]
-        out = []
-        for i in range(cell.shape[1]):
-            out.append(np.asarray(cell[0, i], dtype=np.float64))
-        return out
+        return [np.asarray(cell[0, i], dtype=np.float64) for i in range(cell.shape[1])]
     except NotImplementedError:
         # v7.3 HDF5 fallback
         with h5py.File(path, "r") as f:
             grp = f["atlas2histology_tform"]
-            out = []
-            for i in range(grp.shape[0]):
-                out.append(np.asarray(f[grp[i, 0]]).T.astype(np.float64))
-            return out
+            return [np.asarray(f[grp[i, 0]]).T.astype(np.float64) for i in range(grp.shape[0])]
 
 
 # ---------------------------------------------------------------------------
