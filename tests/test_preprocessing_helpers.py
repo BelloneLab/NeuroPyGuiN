@@ -61,6 +61,16 @@ def test_mirror_output_dir_mirrors_raw_input() -> None:
     assert got == Path(r"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\object\spike_sorting")
 
 
+def test_mirror_output_dir_without_experiment_level() -> None:
+    # The experiment folder is optional for some projects; the mirror keeps whatever
+    # levels sit between rawData and the session, then appends spike_sorting.
+    out = "B:/NPX/processedData"
+    run = "subj_sessA"
+    raw = f"B:/NPX/rawData/ProjX/subj/sessA/{run}_g0/{run}_g0_imec0/{run}_g0_t0.imec0.ap.bin"
+    got = default_pipeline_output_dir(raw, out, run_name=run, mirror_raw_hierarchy=True)
+    assert got == Path(r"B:\NPX\processedData\ProjX\subj\sessA\spike_sorting")
+
+
 def test_mirror_output_dir_handles_bin_already_under_output_root() -> None:
     # A concatenated bin we wrote into processedData has no 'rawData' token; it must
     # still mirror relative to the output root, not collapse to <output_root>/<run>.
@@ -86,6 +96,19 @@ def test_mirrored_concat_base_dir_places_new_session_under_output_root() -> None
     first = "B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin"
     got = mirrored_concat_base_dir(first, out, combined, mirror_raw_hierarchy=True)
     assert got == Path(rf"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\{combined}")
+
+
+def test_concat_in_spike_sorting_round_trips_without_double_nesting() -> None:
+    # The fused run lives inside <session>/spike_sorting/; sorting that bin later
+    # must mirror back to the SAME spike_sorting folder, not spike_sorting/spike_sorting.
+    out = "B:/NPX/processedData"
+    combined = "object_healthy_sick"
+    first = "B:/NPX/rawData/mPFC-NAc/51556/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin"
+    dest = mirrored_concat_base_dir(first, out, combined, mirror_raw_hierarchy=True) / "spike_sorting"
+    fused = default_concat_run_layout(str(dest), combined, "0")["bin"]
+    sort_dir = default_pipeline_output_dir(str(fused), out, run_name=combined, mirror_raw_hierarchy=True)
+    assert dest == Path(r"B:\NPX\processedData\mPFC-NAc\51556\mPFC_NAc_week1\object_healthy_sick\spike_sorting")
+    assert sort_dir == dest
 
 
 def test_mirrored_concat_base_dir_legacy_when_mirror_off() -> None:

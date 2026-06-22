@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Callable, Dict, List
 import json
 import math
 
@@ -364,15 +364,18 @@ class ConcatenateDialog(QtWidgets.QDialog):
     def __init__(
         self,
         source_runs: List[str],
-        default_output_dir: str,
         default_run_name: str,
         defaults: Dict[str, object],
+        dest_resolver: Callable[[str], str],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setProperty("compactDialog", True)
         self.setWindowTitle("Concatenate recordings for joint spike sorting")
         self.resize(680, 540)
+        # Resolves a combined run name to the destination folder under the
+        # Output root from settings; the output location is not user-editable.
+        self._dest_resolver = dest_resolver
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(12)
@@ -404,15 +407,15 @@ class ConcatenateDialog(QtWidgets.QDialog):
         form.setVerticalSpacing(10)
 
         self.ed_run = QtWidgets.QLineEdit(default_run_name)
-        self.ed_dir = QtWidgets.QLineEdit(default_output_dir)
-        btn_browse = QtWidgets.QPushButton("Browse")
-        btn_browse.setProperty("role", "ghost")
-        dir_row = QtWidgets.QHBoxLayout()
-        dir_row.setContentsMargins(0, 0, 0, 0)
-        dir_row.addWidget(self.ed_dir, 1)
-        dir_row.addWidget(btn_browse, 0)
-        dir_wrap = QtWidgets.QWidget()
-        dir_wrap.setLayout(dir_row)
+        # Output location is derived from the Output root in settings and follows
+        # the combined run name; shown read-only so the user can see where it lands.
+        self.lbl_dest = QtWidgets.QLineEdit(self._dest_resolver(default_run_name))
+        self.lbl_dest.setReadOnly(True)
+        self.lbl_dest.setProperty("role", "ghost")
+        self.lbl_dest.setToolTip(
+            "Derived from the Output root in Settings and the combined run name. "
+            "Change the Output root in the preprocessing Settings to move it."
+        )
 
         self.ck_svd = QtWidgets.QCheckBox("Remove shared SVD components (artifact cleaning)")
         self.ck_svd.setChecked(bool(defaults.get("svd_clean", True)))
@@ -443,7 +446,7 @@ class ConcatenateDialog(QtWidgets.QDialog):
         )
 
         form.addRow("Combined run name", self.ed_run)
-        form.addRow("Output folder", dir_wrap)
+        form.addRow("Output folder", self.lbl_dest)
         form.addRow("", self.ck_svd)
         form.addRow("SVD components to remove", self.sp_comp)
         form.addRow("SVD batch length (s)", self.sp_batch)
@@ -451,9 +454,10 @@ class ConcatenateDialog(QtWidgets.QDialog):
         layout.addLayout(form)
 
         note = QtWidgets.QLabel(
-            "A new SpikeGLX-style run folder is created under the output folder, so every "
-            "downstream preprocessing step (CatGT, Kilosort, metrics) treats the fused file like an "
-            "ordinary recording."
+            "A new SpikeGLX-style run folder is created under the Output root from Settings "
+            "(mirroring the raw hierarchy), named after the combined run, so every downstream "
+            "preprocessing step (CatGT, Kilosort, metrics) treats the fused file like an ordinary "
+            "recording."
         )
         note.setObjectName("SectionHint")
         note.setWordWrap(True)
@@ -468,22 +472,19 @@ class ConcatenateDialog(QtWidgets.QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-        btn_browse.clicked.connect(self._pick_output_dir)
+        self.ed_run.textChanged.connect(self._refresh_dest)
         self.ck_svd.toggled.connect(self.sp_comp.setEnabled)
         self.ck_svd.toggled.connect(self.sp_batch.setEnabled)
         self.sp_comp.setEnabled(self.ck_svd.isChecked())
         self.sp_batch.setEnabled(self.ck_svd.isChecked())
 
-    def _pick_output_dir(self) -> None:
-        start = self.ed_dir.text().strip() or str(Path.cwd())
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder", start)
-        if folder:
-            self.ed_dir.setText(folder)
+    def _refresh_dest(self, run_name: str) -> None:
+        """Update the read-only destination preview as the run name is edited."""
+        self.lbl_dest.setText(self._dest_resolver(run_name.strip()))
 
     def values(self) -> Dict[str, object]:
         return {
             "run_name": self.ed_run.text().strip(),
-            "output_dir": self.ed_dir.text().strip(),
             "svd_clean": self.ck_svd.isChecked(),
             "n_svd_components": int(self.sp_comp.value()),
             "batch_seconds": float(self.sp_batch.value()),
@@ -778,9 +779,19 @@ class PreprocessingTab(QtWidgets.QWidget):
 
         self.ed_output = QtWidgets.QLineEdit(str((Path.cwd() / "NeuroPyGuiN_output").resolve()))
         self.ck_mirror_raw_hierarchy_output = QtWidgets.QCheckBox(
-            "Mirror rawData hierarchy into output root and append spike_sorting"
+            "Mirror rawData hierarchy into Output root, under <session>/spike_sorting (always on)"
         )
+        # The mirrored layout is the enforced output structure: every run lands at
+        # <Output root>/<project>/<animal>/[<experiment>]/<session>/spike_sorting/,
+        # matching the rawData hierarchy (histology stores under .../histology/
+        # instead). Locked on so CatGT, Kilosort, and the other modules always agree.
         self.ck_mirror_raw_hierarchy_output.setChecked(True)
+        self.ck_mirror_raw_hierarchy_output.setEnabled(False)
+        self.ck_mirror_raw_hierarchy_output.setToolTip(
+            "Processed outputs always mirror the rawData folder tree under the Output root "
+            "and live in a 'spike_sorting' folder per session (histology uses 'histology'). "
+            "The experiment level is optional and preserved when present."
+        )
         btn_output = QtWidgets.QPushButton("Browse")
         btn_output.setProperty("role", "ghost")
         out_row = QtWidgets.QHBoxLayout()
@@ -1630,15 +1641,22 @@ class PreprocessingTab(QtWidgets.QWidget):
         ]
         combined_default = build_concat_run_name(run_names)
         first = Path(bin_files[0])
-        # Default the fused run into the mirrored processedData hierarchy (a new
-        # session folder under the output root), not into rawData. User can still
-        # override the destination in the dialog.
-        default_dir = mirrored_concat_base_dir(
-            first,
-            self.ed_output.text().strip(),
-            combined_default,
-            mirror_raw_hierarchy=self.ck_mirror_raw_hierarchy_output.isChecked(),
-        )
+
+        # The fused run always lands under the Output root from settings, mirrored
+        # into a new session folder named after the combined run, inside a
+        # 'spike_sorting' subfolder so it matches the layout of every other run
+        # (.../<session>/spike_sorting/). There is no manual output folder: this
+        # resolver maps a combined run name to its destination, and the dialog
+        # shows it read-only and live as the run name is edited.
+        def resolve_dest(run_name: str) -> str:
+            name = str(run_name).strip() or combined_default
+            base = mirrored_concat_base_dir(
+                first,
+                self.ed_output.text().strip(),
+                name,
+                mirror_raw_hierarchy=self.ck_mirror_raw_hierarchy_output.isChecked(),
+            )
+            return str(base / "spike_sorting")
 
         defaults = {
             "svd_clean": self.settings.value("preproc/concat_svd_clean", True, type=bool),
@@ -1646,12 +1664,12 @@ class PreprocessingTab(QtWidgets.QWidget):
             "batch_seconds": float(self.settings.value("preproc/concat_batch_seconds", 0.5)),
             "extract_ni": self.settings.value("preproc/concat_extract_ni", True, type=bool),
         }
-        dlg = ConcatenateDialog(run_names, str(default_dir), combined_default, defaults, self)
+        dlg = ConcatenateDialog(run_names, combined_default, defaults, resolve_dest, self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         vals = dlg.values()
         combined = str(vals.get("run_name") or combined_default).strip() or combined_default
-        out_dir = str(vals.get("output_dir") or default_dir).strip() or str(default_dir)
+        out_dir = resolve_dest(combined)
         probe = str(jobs[0].get("probe_string") or "0")
         layout = default_concat_run_layout(out_dir, combined, probe)
         target_bin = layout["bin"]
@@ -2483,9 +2501,8 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self.ed_output.setText(str(output_root))
             if json_root:
                 self.ed_json.setText(str(json_root))
-            self.ck_mirror_raw_hierarchy_output.setChecked(
-                bool(self.settings.value("preproc/mirror_raw_hierarchy_output", True, type=bool))
-            )
+            # Mirrored layout is enforced; never restore it to off from a stale setting.
+            self.ck_mirror_raw_hierarchy_output.setChecked(True)
             queue_filter = str(self.settings.value("preproc/raw_run_filter", "non_processed"))
             queue_filter_index = max(0, self.cb_queue_filter.findData(queue_filter))
             self.cb_queue_filter.setCurrentIndex(queue_filter_index)
