@@ -26,6 +26,7 @@ from neuropyguin.preprocessing import (
     is_catgt_processed_bin,
     is_concatenated_run_bin,
     merge_extractors_into_catgt_command,
+    mirrored_concat_base_dir,
     parse_kilosort_params_dat_path,
     parse_catgt_processed_bin_context,
     resolve_labelled_output_context,
@@ -50,6 +51,65 @@ def test_default_local_ks_output_dir_uses_bin_parent_and_probe() -> None:
 def test_default_kilosort_output_name_uses_probe_when_available() -> None:
     assert default_kilosort_output_name("ks4", "0") == "imec0_ks4"
     assert default_kilosort_output_name("ks4", "") == "ks4"
+
+
+def test_mirror_output_dir_mirrors_raw_input() -> None:
+    out = "B:/NPX/processedData"
+    run = "51543_object_mPFC_NAc_week1"
+    raw = f"B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/{run}_g0/{run}_g0_imec0/{run}_g0_t0.imec0.ap.bin"
+    got = default_pipeline_output_dir(raw, out, run_name=run, mirror_raw_hierarchy=True)
+    assert got == Path(r"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\object\spike_sorting")
+
+
+def test_mirror_output_dir_handles_bin_already_under_output_root() -> None:
+    # A concatenated bin we wrote into processedData has no 'rawData' token; it must
+    # still mirror relative to the output root, not collapse to <output_root>/<run>.
+    out = "B:/NPX/processedData"
+    concat = (
+        "B:/NPX/processedData/mPFC-NAc/51543/mPFC_NAc_week1/object/"
+        "object_healthy_sick_g0/object_healthy_sick_g0_imec0/object_healthy_sick_g0_t0.imec0.ap.bin"
+    )
+    got = default_pipeline_output_dir(concat, out, run_name="object_healthy_sick", mirror_raw_hierarchy=True)
+    assert got == Path(r"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\object\spike_sorting")
+
+
+def test_mirror_output_dir_flat_fallback_when_unmappable() -> None:
+    out = "B:/NPX/processedData"
+    stray = "C:/somewhere/else/run_g0/run_g0_imec0/run_g0_t0.imec0.ap.bin"
+    got = default_pipeline_output_dir(stray, out, run_name="run", mirror_raw_hierarchy=True)
+    assert got == Path(r"B:\NPX\processedData\run")
+
+
+def test_mirrored_concat_base_dir_places_new_session_under_output_root() -> None:
+    out = "B:/NPX/processedData"
+    combined = "51543_object_healthy_sick_mPFC_NAc_week1"
+    first = "B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin"
+    got = mirrored_concat_base_dir(first, out, combined, mirror_raw_hierarchy=True)
+    assert got == Path(rf"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\{combined}")
+
+
+def test_mirrored_concat_base_dir_legacy_when_mirror_off() -> None:
+    out = "B:/NPX/processedData"
+    first = Path("B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin")
+    got = mirrored_concat_base_dir(first, out, "combined", mirror_raw_hierarchy=False)
+    assert got == first.parents[2]
+
+
+def test_discover_completed_runs_finds_mirrored_run_and_ignores_pipeline_json(tmp_path: Path) -> None:
+    run = "51542_object_healthy_sick_mPFC_NAc_week1"
+    ss = tmp_path / "mPFC-NAc" / "51542" / "mPFC_NAc_week1" / "object_healthy_sick" / "spike_sorting"
+    ks = ss / "imec0_ks4"
+    ks.mkdir(parents=True)
+    bin_path = ss / "catgt_x_g0" / f"{run}_g0_imec0" / f"{run}_g0_tcat.imec0.ap.bin"
+    (ks / "params.py").write_text(f'dat_path = r"{bin_path}"\nn_channels_dat = 385\n', encoding="utf-8")
+    # A per-run JSON folder beside the KS output must NOT be mistaken for a run.
+    pj = ss / "pipeline_json"
+    pj.mkdir()
+    (pj / f"{run}_modules-input.json").write_text("{}", encoding="utf-8")
+
+    entries = discover_completed_runs(tmp_path)
+    assert len(entries) == 1
+    assert Path(entries[0]["ks_folder"]) == ks.resolve()
 
 
 def test_default_pipeline_output_dir_can_mirror_raw_hierarchy_into_spike_sorting() -> None:

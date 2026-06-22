@@ -979,8 +979,11 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         try:
             output_root = Path(self.cfg.output_root)
             output_root.mkdir(parents=True, exist_ok=True)
-            json_root = Path(self.cfg.json_root)
-            json_root.mkdir(parents=True, exist_ok=True)
+            # Per-run intermediate JSONs are co-located inside the run's mirrored
+            # processed folder (assigned below, once extracted_data_root is known) so
+            # they never pile up loose in the output root. cfg.json_root is kept only
+            # as a legacy fallback if that folder cannot be created.
+            cfg_json_fallback = Path(self.cfg.json_root) if str(self.cfg.json_root).strip() else output_root
 
             run_name = self.job["name"]
             bin_file = Path(self.job["bin_file"])
@@ -1141,6 +1144,16 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         f"[{self.job['name']}] Mirrored raw hierarchy output root: {extracted_data_root}",
                     )
 
+            # Co-locate every per-run pipeline JSON inside the run's processed folder
+            # instead of dumping them flat in the output/JSON root.
+            json_root = extracted_data_root / "pipeline_json"
+            try:
+                json_root.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                json_root = cfg_json_fallback
+                json_root.mkdir(parents=True, exist_ok=True)
+            _safe_emit(self.signals.log, f"[{self.job['name']}] Pipeline JSON dir: {json_root}")
+
             module_steps: List[Tuple[str, str, str]] = []
             if self.cfg.run_kilosort:
                 module_steps.append(
@@ -1213,7 +1226,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                             catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
                             source_run_name=catgt_output_context["source_run_name"],
                             gate_string=catgt_output_context["gate_string"],
-                            ni_extract_string=self.cfg.ni_extract_string,
+                            ni_extract_string=effective_ni_extract_string,
                         )
                     ks_folder = default_pipeline_ks_output_dir(
                         str(processing_bin),
@@ -1268,7 +1281,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                             catgt_run_dir=Path(catgt_context["catgt_run_dir"]),
                             source_run_name=catgt_context["source_run_name"],
                             gate_string=catgt_context["gate_string"],
-                            ni_extract_string=self.cfg.ni_extract_string,
+                            ni_extract_string=effective_ni_extract_string,
                         )
                     else:
                         if self.cfg.save_catgt_ap_bin:
@@ -1303,7 +1316,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                                     catgt_run_dir=Path(catgt_output_context["catgt_run_dir"]),
                                     source_run_name=catgt_output_context["source_run_name"],
                                     gate_string=catgt_output_context["gate_string"],
-                                    ni_extract_string=self.cfg.ni_extract_string,
+                                    ni_extract_string=effective_ni_extract_string,
                                 )
                             ks_folder = default_pipeline_ks_output_dir(
                                 str(processing_bin),
@@ -1348,7 +1361,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                                     catgt_run_dir=Path(extract_context["catgt_run_dir"]),
                                     source_run_name=extract_context["source_run_name"],
                                     gate_string=extract_context["gate_string"],
-                                    ni_extract_string=self.cfg.ni_extract_string,
+                                    ni_extract_string=effective_ni_extract_string,
                                 )
 
                 execute_step("catgt_extract_only", "CatGT extract-only", _run_catgt_extract_only_step)
@@ -1490,7 +1503,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                             catgt_run_dir=Path(tprime_context["catgt_run_dir"]),
                             source_run_name=tprime_context["source_run_name"],
                             gate_string=tprime_context["gate_string"],
-                            ni_extract_string=self.cfg.ni_extract_string,
+                            ni_extract_string=effective_ni_extract_string,
                         )
 
                 execute_step("tprime", "TPrime", _run_tprime_step)

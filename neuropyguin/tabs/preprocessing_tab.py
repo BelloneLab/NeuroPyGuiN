@@ -17,6 +17,8 @@ from ..preprocessing import (
     discover_completed_runs,
     discover_bin_files,
     find_meta_for_bin,
+    is_concatenated_run_bin,
+    mirrored_concat_base_dir,
     parse_spikeglx_bin_name,
     validate_concat_inputs,
     validate_spikeglx_ap_bin,
@@ -735,6 +737,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.ck_mirror_raw_hierarchy_output = QtWidgets.QCheckBox(
             "Mirror rawData hierarchy into output root and append spike_sorting"
         )
+        self.ck_mirror_raw_hierarchy_output.setChecked(True)
         btn_output = QtWidgets.QPushButton("Browse")
         btn_output.setProperty("role", "ghost")
         out_row = QtWidgets.QHBoxLayout()
@@ -1572,7 +1575,15 @@ class PreprocessingTab(QtWidgets.QWidget):
         ]
         combined_default = build_concat_run_name(run_names)
         first = Path(bin_files[0])
-        default_dir = first.parents[2] if len(first.parents) >= 3 else first.parent
+        # Default the fused run into the mirrored processedData hierarchy (a new
+        # session folder under the output root), not into rawData. User can still
+        # override the destination in the dialog.
+        default_dir = mirrored_concat_base_dir(
+            first,
+            self.ed_output.text().strip(),
+            combined_default,
+            mirror_raw_hierarchy=self.ck_mirror_raw_hierarchy_output.isChecked(),
+        )
 
         defaults = {
             "svd_clean": self.settings.value("preproc/concat_svd_clean", True, type=bool),
@@ -2217,7 +2228,9 @@ class PreprocessingTab(QtWidgets.QWidget):
             return
         self._show_completed_entry_menu(entry, self.list_completed.viewport().mapToGlobal(pos))
 
-    def _planned_step_definitions(self, cfg: EcephysPipelineConfig) -> List[tuple[str, str]]:
+    def _planned_step_definitions(
+        self, cfg: EcephysPipelineConfig, *, is_concat_run: bool = False
+    ) -> List[tuple[str, str]]:
         steps: List[tuple[str, str]] = []
         if cfg.run_catgt:
             if cfg.run_catgt_extract_only:
@@ -2238,7 +2251,9 @@ class PreprocessingTab(QtWidgets.QWidget):
             steps.append(("mean_waveforms", "Mean Waveforms"))
         if cfg.run_quality_metrics:
             steps.append(("quality_metrics", "Quality Metrics"))
-        if cfg.run_tprime:
+        # Concatenated runs have no continuous sync / nidq stream to align against,
+        # so the worker skips TPrime for them; mirror that in the step panel.
+        if cfg.run_tprime and not is_concat_run:
             steps.append(("tprime", "TPrime"))
         if cfg.run_pybombcell:
             steps.append(("pybombcell", "py_bombcell"))
@@ -2258,10 +2273,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.step_status_host_layout.addWidget(placeholder, 0)
         self.step_status_host_layout.addStretch(1)
 
-    def _prepare_step_status_panel(self, run_name: str, cfg: EcephysPipelineConfig) -> None:
+    def _prepare_step_status_panel(
+        self, run_name: str, cfg: EcephysPipelineConfig, *, is_concat_run: bool = False
+    ) -> None:
         self._clear_step_status_panel()
         self.lbl_active_run_name.setText(run_name)
-        for step_key, label in self._planned_step_definitions(cfg):
+        for step_key, label in self._planned_step_definitions(cfg, is_concat_run=is_concat_run):
             widget = StepStatusItem(label, self.step_status_host)
             self._step_widgets[step_key] = widget
             self.step_status_host_layout.insertWidget(self.step_status_host_layout.count() - 1, widget)
@@ -2326,7 +2343,11 @@ class PreprocessingTab(QtWidgets.QWidget):
                 f"[{job.get('name', '')}] Using per-job step overrides: "
                 + ", ".join(f"{k}={overrides[k]}" for k in sorted(overrides))
             )
-        self._prepare_step_status_panel(str(job.get("name") or "Unknown run"), cfg)
+        job_bin = job.get("bin_file")
+        job_is_concat = bool(job_bin) and is_concatenated_run_bin(job_bin)
+        self._prepare_step_status_panel(
+            str(job.get("name") or "Unknown run"), cfg, is_concat_run=job_is_concat
+        )
         self._active_run_context = {
             "job_snapshot": dict(job),
             "cfg_snapshot": self._serialize_cfg(cfg),
@@ -2396,7 +2417,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             if json_root:
                 self.ed_json.setText(str(json_root))
             self.ck_mirror_raw_hierarchy_output.setChecked(
-                bool(self.settings.value("preproc/mirror_raw_hierarchy_output", False, type=bool))
+                bool(self.settings.value("preproc/mirror_raw_hierarchy_output", True, type=bool))
             )
             queue_filter = str(self.settings.value("preproc/raw_run_filter", "non_processed"))
             queue_filter_index = max(0, self.cb_queue_filter.findData(queue_filter))

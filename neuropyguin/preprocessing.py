@@ -388,14 +388,32 @@ def _session_root_for_spikeglx_bin(bin_file: str) -> Path:
     return path.parent
 
 
-def _relative_session_parts_from_raw_hierarchy(bin_file: str) -> Tuple[str, ...]:
+def _relative_session_parts_from_raw_hierarchy(
+    bin_file: str, output_root: str | Path | None = None
+) -> Tuple[str, ...]:
     session_root = _session_root_for_spikeglx_bin(bin_file)
     lowered = [part.lower() for part in session_root.parts]
     try:
         raw_idx = lowered.index("rawdata")
+        return tuple(session_root.parts[raw_idx + 1 :])
     except ValueError:
-        return ()
-    return tuple(session_root.parts[raw_idx + 1 :])
+        pass
+    # Inputs that already live under the output root (e.g. a concatenated bin we
+    # wrote into processedData) carry no 'rawData' token. Mirror them relative to
+    # the output root so they land in the same hierarchy instead of collapsing to
+    # the flat <output_root>/<run_name> fallback.
+    if output_root:
+        try:
+            base = Path(output_root).expanduser().resolve()
+            rel = session_root.resolve().relative_to(base)
+        except Exception:
+            return ()
+        parts = rel.parts
+        lowered_parts = [p.lower() for p in parts]
+        if "spike_sorting" in lowered_parts:
+            parts = parts[: lowered_parts.index("spike_sorting")]
+        return tuple(parts)
+    return ()
 
 
 def default_pipeline_output_dir(
@@ -408,7 +426,7 @@ def default_pipeline_output_dir(
     root = Path(output_root).expanduser()
     if not mirror_raw_hierarchy:
         return root / str(run_name).strip()
-    relative_session = _relative_session_parts_from_raw_hierarchy(bin_file)
+    relative_session = _relative_session_parts_from_raw_hierarchy(bin_file, output_root)
     if not relative_session:
         return root / str(run_name).strip()
     return root.joinpath(*relative_session, "spike_sorting")
@@ -665,6 +683,43 @@ def build_concat_run_name(
     if len(combined) > max_len:
         combined = f"{prefix}_{cleaned[0]}__and{len(cleaned) - 1}more"
     return combined
+
+
+def mirrored_concat_base_dir(
+    first_source_bin: str | Path,
+    output_root: str | Path,
+    combined_run_name: str,
+    *,
+    mirror_raw_hierarchy: bool = True,
+) -> Path:
+    """Base directory for a concatenated run, mirrored under the output root.
+
+    The fused run is placed as a NEW session folder named ``combined_run_name``
+    beside the mirrored source sessions::
+
+        <output_root>/<raw REL parent>/<combined_run_name>/
+
+    so a later sort mirrors it consistently under processedData instead of the
+    fused bin being written into rawData. ``<raw REL parent>`` is the source
+    run's mirrored hierarchy with its own session level removed, so the result
+    assumes the standard SpikeGLX nesting where the session is the folder above
+    ``<run>_gN`` (e.g. ``rawData/region/animal/week/session/<run>_g0/...`` puts
+    the fused run under ``week``). Falls back to the first source's session
+    folder (legacy behaviour, under rawData) when mirroring is off, the output
+    root is unset, or the raw hierarchy cannot be determined.
+    """
+    first = Path(first_source_bin)
+    legacy = first.parents[2] if len(first.parents) >= 3 else first.parent
+    if not mirror_raw_hierarchy or not str(output_root).strip():
+        return legacy
+    # output_root is intentionally NOT passed here: concat SOURCE bins are raw
+    # (under rawData), so the rawData-token branch resolves them. The output_root
+    # fallback exists only for sort-time of an already-processed concat bin.
+    rel = _relative_session_parts_from_raw_hierarchy(str(first))
+    if not rel:
+        return legacy
+    rel_parent = rel[:-1]  # drop the source session name; the fused run is a new session
+    return Path(output_root).expanduser().joinpath(*rel_parent, str(combined_run_name).strip())
 
 
 def default_concat_run_layout(

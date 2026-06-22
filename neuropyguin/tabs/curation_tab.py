@@ -43,20 +43,33 @@ from ..workers import FunctionWorker
 
 
 def _find_modules_input_json(json_root: Path, ks_folder: Path) -> Optional[Path]:
-    if not json_root.exists():
-        return None
     target_dir = find_kilosort_output_dir(ks_folder, max_depth=4) or ks_folder
-    target = str(target_dir.resolve()).lower()
-    for p in json_root.glob("*_modules-input.json"):
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            d = data.get("directories", {})
-            kdir = str(d.get("kilosort_output_directory", "")).lower()
-            resolved_kdir = find_kilosort_output_dir(kdir, max_depth=4) or Path(kdir)
-            if kdir and resolved_kdir.resolve().as_posix().lower() == Path(target).resolve().as_posix().lower():
-                return p
-        except Exception:
+    target = target_dir.resolve().as_posix().lower()
+    # Per-run JSONs now live in a 'pipeline_json' folder inside the run's mirrored
+    # processed root (an ancestor of the KS folder). Search there as well as the
+    # legacy flat json_root so quality-metrics recompute keeps working either way.
+    candidate_roots: List[Path] = []
+    if json_root and str(json_root).strip():
+        candidate_roots.append(json_root)
+    for ancestor in [ks_folder, *ks_folder.parents][:6]:
+        pj = ancestor / "pipeline_json"
+        if pj not in candidate_roots:
+            candidate_roots.append(pj)
+    for root in candidate_roots:
+        if not root.exists():
             continue
+        for p in sorted(root.glob("*_modules-input.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                d = data.get("directories", {})
+                kdir = str(d.get("kilosort_output_directory", "")).lower()
+                if not kdir:
+                    continue
+                resolved_kdir = find_kilosort_output_dir(kdir, max_depth=4) or Path(kdir)
+                if resolved_kdir.resolve().as_posix().lower() == target:
+                    return p
+            except Exception:
+                continue
     return None
 
 
