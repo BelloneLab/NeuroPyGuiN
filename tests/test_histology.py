@@ -146,6 +146,30 @@ def test_trajectory_3d_tube_mesh_shape():
     assert all(part.shape == mesh[0].shape for part in mesh)
 
 
+def test_trajectory_3d_shell_draws_visible_contour_lines():
+    from neuropyguin.tabs import histology_tab
+    from neuropyguin.tabs.histology_tab import Trajectory3DCanvas
+
+    if histology_tab.Figure is None:
+        pytest.skip("Matplotlib is unavailable")
+
+    fig = histology_tab.Figure(figsize=(2.0, 2.0), dpi=80)
+    ax = fig.add_subplot(111, projection="3d")
+    polygon = np.array([
+        [540.0, 400.0, 570.0],
+        [540.0, 420.0, 590.0],
+        [540.0, 440.0, 570.0],
+        [540.0, 400.0, 570.0],
+    ])
+
+    ok = Trajectory3DCanvas._draw_brain_shell(ax, [polygon], "#d3dbe5", "Light")
+
+    assert ok
+    assert len(ax.lines) == 1
+    assert ax.lines[0].get_alpha() >= 0.5
+    assert ax.lines[0].get_linewidth() >= 0.5
+
+
 # ---------------------------------------------------------------- atlas
 @pytest.mark.skipif(not ATLAS_OK, reason="Allen CCF atlas files not present")
 def test_coronal_slice_is_constant_ap():

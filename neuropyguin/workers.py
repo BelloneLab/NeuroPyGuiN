@@ -1009,6 +1009,18 @@ class EcephysPipelineWorker(QtCore.QRunnable):
 
             run_catgt_extract_only = self.cfg.run_catgt_extract_only
             run_catgt_effective = self.cfg.run_catgt and not run_catgt_extract_only and not catgt_processed_input
+            # Concatenated runs merge several AP sessions into one bin with no nidq stream.
+            # TPrime aligns event times to a reference stream via sync edges, which is
+            # meaningless once sessions are spliced together (the sync is discontinuous and
+            # there is no NI stream to map), so TPrime is disabled by default for these.
+            is_concat_run = is_concatenated_run_bin(bin_file)
+            run_tprime_effective = self.cfg.run_tprime and not is_concat_run
+            if self.cfg.run_tprime and not run_tprime_effective:
+                _safe_emit(
+                    self.signals.log,
+                    f"[{self.job['name']}] Concatenated run; skipping TPrime alignment "
+                    "(no continuous sync / nidq stream to align against).",
+                )
             catgt_dir = self._normalize_tool_dir(self.cfg.catgt_path, ("CatGT",))
             tprime_dir = self._normalize_tool_dir(self.cfg.tprime_path, ("TPrime",))
             cwaves_dir = self._normalize_tool_dir(self.cfg.cwaves_path, ("C_Waves", "C_Waves_win", "C_Waves-win"))
@@ -1037,7 +1049,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 effective_catgt_cmd = strip_ni_catgt_extractor_flags(effective_catgt_cmd)
                 effective_ni_extract_string = ""
                 dropped_preview = ", ".join(Path(p).name for p in dropped_ni) if dropped_ni else "NI digital extractors"
-                if is_concatenated_run_bin(bin_file):
+                if is_concat_run:
                     reason = "Concatenated run has no nidq stream by design"
                 else:
                     reason = "No nidq stream found for this run"
@@ -1076,7 +1088,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     "CatGT executable dir is invalid. Set it to the folder containing CatGT "
                     f"(current value: {self.cfg.catgt_path})"
                 )
-            if self.cfg.run_tprime and not tprime_dir.is_dir():
+            if run_tprime_effective and not tprime_dir.is_dir():
                 raise RuntimeError(
                     "TPrime executable dir is invalid. Set it to the folder containing TPrime "
                     f"(current value: {self.cfg.tprime_path})"
@@ -1148,7 +1160,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 module_steps.append(("quality_metrics", "Quality Metrics", "quality_metrics"))
 
             done = 0
-            total = max(len(module_steps) + int(run_catgt_effective or run_catgt_extract_only) + int(self.cfg.run_tprime) + int(self.cfg.run_pybombcell), 1)
+            total = max(len(module_steps) + int(run_catgt_effective or run_catgt_extract_only) + int(run_tprime_effective) + int(self.cfg.run_pybombcell), 1)
 
             def execute_step(step_key: str, step_label: str, fn) -> None:
                 nonlocal done
@@ -1354,7 +1366,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 or self.cfg.run_noise_templates
                 or self.cfg.run_mean_waveforms
                 or self.cfg.run_quality_metrics
-                or self.cfg.run_tprime
+                or run_tprime_effective
                 or self.cfg.run_pybombcell
             ) and not self.cfg.run_kilosort
             if needs_existing_ks:
@@ -1448,7 +1460,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     lambda module_name=module_name: self._run_module(module_name, module_in, module_out, self.job["workdir"]),
                 )
 
-            if self.cfg.run_tprime:
+            if run_tprime_effective:
                 def _run_tprime_step() -> None:
                     createInputJson(
                         str(tprime_in),

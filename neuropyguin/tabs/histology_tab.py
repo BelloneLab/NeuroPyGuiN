@@ -294,31 +294,31 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
             if region_segments:
                 for seg_start, seg_end, seg_color in region_segments:
                     seg_xyz = cls._ccf_to_plot_mm(np.vstack([seg_start, seg_end]))
-                    mesh = cls._tube_mesh(seg_xyz[0], seg_xyz[1], radius_mm=0.055)
+                    mesh = cls._tube_mesh(seg_xyz[0], seg_xyz[1], radius_mm=0.075)
                     if mesh is None:
                         continue
                     ax.plot_surface(
                         mesh[0], mesh[1], mesh[2],
                         color=seg_color,
-                        alpha=0.30,
+                        alpha=0.86,
                         linewidth=0,
                         antialiased=False,
                         shade=False,
                     )
             else:
-                mesh = cls._tube_mesh(xyz[0], xyz[-1], radius_mm=0.045)
+                mesh = cls._tube_mesh(xyz[0], xyz[-1], radius_mm=0.065)
                 if mesh is not None:
                     ax.plot_surface(
                         mesh[0], mesh[1], mesh[2],
                         color=color,
-                        alpha=0.18,
+                        alpha=0.62,
                         linewidth=0,
                         antialiased=False,
                         shade=False,
                     )
             ax.plot(
                 xyz[:, 0], xyz[:, 1], xyz[:, 2],
-                color=color, linewidth=1.25, alpha=0.96,
+                color=color, linewidth=0.95, alpha=0.96,
             )
             ax.scatter(
                 xyz[:, 0], xyz[:, 1], xyz[:, 2],
@@ -355,8 +355,14 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
     @staticmethod
     def _theme_colors_for(theme: str) -> Tuple[str, str, str]:
         if str(theme).lower().startswith("dark"):
-            return "#0b0f14", "#d7dde5", "#aebbc8"
-        return "#ffffff", "#27313a", "#d8dee6"
+            return "#0b0f14", "#d7dde5", "#314253"
+        return "#ffffff", "#27313a", "#d3dbe5"
+
+    @staticmethod
+    def _brain_shell_style_for(theme: str) -> Tuple[str, str, float, float, float]:
+        if str(theme).lower().startswith("dark"):
+            return "#314253", "#d9e6f2", 0.10, 0.56, 0.62
+        return "#d3dbe5", "#425466", 0.11, 0.72, 0.58
 
     @staticmethod
     def _probe_rgb(index: int) -> Tuple[float, float, float]:
@@ -404,17 +410,25 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         ]
         if not xyz_polygons:
             return False
-        alpha = 0.14 if str(theme).lower().startswith("dark") else 0.11
+        face_color, edge_color, face_alpha, line_alpha, line_width = cls._brain_shell_style_for(theme)
         shell = Poly3DCollection(
             xyz_polygons,
-            facecolors=color,
+            facecolors=face_color,
             edgecolors="none",
             linewidths=0.0,
-            alpha=alpha,
+            alpha=face_alpha,
             zsort="average",
         )
         shell.set_antialiased(False)
         ax.add_collection3d(shell)
+        for xyz in xyz_polygons:
+            ax.plot(
+                xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                color=edge_color,
+                linewidth=line_width,
+                alpha=line_alpha,
+                solid_capstyle="round",
+            )
         return True
 
     @staticmethod
@@ -626,23 +640,23 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         ap_n, dv_n, ml_n = atlas.shape
         polygons: List[np.ndarray] = []
 
-        for ap_i in np.unique(np.linspace(0, ap_n - 1, 7, dtype=int)):
+        for ap_i in np.unique(np.linspace(0, ap_n - 1, 15, dtype=int)):
             mask = np.asarray(av[ap_i, :, :]) > 1
-            for y, x in cls._contour_lines(mask, max_points=96):
+            for y, x in cls._contour_lines(mask, max_points=128):
                 polygons.append(np.column_stack([
                     np.full(y.shape, ap_i + 1.0), y + 1.0, x + 1.0,
                 ]))
 
-        for ml_i in np.unique(np.linspace(0, ml_n - 1, 5, dtype=int)):
+        for ml_i in np.unique(np.linspace(0, ml_n - 1, 9, dtype=int)):
             mask = np.asarray(av[:, :, ml_i]) > 1
-            for y, x in cls._contour_lines(mask, max_points=96):
+            for y, x in cls._contour_lines(mask, max_points=128):
                 polygons.append(np.column_stack([
                     y + 1.0, x + 1.0, np.full(y.shape, ml_i + 1.0),
                 ]))
 
-        for dv_i in np.unique(np.linspace(0, dv_n - 1, 3, dtype=int)):
+        for dv_i in np.unique(np.linspace(0, dv_n - 1, 5, dtype=int)):
             mask = np.asarray(av[:, dv_i, :]) > 1
-            for y, x in cls._contour_lines(mask, max_points=84):
+            for y, x in cls._contour_lines(mask, max_points=112):
                 polygons.append(np.column_stack([
                     y + 1.0, np.full(y.shape, dv_i + 1.0), x + 1.0,
                 ]))
@@ -2378,8 +2392,36 @@ class HistologyTab(QtWidgets.QWidget):
 
         sizes = rate_to_size(rates)
 
+        region_count = len(region_order)
+        size_count = 1 + min(3, len(rates)) if rates.size else 0
+        legend_cols = max(1, min(region_count + size_count, 12))
+        leg = pg.LegendItem(
+            offset=(0, 0),
+            labelTextColor=(40, 40, 40),
+            brush=pg.mkBrush(255, 255, 255, 0),
+            pen=None,
+            frame=False,
+            colCount=legend_cols,
+        )
+        self.units_plot.addItem(leg, row=0, col=0, colspan=2)
+        for a in region_order:
+            c = region_colors.get(a, (120, 120, 120))
+            swatch = pg.ScatterPlotItem(symbol="o", size=10, brush=pg.mkBrush(*c, 235),
+                                        pen=pg.mkPen((40, 40, 40), width=0.4))
+            leg.addItem(swatch, f"{a} ({data['regions'][a]['count']})")
+        if rates.size:
+            spacer = pg.ScatterPlotItem(symbol="o", size=0.1, pen=None,
+                                        brush=pg.mkBrush(255, 255, 255, 0))
+            leg.addItem(spacer, f"size: {size_word} ({unit_word})")
+            refs = np.unique(np.round(np.nanpercentile(rates, [15, 55, 95]), 1))
+            for r in refs:
+                ref = pg.ScatterPlotItem(symbol="o", size=float(rate_to_size(r)),
+                                         brush=pg.mkBrush(135, 135, 135, 230),
+                                         pen=pg.mkPen((40, 40, 40), width=0.4))
+                leg.addItem(ref, f"{r:g} {unit_word}")
+
         # Panel 1: spatial scatter (lateral vs depth), colour = region, size = rate.
-        p1 = self.units_plot.addPlot(row=0, col=0)
+        p1 = self.units_plot.addPlot(row=1, col=0)
         self._style_plot(p1, f"{data['n_units']} units   (colour = region, size = {size_word})")
         p1.setLabel("left", "depth (um)")
         p1.setLabel("bottom", "lateral (um)")
@@ -2391,29 +2433,10 @@ class HistologyTab(QtWidgets.QWidget):
             x=(lat + jitter).tolist(), y=depths.tolist(),
             size=sizes.tolist(), brush=brushes, pen=pg.mkPen((40, 40, 40), width=0.4)))
 
-        # Legend: region colour key + a firing-rate size scale, in one anchored box.
-        leg = p1.addLegend(offset=(-8, 8), labelTextColor=(40, 40, 40),
-                           brush=pg.mkBrush(255, 255, 255, 215), pen=pg.mkPen(170, 170, 170))
-        for a in region_order:
-            c = region_colors.get(a, (120, 120, 120))
-            swatch = pg.ScatterPlotItem(symbol="o", size=10, brush=pg.mkBrush(*c, 235),
-                                        pen=pg.mkPen((40, 40, 40), width=0.4))
-            leg.addItem(swatch, f"{a}  ({data['regions'][a]['count']})")
-        if rates.size:
-            spacer = pg.ScatterPlotItem(symbol="o", size=0.1, pen=None,
-                                        brush=pg.mkBrush(255, 255, 255, 0))
-            leg.addItem(spacer, f"— {size_word} ({unit_word}) —")
-            refs = np.unique(np.round(np.nanpercentile(rates, [15, 55, 95]), 1))
-            for r in refs:
-                ref = pg.ScatterPlotItem(symbol="o", size=float(rate_to_size(r)),
-                                         brush=pg.mkBrush(135, 135, 135, 230),
-                                         pen=pg.mkPen((40, 40, 40), width=0.4))
-                leg.addItem(ref, f"{r:g} {unit_word}")
-
         # Panel 2: units per region (horizontal bars), same region colours.
         order = region_order
         if order:
-            p2 = self.units_plot.addPlot(row=0, col=1)
+            p2 = self.units_plot.addPlot(row=1, col=1)
             self._style_plot(p2, "units per region")
             p2.setLabel("bottom", "# units")
             ypos = np.arange(len(order))
