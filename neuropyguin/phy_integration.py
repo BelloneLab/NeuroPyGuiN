@@ -303,12 +303,37 @@ def _registration_block(plugin_dir: Path) -> str:
     return dedent(
         f"""
         {_REGISTRATION_BEGIN}
+        import os as _neuropygui_os
+
+        def _neuropygui_norm_dir(_path):
+            # Resolve ~, normalize separators/.. and case so that entries
+            # pointing at the same folder compare equal (Windows-safe).
+            return _neuropygui_os.path.normcase(
+                _neuropygui_os.path.normpath(
+                    _neuropygui_os.path.expanduser(str(_path))
+                )
+            )
+
         try:
             _neuropygui_plugin_dirs = list(getattr(c.Plugins, "dirs", []))
         except Exception:
             _neuropygui_plugin_dirs = []
+
+        # Deduplicate existing entries by resolved path, preserving order, so a
+        # pre-existing '~/.phy/plugins/' and an absolute duplicate never both
+        # survive (which would make phy scan the same folder twice).
+        _neuropygui_seen = set()
+        _neuropygui_unique_dirs = []
+        for _neuropygui_d in _neuropygui_plugin_dirs:
+            _neuropygui_key = _neuropygui_norm_dir(_neuropygui_d)
+            if _neuropygui_key in _neuropygui_seen:
+                continue
+            _neuropygui_seen.add(_neuropygui_key)
+            _neuropygui_unique_dirs.append(_neuropygui_d)
+        _neuropygui_plugin_dirs = _neuropygui_unique_dirs
+
         _neuropygui_plugin_dir = r"{plugin_dir}"
-        if _neuropygui_plugin_dir not in _neuropygui_plugin_dirs:
+        if _neuropygui_norm_dir(_neuropygui_plugin_dir) not in _neuropygui_seen:
             _neuropygui_plugin_dirs.append(_neuropygui_plugin_dir)
         c.Plugins.dirs = _neuropygui_plugin_dirs
 

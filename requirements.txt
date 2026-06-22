@@ -23,5 +23,12 @@ pyarrow
 ipython
 cmcrameri
 pillow
+# The py_bombcell unit-quality GUI runs as a Jupyter notebook with ipywidgets,
+# launched from the curation tab. Without these it silently never opens.
+ipywidgets
+jupyterlab
 # Optional on NVIDIA CUDA 12 systems for whitening/filtering:
 # cupy-cuda12x
+#
+# NOTE: phy curation runs in a SEPARATE env (typically "phy2") that owns phy 2.0.
+# The bundled phy plugins need extra packages in THAT env. See requirements-phy.txt.

@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import ctypes
+import os
 import sys
 import time
 from collections import deque
@@ -72,6 +73,14 @@ except ImportError:
     _HAS_QT = False
 
 # ── safely import pygame ──────────────────────────────────────────────────
+# Force SDL's dummy video and audio drivers BEFORE pygame is initialized. A full
+# pygame.init() otherwise brings up SDL's real video subsystem, whose graphics
+# context collides with phy's Qt/OpenGL context and crashes the whole process
+# with a native access violation (exit code 0xC0000005). The gamepad plugin only
+# needs joystick polling, which works fine under the dummy drivers (no window,
+# GPU, or audio device is created).
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 try:
     import pygame
     _HAS_PYGAME = True
@@ -91,10 +100,15 @@ _HAS_XINPUT = _XINPUT_DLL is not None
 
 if _HAS_XINPUT:
     class _XINPUT_GAMEPAD(ctypes.Structure):
+        # Layout must match the Win32 XINPUT_GAMEPAD struct exactly. BYTE in the
+        # Windows headers is unsigned (0..255), so the triggers use c_ubyte, not
+        # wintypes.BYTE (which is signed c_byte). A wrong field type here makes
+        # XInputGetState read into a mismatched buffer, which is the kind of
+        # ctypes signature error that can corrupt memory.
         _fields_ = [
             ("wButtons", wintypes.WORD),
-            ("bLeftTrigger", wintypes.BYTE),
-            ("bRightTrigger", wintypes.BYTE),
+            ("bLeftTrigger", ctypes.c_ubyte),
+            ("bRightTrigger", ctypes.c_ubyte),
             ("sThumbLX", ctypes.c_short),
             ("sThumbLY", ctypes.c_short),
             ("sThumbRX", ctypes.c_short),
@@ -356,7 +370,13 @@ class _XInputController:
         if not _HAS_XINPUT or _XINPUT_GET_STATE is None:
             return False
         state = _XINPUT_STATE()
-        result = _XINPUT_GET_STATE(self._user_index, ctypes.byref(state))
+        try:
+            result = _XINPUT_GET_STATE(self._user_index, ctypes.byref(state))
+        except Exception:
+            # Any ctypes failure here means input is simply unavailable. Degrade
+            # quietly to a disconnect rather than letting it bubble up.
+            logger.exception("XInputGetState raised for slot %s", self._user_index)
+            return False
         if result != _XINPUT_ERROR_SUCCESS:
             return False
         self._state = state
@@ -1771,7 +1791,7 @@ if _HAS_QT:
             )
             self._focus_action(action)
 
-            if _HAS_PYGAME and self._plugin._joystick is not None:
+            if self._plugin._joystick is not None:
                 self._learn_timer = QTimer(self)
                 self._learn_timer.setInterval(50)
                 self._learn_timer.timeout.connect(self._learn_poll)
@@ -1781,8 +1801,21 @@ if _HAS_QT:
             js = self._plugin._joystick
             if js is None:
                 return
+            backend = getattr(self._plugin, "_controller_backend", None)
             try:
-                pygame.event.pump()
+                # Refresh controller state per backend. Only the pygame backend
+                # needs pygame.event.pump(); the XInput backend reads state via a
+                # direct ctypes call and must NOT touch SDL (that is the segfault
+                # path). Guarding on the active backend keeps Learn-mode safe.
+                if backend == _XINPUT_BACKEND:
+                    if not js.refresh_state():
+                        return
+                elif backend == _PYGAME_BACKEND:
+                    if not _HAS_PYGAME:
+                        return
+                    pygame.event.pump()
+                else:
+                    return
                 for bid in range(js.get_numbuttons()):
                     if js.get_button(bid):
                         self._assign(bid, self._learning_action)
@@ -1897,7 +1930,12 @@ class NeuroPyGuiNGamepadController(IPlugin):
 
             self._update_mapping_surfaces()
 
-            if _HAS_PYGAME:
+            # Only spin up pygame/SDL when XInput is not available. On Windows with
+            # XInput present we deliberately keep SDL completely out of the picture:
+            # initializing pygame's joystick subsystem makes SDL open the physical
+            # device and start feeding it through the SDL message loop, which is
+            # exactly the interaction that segfaults phy. XInput needs no SDL state.
+            if _HAS_PYGAME and not _HAS_XINPUT:
                 pygame.init()
                 try:
                     pygame.joystick.init()
@@ -1989,11 +2027,20 @@ class NeuroPyGuiNGamepadController(IPlugin):
         return None
 
     def _detect_controller(self):
-        js = self._detect_pygame_controller()
-        backend = _PYGAME_BACKEND if js is not None else None
+        # Prefer the Windows XInput backend whenever it is available. XInput is
+        # polled directly through XInputGetState (a pure ctypes call), so it does
+        # NOT require pygame.event.pump() and never touches SDL's event/message
+        # loop. Driving pygame.event.pump() from a Qt QTimer while a real pad is
+        # connected under SDL_VIDEODRIVER=dummy crashes phy natively with an
+        # access violation (0xC0000005): SDL's joystick state on Windows is fed
+        # by the SDL message loop, which fights Qt's own loop. Using XInput as the
+        # primary backend sidesteps that conflict entirely. pygame is only used
+        # as a fallback (non-Windows, or when XInput reports no controller).
+        js = self._detect_xinput_controller()
+        backend = _XINPUT_BACKEND if js is not None else None
         if js is None:
-            js = self._detect_xinput_controller()
-            backend = _XINPUT_BACKEND if js is not None else None
+            js = self._detect_pygame_controller()
+            backend = _PYGAME_BACKEND if js is not None else None
         if js is None:
             if self._joystick is not None:
                 self._handle_disconnect()

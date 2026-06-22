@@ -10,11 +10,14 @@ import pytest
 from neuropyguin.pybombcell_integration import (
     _ensure_saved_metrics_maxchannels,
     _write_pybombcell_manifest,
+    classify_pybombcell_metrics,
+    load_pybombcell_labels,
     pybombcell_metadata_path,
     pybombcell_default_settings,
     pybombcell_settings_signature,
     run_pybombcell_on_folder,
     run_pybombcell_on_folders,
+    save_pybombcell_labels,
     summarize_saved_pybombcell_results,
 )
 
@@ -50,6 +53,69 @@ def test_summarize_saved_pybombcell_results_counts_labels_and_reuses_matching_ma
     assert summary["n_units"] == 3
     assert summary["can_reuse"] is True
     assert summary["cache_reason"] == "matching_signature"
+
+
+def test_load_pybombcell_labels_normalizes_saved_csv(tmp_path: Path) -> None:
+    ks = tmp_path / "imec0_ks4"
+    ks.mkdir(parents=True)
+    (ks / "bombcell_labels.csv").write_text(
+        "cluster_id,bombcell_label\n0,GOOD\n1,MUA\n2,NON-SOMA GOOD\n3,noise\n",
+        encoding="utf-8",
+    )
+
+    labels = load_pybombcell_labels(ks)
+
+    assert labels.index.tolist() == [0, 1, 2, 3]
+    assert labels["bombcell_label"].tolist() == ["good", "mua", "non_soma", "noise"]
+
+
+def test_classify_pybombcell_metrics_uses_bombcell_thresholds() -> None:
+    metrics = pd.DataFrame(
+        {
+            "cluster_id": [0, 1, 2, 3],
+            "nPeaks": [1, 3, 1, 1],
+            "nTroughs": [1, 1, 1, 1],
+            "waveformDuration_peakTrough": [500.0, 500.0, 500.0, 500.0],
+            "spatialDecaySlope": [0.02, 0.02, 0.02, 0.02],
+            "waveformBaselineFlatness": [0.1, 0.1, 0.1, 0.1],
+            "scndPeakToTroughRatio": [0.1, 0.1, 0.1, 0.1],
+            "mainPeakToTroughRatio": [0.2, 0.2, 0.2, 0.2],
+            "peak1ToPeak2Ratio": [1.0, 1.0, 1.0, 4.0],
+            "troughToPeak2Ratio": [10.0, 10.0, 10.0, 1.0],
+            "mainPeak_before_width": [10.0, 10.0, 10.0, 1.0],
+            "mainTrough_width": [10.0, 10.0, 10.0, 1.0],
+            "percentageSpikesMissing_gaussian": [0.0, 0.0, 50.0, 0.0],
+            "nSpikes": [1000.0, 1000.0, 1000.0, 1000.0],
+            "fractionRPVs_estimatedTauR": [0.0, 0.0, 0.0, 0.0],
+            "presenceRatio": [1.0, 1.0, 1.0, 1.0],
+            "rawAmplitude": [100.0, 100.0, 100.0, 100.0],
+            "signalToNoiseRatio": [10.0, 10.0, 10.0, 10.0],
+        }
+    )
+
+    labels = classify_pybombcell_metrics(metrics, settings=pybombcell_default_settings())
+
+    assert labels["bombcell_label"].to_dict() == {
+        0: "good",
+        1: "noise",
+        2: "mua",
+        3: "non_soma",
+    }
+
+
+def test_save_pybombcell_labels_writes_displayed_labels_and_syncs_phy(tmp_path: Path) -> None:
+    ks = tmp_path / "imec0_ks4"
+    (ks / "bombcell").mkdir(parents=True)
+    (ks / "bombcell" / "templates._bc_qMetrics.csv").write_text("cluster_id\n0\n1\n", encoding="utf-8")
+    labels = pd.DataFrame({"bombcell_label": ["good", "noise"]}, index=[0, 1])
+
+    result = save_pybombcell_labels(ks, labels, settings=pybombcell_default_settings())
+
+    saved = pd.read_csv(ks / "bombcell_labels.csv")
+    group = pd.read_csv(ks / "cluster_group.tsv", sep="\t")
+    assert result["counts"] == {"good": 1, "noise": 1}
+    assert saved["bombcell_label"].tolist() == ["good", "noise"]
+    assert group["group"].tolist() == ["good", "noise"]
 
 
 def test_summarize_saved_pybombcell_results_normalizes_uppercase_labels_and_writes_metadata(tmp_path: Path) -> None:
@@ -275,7 +341,7 @@ def test_ensure_saved_metrics_maxchannels_rebuilds_from_template_waveforms() -> 
 
 
 def test_run_pybombcell_on_folders_aggregates_success_cache_and_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(folder: str, save_plots: bool = True, force_recompute: bool = False, settings=None):
+    def fake_run(folder: str, save_plots: bool = True, force_recompute: bool = False, settings=None, extract_raw: bool = False):
         if folder.endswith("bad"):
             raise RuntimeError("boom")
         return {

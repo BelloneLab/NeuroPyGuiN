@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from neuropyguin.phy_gamepad_plugin import _gamepad_plugin_source
 from neuropyguin.phy_integration import PHY_PLUGIN_CLASS, PHY_PLUGIN_FILE, ensure_phy_short_isi_plugin
+from neuropyguin.phy_launch import (
+    PHY_EXECUTABLE_ENV,
+    _phy_exe_name,
+    _scripts_dir_name,
+    phy_child_environment,
+    resolve_phy_executable,
+)
 
 
 def test_ensure_phy_short_isi_plugin_creates_plugin_and_config(tmp_path: Path) -> None:
@@ -98,3 +106,60 @@ def test_gamepad_plugin_source_contains_xinput_fallback() -> None:
     assert 'if _HAS_PYGAME or _HAS_XINPUT:' in source
     assert 'logger.info("Gamepad connected via %s: %s", backend, name)' in source
     assert 'backend == _XINPUT_BACKEND' in source
+
+
+def test_gamepad_plugin_source_forces_sdl_dummy_before_pygame_import() -> None:
+    source = _gamepad_plugin_source()
+
+    video_idx = source.index('os.environ.setdefault("SDL_VIDEODRIVER", "dummy")')
+    pygame_idx = source.index("    import pygame")
+    assert video_idx < pygame_idx
+    assert 'os.environ.setdefault("SDL_AUDIODRIVER", "dummy")' in source
+
+
+def test_resolve_phy_executable_honors_explicit_env_var(tmp_path: Path) -> None:
+    fake_phy = tmp_path / _phy_exe_name()
+
+    assert resolve_phy_executable({PHY_EXECUTABLE_ENV: str(fake_phy), "PATH": ""}) == str(fake_phy)
+
+
+def test_phy_child_environment_forces_pyqt5_and_sdl_dummy() -> None:
+    env = {
+        "PATH": "original",
+        "PYQTGRAPH_QT_LIB": "PySide6",
+        "QT_API": "pyside6",
+    }
+
+    child = phy_child_environment(env)
+
+    assert child["PYQTGRAPH_QT_LIB"] == "PyQt5"
+    assert child["QT_API"] == "pyqt5"
+    assert child["SDL_VIDEODRIVER"] == "dummy"
+    assert child["SDL_AUDIODRIVER"] == "dummy"
+    assert child["PYGAME_HIDE_SUPPORT_PROMPT"] == "1"
+
+
+def test_phy_child_environment_prepends_conda_runtime_paths(tmp_path: Path) -> None:
+    conda_root = tmp_path / "phy2"
+    (conda_root / "conda-meta").mkdir(parents=True)
+    scripts = conda_root / _scripts_dir_name()
+    scripts.mkdir()
+    phy_exe = scripts / _phy_exe_name()
+    phy_exe.write_text("", encoding="utf-8")
+    if _scripts_dir_name() == "Scripts":
+        (conda_root / "Library" / "bin").mkdir(parents=True)
+        (conda_root / "Library" / "usr" / "bin").mkdir(parents=True)
+        site_packages = conda_root / "Lib" / "site-packages"
+    else:
+        site_packages = conda_root / "lib" / "python3.10" / "site-packages"
+    site_packages.mkdir(parents=True)
+
+    child = phy_child_environment({"PATH": "original"}, str(phy_exe))
+
+    expected_first = str(conda_root) if _scripts_dir_name() == "Scripts" else str(conda_root / "bin")
+    assert child["PATH"].split(os.pathsep)[0] == expected_first
+    # phy is no longer hard-isolated from the user site (some user phy plugins need
+    # user-site packages like seaborn/umap-learn). Instead the env's own
+    # site-packages lead PYTHONPATH so its tested numpy/scipy/scikit-learn win.
+    assert "PYTHONNOUSERSITE" not in child
+    assert child["PYTHONPATH"].split(os.pathsep)[0] == str(site_packages)

@@ -23,6 +23,10 @@ dependencies:
   - cachecache
   - pyarrow
   - ipython
+  # The py_bombcell unit-quality GUI runs as a Jupyter notebook with ipywidgets,
+  # launched from the curation tab. Without these the GUI silently never opens.
+  - ipywidgets
+  - jupyterlab
   - cmcrameri
   - pillow
   - cupy
@@ -47,3 +51,11 @@ dependencies:
       # The IBL apps repo (folder containing `atlaselectrophysiology`) must also be
       # on the path. Either clone https://github.com/int-brain-lab/iblapps and add
       # it to PYTHONPATH, or drop a `.pth` pointing at it into site-packages.
+
+# --- phy curation runs in a SEPARATE conda env (typically "phy2") that owns
+#     phy 2.0 / phylib. The bundled phy plugins need extra packages in THAT env,
+#     not this one. See requirements-phy.txt. In short:
+#       conda install -n <phy-env> -c conda-forge seaborn umap-learn
+#     (seaborn -> mahalanobis plugin; umap-learn -> UMAP / recluster plugins.)
+#     The gamepad plugin uses Windows XInput via ctypes (no dependency); pygame is
+#     only a fallback for non-Windows / no-XInput setups.

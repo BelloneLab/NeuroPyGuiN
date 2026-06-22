@@ -198,6 +198,11 @@ def _normalize_label_name(label: object) -> str:
     return remap.get(raw, raw)
 
 
+def normalize_pybombcell_label(label: object) -> str:
+    """Normalize a py_bombcell unit label to the GUI's four-label vocabulary."""
+    return _normalize_label_name(label)
+
+
 def _normalize_counts(counts: Optional[Dict[object, object]]) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for key, value in (counts or {}).items():
@@ -209,6 +214,22 @@ def _normalize_counts(counts: Optional[Dict[object, object]]) -> Dict[str, int]:
         except Exception:
             continue
     return out
+
+
+def _restore_jsonable_setting_value(value: object) -> object:
+    """Restore values serialized by _jsonable_setting_value."""
+    if value == "__NaN__":
+        return float("nan")
+    return value
+
+
+def decode_pybombcell_settings_payload(settings: Optional[Dict[str, object]]) -> Dict[str, object]:
+    """Normalize py_bombcell settings read from a manifest JSON payload."""
+    restored = {
+        key: _restore_jsonable_setting_value(value)
+        for key, value in (settings or {}).items()
+    }
+    return normalize_pybombcell_settings(restored)
 
 
 def _write_pybombcell_manifest(
@@ -308,6 +329,63 @@ def _label_counts(labels_csv: Path) -> Dict[str, int]:
         return {}
     counts = df["bombcell_label"].astype(str).map(_normalize_label_name).value_counts().to_dict()
     return _normalize_counts(counts)
+
+
+def _coerce_cluster_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy indexed by integer cluster ids when such an id is present."""
+    out = df.copy()
+    cols = [str(c) for c in out.columns]
+    for name in ("cluster_id", "phy_clusterID", "unit_id"):
+        if name in cols:
+            out = out.set_index(name, drop=True)
+            break
+    else:
+        if cols:
+            first = cols[0]
+            if first.lower().startswith("unnamed") or first.lower() in {"id", "cluster", "unit"}:
+                out = out.set_index(first, drop=True)
+
+    idx = pd.to_numeric(out.index, errors="coerce")
+    valid = ~pd.isna(idx)
+    if valid.any():
+        valid_mask = np.asarray(valid, dtype=bool)
+        out = out.iloc[valid_mask]
+        out.index = np.asarray(idx)[valid_mask].astype(int)
+        out.index.name = "cluster_id"
+    return out
+
+
+def load_pybombcell_labels(ks_folder: str | Path) -> pd.DataFrame:
+    """Load ``bombcell_labels.csv`` as a normalized label DataFrame.
+
+    The returned frame is indexed by ``cluster_id`` and has one column,
+    ``bombcell_label``. Missing files return an empty frame with that schema.
+    """
+    labels_csv = Path(ks_folder) / "bombcell_labels.csv"
+    empty = pd.DataFrame(columns=["bombcell_label"])
+    empty.index.name = "cluster_id"
+    if not labels_csv.exists():
+        return empty
+    df = _coerce_cluster_index(pd.read_csv(labels_csv))
+    label_column = ""
+    for candidate in (
+        "bombcell_label",
+        "unit_type",
+        "Bombcell_unit_type",
+        "unitType",
+        "label",
+        "group",
+    ):
+        if candidate in df.columns:
+            label_column = candidate
+            break
+    if not label_column:
+        return empty
+    labels = df[label_column].map(_normalize_label_name)
+    labels = labels[labels.astype(str).str.len() > 0]
+    out = pd.DataFrame({"bombcell_label": labels})
+    out.index.name = "cluster_id"
+    return out
 
 
 def _normalized_unit_labels(labels: Iterable[object]) -> List[str]:
@@ -448,6 +526,133 @@ def _quality_metrics_dict_from_df(metrics_df: pd.DataFrame) -> Dict[str, np.ndar
             continue
         out[str(column)] = metrics_df[column].to_numpy()
     return out
+
+
+def _numeric_quality_metrics_dict_from_df(metrics_df: pd.DataFrame) -> Dict[str, np.ndarray]:
+    out: Dict[str, np.ndarray] = {}
+    for column in metrics_df.columns:
+        name = str(column)
+        if name.lower().startswith("unnamed"):
+            continue
+        try:
+            out[name] = pd.to_numeric(metrics_df[column], errors="coerce").to_numpy(dtype=float)
+        except Exception:
+            continue
+    return out
+
+
+def classify_pybombcell_metrics(
+    metrics_df: pd.DataFrame,
+    settings: Optional[Dict[str, object]] = None,
+) -> pd.DataFrame:
+    """Classify saved py_bombcell metrics with BombCell's own threshold logic.
+
+    This is the lightweight path used by the live QC panel. It does not
+    recompute metrics or raw waveforms; it only applies ``get_quality_unit_type``
+    to an already loaded ``templates._bc_qMetrics`` table.
+    """
+    if metrics_df.empty:
+        out = pd.DataFrame(columns=["bombcell_label"])
+        out.index.name = "cluster_id"
+        return out
+
+    metrics = _coerce_cluster_index(metrics_df)
+    quality_metrics = _numeric_quality_metrics_dict_from_df(metrics)
+    normalized_settings = normalize_pybombcell_settings(settings)
+    n_units = int(len(metrics))
+
+    required = [
+        "nPeaks",
+        "nTroughs",
+        "waveformDuration_peakTrough",
+        "waveformBaselineFlatness",
+        "scndPeakToTroughRatio",
+        "troughToPeak2Ratio",
+        "mainPeak_before_width",
+        "mainTrough_width",
+        "peak1ToPeak2Ratio",
+        "mainPeakToTroughRatio",
+        "percentageSpikesMissing_gaussian",
+        "nSpikes",
+        "fractionRPVs_estimatedTauR",
+        "presenceRatio",
+    ]
+    if normalized_settings.get("computeSpatialDecay", False):
+        required.append("spatialDecaySlope")
+    if normalized_settings.get("computeDrift", False):
+        required.append("maxDriftEstimate")
+    if normalized_settings.get("computeDistanceMetrics", False):
+        required.extend(["isolationDistance", "Lratio"])
+
+    missing = [name for name in required if name not in quality_metrics]
+    if missing:
+        raise RuntimeError(
+            "Saved py_bombcell metrics are missing required columns: "
+            + ", ".join(missing)
+        )
+
+    for optional in ("rawAmplitude", "signalToNoiseRatio", "maxDriftEstimate", "isolationDistance", "Lratio"):
+        quality_metrics.setdefault(optional, np.full(n_units, np.nan, dtype=float))
+
+    ensure_pybombcell_on_sys_path()
+    from bombcell.quality_metrics import get_quality_unit_type
+
+    _unit_type, unit_type_string = get_quality_unit_type(normalized_settings, quality_metrics)
+    labels = _normalized_unit_labels(unit_type_string)
+    out = pd.DataFrame({"bombcell_label": labels}, index=metrics.index.astype(int))
+    out.index.name = "cluster_id"
+    return out
+
+
+def save_pybombcell_labels(
+    ks_folder: str | Path,
+    labels_df: pd.DataFrame,
+    *,
+    settings: Optional[Dict[str, object]] = None,
+    mode: str = "live_threshold_preview",
+) -> Dict[str, object]:
+    """Write the displayed py_bombcell labels and sync ``cluster_group.tsv``."""
+    ks = Path(ks_folder)
+    if labels_df.empty or "bombcell_label" not in labels_df.columns:
+        raise RuntimeError("No py_bombcell labels are available to save.")
+
+    labels = _coerce_cluster_index(labels_df)
+    if "bombcell_label" not in labels.columns:
+        raise RuntimeError("No py_bombcell label column is available to save.")
+    labels = pd.DataFrame(
+        {"bombcell_label": labels["bombcell_label"].map(_normalize_label_name)},
+        index=labels.index.astype(int),
+    )
+    labels.index.name = "cluster_id"
+    labels = labels.sort_index()
+
+    labels_csv = ks / "bombcell_labels.csv"
+    labels.reset_index().to_csv(labels_csv, index=False)
+    counts = _normalize_counts(labels["bombcell_label"].value_counts().to_dict())
+    sync_result = sync_phy_cluster_group(ks, force=True)
+
+    metrics_path = _saved_metrics_path(ks) or (ks / "bombcell" / "templates._bc_qMetrics.csv")
+    plots_dir = ks / "bombcell_plots"
+    manifest_path = _write_pybombcell_manifest(
+        ks,
+        normalize_pybombcell_settings(settings),
+        metrics_csv=metrics_path,
+        labels_csv=labels_csv,
+        plots_dir=plots_dir,
+        counts=counts,
+        n_units=len(labels),
+        metrics_reused=True,
+        mode=mode,
+    )
+    return {
+        "labels_csv": str(labels_csv),
+        "metrics_csv": str(metrics_path),
+        "manifest_path": str(manifest_path),
+        "n_units": int(len(labels)),
+        "counts": counts,
+        "phy_group_sync": sync_result,
+        "mode": mode,
+    }
 
 
 def _persist_saved_metrics_dataframe(ks_folder: Path, metrics_df: pd.DataFrame) -> None:
@@ -719,25 +924,53 @@ def launch_pybombcell_gui(ks_folder: str | Path) -> Dict[str, object]:
         raise RuntimeError(f"No saved py_bombcell metrics found for {ks}")
 
     notebook_path = _write_bombcell_gui_notebook(ks)
-    commands = [
-        [sys.executable, "-m", "jupyterlab", str(notebook_path)],
-        [sys.executable, "-m", "notebook", str(notebook_path)],
-        ["jupyter-lab", str(notebook_path)],
-        ["jupyter-notebook", str(notebook_path)],
-        ["jupyter", "lab", str(notebook_path)],
-        ["jupyter", "notebook", str(notebook_path)],
-    ]
-    last_error = "No Jupyter launcher found."
+
+    # Only offer launchers that actually exist in this environment. Running
+    # "python -m jupyterlab" when jupyterlab is not installed still spawns a
+    # process (python exists) that dies immediately, so the GUI silently never
+    # opens. Probing first lets us fail with a clear, actionable message.
+    def _module_available(name: str) -> bool:
+        try:
+            import importlib.util
+            return importlib.util.find_spec(name) is not None
+        except Exception:
+            return False
+
+    commands: List[List[str]] = []
+    if _module_available("jupyterlab"):
+        commands.append([sys.executable, "-m", "jupyterlab", str(notebook_path)])
+    if _module_available("notebook"):
+        commands.append([sys.executable, "-m", "notebook", str(notebook_path)])
+    for exe in ("jupyter-lab", "jupyter-notebook"):
+        if shutil.which(exe):
+            commands.append([exe, str(notebook_path)])
+    if shutil.which("jupyter"):
+        commands.append(["jupyter", "lab", str(notebook_path)])
+        commands.append(["jupyter", "notebook", str(notebook_path)])
+
+    if not commands:
+        raise RuntimeError(
+            "Jupyter is not installed in the app's Python environment, so the BombCell "
+            "GUI cannot open. Install it with:\n"
+            f'    "{sys.executable}" -m pip install jupyterlab'
+        )
+
+    # Capture the Jupyter server output to a log next to the notebook so a failed
+    # launch is diagnosable instead of vanishing into DEVNULL.
+    log_path = notebook_path.parent / "bombcell_gui.log"
     creationflags = 0
     if sys.platform.startswith("win"):
         creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    last_error = "No Jupyter launcher could be started."
     for cmd in commands:
+        log_handle = None
         try:
+            log_handle = open(log_path, "w", encoding="utf-8")
             tracked_popen(
                 cmd,
                 cwd=str(notebook_path.parent),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
                 creationflags=creationflags,
@@ -745,11 +978,20 @@ def launch_pybombcell_gui(ks_folder: str | Path) -> Dict[str, object]:
             return {
                 "launcher": " ".join(cmd[:3]) if len(cmd) > 2 else " ".join(cmd),
                 "notebook_path": str(notebook_path),
+                "log_path": str(log_path),
             }
         except FileNotFoundError:
             continue
         except Exception as exc:
             last_error = str(exc)
+        finally:
+            # The detached child keeps its own inherited handle; close ours so the
+            # log file is not held open by the app process.
+            if log_handle is not None:
+                try:
+                    log_handle.close()
+                except Exception:
+                    pass
     raise RuntimeError(f"Unable to launch BombCell GUI notebook: {last_error}")
 
 

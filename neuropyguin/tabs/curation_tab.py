@@ -3,6 +3,7 @@
 import ast
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -14,15 +15,16 @@ from scipy import signal as sps
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-from ..bombcell_core import (
-    bombcell_get_default_thresholds,
-    bombcell_label_units_from_metrics,
-    run_bombcell_on_folder_with_thresholds,
-    sync_phy_cluster_group,
-)
+from ..bombcell_core import sync_phy_cluster_group
 from ..ecephys_runtime import ecephys_subprocess_env
 from ..ks_output_resolver import find_kilosort_output_dir, find_metrics_file
 from ..phy_integration import ensure_phy_short_isi_plugin
+from ..phy_launch import (
+    PHY_ENV_OVERRIDES,
+    PHY_EXECUTABLE_ENV,
+    phy_child_environment,
+    resolve_phy_executable,
+)
 from ..preprocessing import (
     find_concat_splitinfo_for_ks_folder,
     infer_completed_run_name,
@@ -31,11 +33,16 @@ from ..preprocessing import (
 from ..processes import tracked_run
 from ..pybombcell_integration import (
     PYBOMBCELL_SETTINGS_SCHEMA,
+    classify_pybombcell_metrics,
+    decode_pybombcell_settings_payload,
     launch_pybombcell_gui,
+    load_pybombcell_labels,
+    load_pybombcell_manifest,
     normalize_pybombcell_settings,
     pybombcell_default_settings,
     run_pybombcell_on_folder,
     run_pybombcell_on_folders,
+    save_pybombcell_labels,
     summarize_saved_pybombcell_results,
 )
 from ..side_nav import SideNavStack
@@ -226,6 +233,34 @@ def _preferred_metrics_file(ks_folder: Path) -> Optional[Path]:
     return find_metrics_file(ks_folder, max_depth=4)
 
 
+PYBOMBCELL_THRESHOLD_ROWS: List[Dict[str, object]] = [
+    {"category": "noise", "metric": "nPeaks", "max": "maxNPeaks"},
+    {"category": "noise", "metric": "nTroughs", "max": "maxNTroughs"},
+    {"category": "noise", "metric": "waveformDuration_peakTrough", "min": "minWvDuration", "max": "maxWvDuration"},
+    {"category": "noise", "metric": "waveformBaselineFlatness", "max": "maxWvBaselineFraction"},
+    {"category": "noise", "metric": "scndPeakToTroughRatio", "max": "maxScndPeakToTroughRatio_noise"},
+    {"category": "noise", "metric": "spatialDecaySlope", "min": "minSpatialDecaySlopeExp", "max": "maxSpatialDecaySlopeExp"},
+    {"category": "mua", "metric": "percentageSpikesMissing_gaussian", "max": "maxPercSpikesMissing"},
+    {"category": "mua", "metric": "nSpikes", "min": "minNumSpikes"},
+    {"category": "mua", "metric": "fractionRPVs_estimatedTauR", "max": "maxRPVviolations"},
+    {"category": "mua", "metric": "presenceRatio", "min": "minPresenceRatio"},
+    {"category": "mua", "metric": "rawAmplitude", "min": "minAmplitude"},
+    {"category": "mua", "metric": "signalToNoiseRatio", "min": "minSNR"},
+    {"category": "mua", "metric": "maxDriftEstimate", "max": "maxDrift"},
+    {"category": "mua", "metric": "isolationDistance", "min": "isoDmin"},
+    {"category": "mua", "metric": "Lratio", "max": "lratioMax"},
+    {"category": "non_soma", "metric": "troughToPeak2Ratio", "min": "minTroughToPeak2Ratio_nonSomatic"},
+    {"category": "non_soma", "metric": "mainPeak_before_width", "min": "minWidthFirstPeak_nonSomatic"},
+    {"category": "non_soma", "metric": "mainTrough_width", "min": "minWidthMainTrough_nonSomatic"},
+    {"category": "non_soma", "metric": "peak1ToPeak2Ratio", "max": "maxPeak1ToPeak2Ratio_nonSomatic"},
+    {"category": "non_soma", "metric": "mainPeakToTroughRatio", "max": "maxMainPeakToTroughRatio_nonSomatic"},
+]
+PYBOMBCELL_THRESHOLD_BY_METRIC = {
+    str(row["metric"]): row
+    for row in PYBOMBCELL_THRESHOLD_ROWS
+}
+
+
 class PyBombcellSettingsDialog(QtWidgets.QDialog):
     """Modal editor for py_bombcell default parameters.
 
@@ -362,6 +397,7 @@ class CurationTab(QtWidgets.QWidget):
         self.settings = QtCore.QSettings("NeuroPyGuiN", "NeuroPyGuiN")
         self.metrics_df = pd.DataFrame()
         self.preview_labels = pd.DataFrame()
+        self._preview_label_source = ""
         self.ks_folders: List[str] = []
         self._pybombcell_settings = pybombcell_default_settings()
         self._updating_table = False
@@ -388,13 +424,13 @@ class CurationTab(QtWidgets.QWidget):
         self.phy_process.readyReadStandardOutput.connect(self._on_phy_output)
         self.phy_process.errorOccurred.connect(self._on_phy_error)
         self.phy_process.started.connect(lambda: self._log("Phy process started."))
-        self.phy_process.finished.connect(lambda code, status: self._log(f"Phy process finished: code={code}, status={status}"))
+        self.phy_process.finished.connect(self._on_phy_finished)
 
         self.watcher = QtCore.QFileSystemWatcher(self)
         self.watcher.fileChanged.connect(self._on_metrics_changed)
 
         self._build_ui()
-        self._reset_thresholds()
+        self._populate_threshold_table_from_pybombcell_settings(self._pybombcell_settings)
         self._restore_settings()
 
     def _build_ui(self) -> None:
@@ -488,7 +524,7 @@ class CurationTab(QtWidgets.QWidget):
         bomb_layout.setSpacing(10)
 
         bomb_top = QtWidgets.QHBoxLayout()
-        self.btn_load_metrics = QtWidgets.QPushButton("Load active metrics")
+        self.btn_load_metrics = QtWidgets.QPushButton("Load py_bombcell results")
         self.btn_run_pybomb = QtWidgets.QPushButton("Run py_bombcell on active folder")
         self.btn_load_metrics.setProperty("role", "secondary")
         self.btn_run_pybomb.setProperty("role", "primary")
@@ -516,7 +552,7 @@ class CurationTab(QtWidgets.QWidget):
 
         self.tbl_thresh = QtWidgets.QTableWidget(0, 5)
         self.tbl_thresh.setAlternatingRowColors(True)
-        self.tbl_thresh.setHorizontalHeaderLabels(["Category", "Metric", "Min", "Max", "Abs"])
+        self.tbl_thresh.setHorizontalHeaderLabels(["Category", "Metric", "Min", "Max", "Parameter"])
         self.tbl_thresh.horizontalHeader().setStretchLastSection(True)
         self.tbl_thresh.verticalHeader().setVisible(False)
         self.tbl_thresh.setMinimumWidth(460)
@@ -554,7 +590,7 @@ class CurationTab(QtWidgets.QWidget):
         defaults_box.setProperty("settingsSection", True)
         defaults_l = QtWidgets.QVBoxLayout(defaults_box)
         defaults_hint = QtWidgets.QLabel(
-            "These are the default py_bombcell parameters used for reruns. They are separate from the live review thresholds."
+            "These are the full py_bombcell parameters used for reruns. Threshold rows are extracted from the same parameter set."
         )
         defaults_hint.setObjectName("SectionHint")
         defaults_hint.setWordWrap(True)
@@ -587,7 +623,7 @@ class CurationTab(QtWidgets.QWidget):
         plots_panel_l.setSpacing(0)
         plots_panel_l.addWidget(self.metrics_grid, 1)
 
-        self.btn_save_labels = QtWidgets.QPushButton("Save bombcell_labels.csv")
+        self.btn_save_labels = QtWidgets.QPushButton("Save displayed labels")
         self.btn_export = QtWidgets.QPushButton("Export plotted data")
         self.btn_detach_plots = QtWidgets.QPushButton("Detach plots")
         self.btn_detach_plots.setCheckable(True)
@@ -658,7 +694,7 @@ class CurationTab(QtWidgets.QWidget):
         review_box_l = QtWidgets.QVBoxLayout(review_box)
         review_box_l.setSpacing(10)
         review_hint = QtWidgets.QLabel(
-            "Load metrics, run py_bombcell, then use the Thresholds and Metrics subsections to refine the review."
+            "Load saved py_bombcell metrics and labels, then use Thresholds and Metrics to inspect or reclassify the saved qMetrics."
         )
         review_hint.setObjectName("SectionHint")
         review_hint.setWordWrap(True)
@@ -834,7 +870,10 @@ class CurationTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Invalid py_bombcell default", str(exc))
             return False
         self.settings.setValue("curation/pybombcell_settings_json", json.dumps(self._pybombcell_settings))
+        self._populate_threshold_table_from_pybombcell_settings(self._pybombcell_settings)
         self._refresh_folder_item_texts()
+        if not self.metrics_df.empty:
+            self._recompute_preview()
         if announce:
             self._log("Applied py_bombcell default parameters.")
         return True
@@ -842,8 +881,11 @@ class CurationTab(QtWidgets.QWidget):
     def _reset_pybombcell_defaults_table(self) -> None:
         self._pybombcell_settings = pybombcell_default_settings()
         self._populate_pybomb_defaults_table(self._pybombcell_settings)
+        self._populate_threshold_table_from_pybombcell_settings(self._pybombcell_settings)
         self.settings.setValue("curation/pybombcell_settings_json", json.dumps(self._pybombcell_settings))
         self._refresh_folder_item_texts()
+        if not self.metrics_df.empty:
+            self._recompute_preview()
         self._log("Restored bundled py_bombcell defaults.")
 
     def _persist_folder_list(self) -> None:
@@ -1196,6 +1238,7 @@ class CurationTab(QtWidgets.QWidget):
     def _clear_metrics_state(self) -> None:
         self.metrics_df = pd.DataFrame()
         self.preview_labels = pd.DataFrame()
+        self._preview_label_source = ""
         self._selected_unit_id = None
         self.metrics_grid.clear()
         self._plot_lines.clear()
@@ -1246,10 +1289,19 @@ class CurationTab(QtWidgets.QWidget):
             self._log("Phy is already running.")
             return
 
-        program = "phy"
+        program = resolve_phy_executable(os.environ)
         args = ["template-gui", str(params)]
+        child_env = phy_child_environment(os.environ, program)
+        qenv = QtCore.QProcessEnvironment()
+        for key, value in child_env.items():
+            qenv.insert(str(key), str(value))
+        self.phy_process.setProcessEnvironment(qenv)
 
         self._log("Launching: " + " ".join([program] + args))
+        self._log(
+            "Phy child env: "
+            + ", ".join(f"{key}={value}" for key, value in PHY_ENV_OVERRIDES.items())
+        )
         self.phy_process.setWorkingDirectory(str(folder))
         self.phy_process.start(program, args)
         if not self.phy_process.waitForStarted(3000):
@@ -1286,23 +1338,68 @@ class CurationTab(QtWidgets.QWidget):
     def _on_phy_error(self, _err) -> None:
         self._log("Phy error: " + self.phy_process.errorString())
 
+    def _on_phy_finished(self, code: int, status: QtCore.QProcess.ExitStatus) -> None:
+        self._log(f"Phy process finished: code={code}, status={status}")
+        if status == QtCore.QProcess.ExitStatus.CrashExit:
+            hint = "native crash"
+            if int(code) == -1073741819:
+                hint = "Windows access violation 0xC0000005"
+            self._log(
+                f"Phy crashed ({hint}). If this persists, disable third-party phy plugins "
+                f"or set {PHY_EXECUTABLE_ENV} to a known-good phy.exe."
+            )
+
     def _reset_thresholds(self) -> None:
-        defaults = bombcell_get_default_thresholds()
-        self._updating_table = True
-        self.tbl_thresh.setRowCount(0)
-        for category, metrics in defaults.items():
-            for metric, conf in metrics.items():
-                row = self.tbl_thresh.rowCount()
-                self.tbl_thresh.insertRow(row)
-                self.tbl_thresh.setItem(row, 0, QtWidgets.QTableWidgetItem(str(category)))
-                self.tbl_thresh.setItem(row, 1, QtWidgets.QTableWidgetItem(str(metric)))
-                self.tbl_thresh.setItem(row, 2, QtWidgets.QTableWidgetItem("" if conf.get("min") is None else str(conf.get("min"))))
-                self.tbl_thresh.setItem(row, 3, QtWidgets.QTableWidgetItem("" if conf.get("max") is None else str(conf.get("max"))))
-                self.tbl_thresh.setItem(row, 4, QtWidgets.QTableWidgetItem("1" if conf.get("abs", False) else "0"))
-        self.tbl_thresh.resizeColumnsToContents()
-        self._updating_table = False
+        self._pybombcell_settings = pybombcell_default_settings()
+        self._populate_pybomb_defaults_table(self._pybombcell_settings)
+        self.settings.setValue("curation/pybombcell_settings_json", json.dumps(self._pybombcell_settings))
+        self._populate_threshold_table_from_pybombcell_settings(self._pybombcell_settings)
         self._refresh_metric_selector()
         self._recompute_preview()
+
+    @staticmethod
+    def _threshold_text(value: object) -> str:
+        try:
+            if np.isnan(value):
+                return ""
+        except Exception:
+            pass
+        return "" if value is None else str(value)
+
+    @staticmethod
+    def _readonly_item(text: str) -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+        return item
+
+    def _populate_threshold_table_from_pybombcell_settings(self, settings: Dict[str, object]) -> None:
+        values = normalize_pybombcell_settings(settings)
+        self._updating_table = True
+        self.tbl_thresh.setRowCount(0)
+        for conf in PYBOMBCELL_THRESHOLD_ROWS:
+            row = self.tbl_thresh.rowCount()
+            self.tbl_thresh.insertRow(row)
+            metric = str(conf["metric"])
+            min_key = conf.get("min")
+            max_key = conf.get("max")
+            param_names = " / ".join(str(key) for key in (min_key, max_key) if key)
+            self.tbl_thresh.setItem(row, 0, self._readonly_item(str(conf["category"])))
+            self.tbl_thresh.setItem(row, 1, self._readonly_item(metric))
+            min_item = QtWidgets.QTableWidgetItem(
+                self._threshold_text(values.get(str(min_key))) if min_key else ""
+            )
+            max_item = QtWidgets.QTableWidgetItem(
+                self._threshold_text(values.get(str(max_key))) if max_key else ""
+            )
+            if not min_key:
+                min_item.setFlags(min_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            if not max_key:
+                max_item.setFlags(max_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.tbl_thresh.setItem(row, 2, min_item)
+            self.tbl_thresh.setItem(row, 3, max_item)
+            self.tbl_thresh.setItem(row, 4, self._readonly_item(param_names))
+        self.tbl_thresh.resizeColumnsToContents()
+        self._updating_table = False
 
     def _restore_settings(self) -> None:
         raw_settings = str(self.settings.value("curation/pybombcell_settings_json", "{}") or "{}")
@@ -1311,8 +1408,9 @@ class CurationTab(QtWidgets.QWidget):
         except Exception:
             parsed_settings = {}
         if isinstance(parsed_settings, dict):
-            self._pybombcell_settings = normalize_pybombcell_settings(parsed_settings)
+            self._pybombcell_settings = decode_pybombcell_settings_payload(parsed_settings)
         self._populate_pybomb_defaults_table(self._pybombcell_settings)
+        self._populate_threshold_table_from_pybombcell_settings(self._pybombcell_settings)
 
         raw_folders = str(self.settings.value("curation/ks_folders_json", "[]") or "[]")
         try:
@@ -1375,28 +1473,29 @@ class CurationTab(QtWidgets.QWidget):
             return None
         return float(t)
 
-    def _thresholds_from_table(self) -> Dict:
-        out: Dict = {"noise": {}, "mua": {}, "non-somatic": {}}
+    def _parse_threshold_value(self, item: QtWidgets.QTableWidgetItem | None) -> float:
+        text = item.text().strip() if item is not None else ""
+        if not text:
+            return float("nan")
+        return float(text)
+
+    def _pybombcell_settings_from_threshold_table(self) -> Dict[str, object]:
+        settings = self._current_pybombcell_settings_from_table()
         for row in range(self.tbl_thresh.rowCount()):
-            cat_item = self.tbl_thresh.item(row, 0)
             met_item = self.tbl_thresh.item(row, 1)
-            min_item = self.tbl_thresh.item(row, 2)
-            max_item = self.tbl_thresh.item(row, 3)
-            abs_item = self.tbl_thresh.item(row, 4)
-            if cat_item is None or met_item is None:
+            if met_item is None:
                 continue
-            cat = cat_item.text().strip()
-            met = met_item.text().strip()
-            if cat not in out or not met:
+            metric = met_item.text().strip()
+            conf = PYBOMBCELL_THRESHOLD_BY_METRIC.get(metric)
+            if not conf:
                 continue
-            conf = {
-                "min": self._parse_optional_float(min_item.text() if min_item else ""),
-                "max": self._parse_optional_float(max_item.text() if max_item else ""),
-            }
-            if abs_item is not None and abs_item.text().strip() in {"1", "true", "True", "yes", "YES"}:
-                conf["abs"] = True
-            out[cat][met] = conf
-        return out
+            min_key = conf.get("min")
+            max_key = conf.get("max")
+            if min_key:
+                settings[str(min_key)] = self._parse_threshold_value(self.tbl_thresh.item(row, 2))
+            if max_key:
+                settings[str(max_key)] = self._parse_threshold_value(self.tbl_thresh.item(row, 3))
+        return normalize_pybombcell_settings(settings)
 
     def _load_metrics(self, allow_compute: bool = True) -> None:
         if hasattr(self, "_main_sections"):
@@ -1432,10 +1531,18 @@ class CurationTab(QtWidgets.QWidget):
             idx = pd.to_numeric(df.index, errors="coerce")
             ok = ~pd.isna(idx)
             if ok.any():
-                df = df.loc[ok]
-                df.index = idx[ok].astype(int)
+                ok_mask = np.asarray(ok, dtype=bool)
+                df = df.iloc[ok_mask]
+                df.index = np.asarray(idx)[ok_mask].astype(int)
         except Exception:
             pass
+
+        manifest = load_pybombcell_manifest(folder)
+        manifest_settings = manifest.get("settings") if isinstance(manifest, dict) else {}
+        if isinstance(manifest_settings, dict) and manifest_settings:
+            self._pybombcell_settings = decode_pybombcell_settings_payload(manifest_settings)
+            self._populate_pybomb_defaults_table(self._pybombcell_settings)
+            self._populate_threshold_table_from_pybombcell_settings(self._pybombcell_settings)
 
         df = self._augment_with_psd_metrics(df, folder)
         self.metrics_df = df
@@ -1448,9 +1555,22 @@ class CurationTab(QtWidgets.QWidget):
         if paths:
             self.watcher.removePaths(paths)
         self.watcher.addPath(str(metrics_path))
+        labels_path = folder / "bombcell_labels.csv"
+        if labels_path.exists():
+            self.watcher.addPath(str(labels_path))
 
         self._refresh_metric_selector()
-        self._recompute_preview()
+        labels = load_pybombcell_labels(folder)
+        if not labels.empty:
+            self._set_preview_labels(labels, source=f"saved py_bombcell labels: {folder / 'bombcell_labels.csv'}")
+            counts = labels["bombcell_label"].value_counts().to_dict()
+            self._log(
+                "Loaded saved py_bombcell labels: "
+                f"good={counts.get('good', 0)} noise={counts.get('noise', 0)} "
+                f"mua={counts.get('mua', 0)} non_soma={counts.get('non_soma', 0)}"
+            )
+        else:
+            self._recompute_preview()
 
     def _augment_with_psd_metrics(self, df: pd.DataFrame, folder: Path) -> pd.DataFrame:
         """Add per-unit PSD-derived metrics to loaded quality metrics."""
@@ -1673,9 +1793,17 @@ class CurationTab(QtWidgets.QWidget):
         self._log(f"Detected metrics file update: {path}")
         self._load_metrics(allow_compute=False)
 
-    def _apply_settings(self) -> None:
+    def _apply_settings(self, checked: bool | None = None, *, announce: bool = True) -> None:
+        try:
+            self._pybombcell_settings = self._pybombcell_settings_from_threshold_table()
+        except Exception as exc:
+            self._log(f"Invalid py_bombcell threshold setting: {exc}")
+            return
+        self.settings.setValue("curation/pybombcell_settings_json", json.dumps(self._pybombcell_settings))
+        self._populate_pybomb_defaults_table(self._pybombcell_settings)
         self._recompute_preview()
-        self._log("Applied Bombcell settings.")
+        if announce:
+            self._log("Applied py_bombcell threshold settings.")
 
     def _on_threshold_changed(self, _item: QtWidgets.QTableWidgetItem) -> None:
         if self._updating_table:
@@ -1683,7 +1811,7 @@ class CurationTab(QtWidgets.QWidget):
         self._refresh_metric_selector(keep_current=True)
         self._refresh_metric_plot()
         if self.ck_live_apply.isChecked():
-            self._recompute_preview()
+            self._apply_settings(announce=False)
 
     def _on_threshold_row_selected(self, row: int, _current_col: int, _prev_row: int, _prev_col: int) -> None:
         if row < 0:
@@ -1753,11 +1881,10 @@ class CurationTab(QtWidgets.QWidget):
                 continue
             min_item = self.tbl_thresh.item(row, 2)
             max_item = self.tbl_thresh.item(row, 3)
-            abs_item = self.tbl_thresh.item(row, 4)
             return {
                 "min": self._parse_optional_float(min_item.text() if min_item else ""),
                 "max": self._parse_optional_float(max_item.text() if max_item else ""),
-                "abs": abs_item is not None and abs_item.text().strip() in {"1", "true", "True", "yes", "YES"},
+                "abs": False,
             }
         return {"min": None, "max": None, "abs": False}
 
@@ -1900,29 +2027,52 @@ class CurationTab(QtWidgets.QWidget):
             self._apply_settings()
             break
 
-    def _recompute_preview(self) -> None:
-        if self.metrics_df.empty:
-            return
-        try:
-            labels = bombcell_label_units_from_metrics(self.metrics_df, thresholds=self._thresholds_from_table())
-        except Exception as exc:
-            self._log(f"Threshold preview error: {exc}")
-            return
+    def _set_preview_labels(self, labels: pd.DataFrame, *, source: str) -> None:
+        if labels.empty or "bombcell_label" not in labels.columns:
+            self.preview_labels = pd.DataFrame(columns=["bombcell_label"])
+            self._preview_label_source = source
+            counts: Dict[str, int] = {}
+        else:
+            preview = labels.copy()
+            try:
+                idx = pd.to_numeric(preview.index, errors="coerce")
+                ok = ~pd.isna(idx)
+                if ok.any():
+                    ok_mask = np.asarray(ok, dtype=bool)
+                    preview = preview.iloc[ok_mask]
+                    preview.index = np.asarray(idx)[ok_mask].astype(int)
+            except Exception:
+                pass
+            preview.index.name = "cluster_id"
+            self.preview_labels = preview
+            self._preview_label_source = source
+            counts = preview["bombcell_label"].value_counts().to_dict()
 
-        self.preview_labels = labels
-        counts = labels["bombcell_label"].value_counts().to_dict()
         self.lbl_good.setText(f"good: {counts.get('good', 0)}")
         self.lbl_noise.setText(f"noise: {counts.get('noise', 0)}")
         self.lbl_mua.setText(f"mua: {counts.get('mua', 0)}")
         self.lbl_non_soma.setText(f"non_soma: {counts.get('non_soma', 0)}")
         self._refresh_report_plot({str(key): int(value) for key, value in counts.items()})
 
-        self._fill_list(self.list_good, labels, "good")
-        self._fill_list(self.list_noise, labels, "noise")
-        self._fill_list(self.list_mua, labels, "mua")
-        self._fill_list(self.list_non_soma, labels, "non_soma")
+        self._fill_list(self.list_good, self.preview_labels, "good")
+        self._fill_list(self.list_noise, self.preview_labels, "noise")
+        self._fill_list(self.list_mua, self.preview_labels, "mua")
+        self._fill_list(self.list_non_soma, self.preview_labels, "non_soma")
         self._refresh_unit_inspector()
         self._refresh_metric_plot()
+
+    def _recompute_preview(self) -> None:
+        if self.metrics_df.empty:
+            return
+        try:
+            settings = self._pybombcell_settings_from_threshold_table()
+            labels = classify_pybombcell_metrics(self.metrics_df, settings=settings)
+        except Exception as exc:
+            self._log(f"py_bombcell threshold preview error: {exc}")
+            return
+
+        self._pybombcell_settings = settings
+        self._set_preview_labels(labels, source="live py_bombcell threshold preview")
 
     def _fill_list(self, target: QtWidgets.QListWidget, labels_df: pd.DataFrame, label_name: str) -> None:
         target.clear()
@@ -1992,11 +2142,26 @@ class CurationTab(QtWidgets.QWidget):
             self._load_metrics()
             if self.metrics_df.empty:
                 return
+        if self.preview_labels.empty:
+            self._recompute_preview()
+            if self.preview_labels.empty:
+                self._log("No py_bombcell labels are available to save.")
+                return
 
-        thresholds = self._thresholds_from_table()
+        try:
+            settings = self._pybombcell_settings_from_threshold_table()
+        except Exception as exc:
+            self._log(f"Invalid py_bombcell threshold setting: {exc}")
+            return
         self.btn_save_labels.setEnabled(False)
         self._busy_count += 1
-        worker = FunctionWorker(run_bombcell_on_folder_with_thresholds, folder, thresholds)
+        worker = FunctionWorker(
+            save_pybombcell_labels,
+            folder,
+            self.preview_labels.copy(),
+            settings=settings,
+            mode="live_qc_displayed_labels",
+        )
         worker.signals.error.connect(self._log)
         worker.signals.finished.connect(self._on_save_finished)
         self.pool.start(worker)
@@ -2010,7 +2175,7 @@ class CurationTab(QtWidgets.QWidget):
         payload = result.get("result", {})
         counts = payload.get("counts", {})
         self._log(
-            f"Saved bombcell_labels.csv | units={payload.get('n_units')} "
+            f"Saved displayed py_bombcell labels | units={payload.get('n_units')} "
             f"good={counts.get('good', 0)} noise={counts.get('noise', 0)} "
             f"mua={counts.get('mua', 0)} non_soma={counts.get('non_soma', 0)}"
         )
@@ -2021,7 +2186,7 @@ class CurationTab(QtWidgets.QWidget):
                 f"({sync_result.get('n_units', 0)} units)"
             )
         self._refresh_folder_item_texts()
-        self._recompute_preview()
+        self._set_preview_labels(self.preview_labels, source=str(payload.get("labels_csv") or "saved labels"))
 
     def _log(self, line: str) -> None:
         self.log.appendPlainText(line)

@@ -1,0 +1,31 @@
+# Extra dependencies for the SEPARATE phy environment (typically a conda env
+# named "phy2") that owns phy 2.0 / phylib and runs manual curation.
+#
+# These are NOT app (neuropygui) dependencies. They are required by the phy
+# plugins that NeuroPyGuiN deploys into ~/.phy/plugins. Install them into the
+# phy env, for example:
+#
+#     conda activate phy2
+#     pip install -r requirements-phy.txt
+#   or
+#     conda install -n phy2 -c conda-forge seaborn umap-learn
+#
+# Background (debugging notes):
+# - seaborn      : imported by the mahalanobis phy plugin. If missing, phy's
+#                  plugin discovery raised ModuleNotFoundError and the GUI failed
+#                  to open. NeuroPyGuiN no longer hard-isolates phy from the user
+#                  site-packages (see neuropyguin/phy_launch.py), so a user-site
+#                  install also works, but installing into the phy env is cleaner.
+# - umap-learn   : imported by the UMAP / recluster phy plugins (same failure mode
+#                  as seaborn when missing).
+seaborn
+umap-learn
+
+# - pygame       : OPTIONAL. The NeuroPyGuiN gamepad plugin prefers Windows XInput
+#                  (pure ctypes, no dependency) and only falls back to pygame on
+#                  non-Windows systems or when no XInput controller is present.
+#                  Polling a real controller through pygame from phy's Qt event
+#                  loop crashed phy with a native access violation, which is why
+#                  XInput is now primary on Windows. Install pygame only if you
+#                  need the non-Windows fallback.
+# pygame
