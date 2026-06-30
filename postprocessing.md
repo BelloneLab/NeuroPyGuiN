@@ -265,6 +265,27 @@ Screenshots in `tools/_postproc_shots/` (`fonttest` = before, `stage5` = after).
 - The bridge hardlinks the `.ap.bin` and copies the `.ap.meta` into the ks4 folder for the run (KS4 leaves them in
   the parent), then removes them.
 
+- **[DONE] Export waveforms, second cell-type classifier (Bombcell), ACG cleanup.**
+  - **Export waveforms** toolbar button: off-thread batch export of every good unit's compact
+    waveform-on-geometry + Hz ACG card to per-unit PNGs and one `good_units_waveform_acg.pdf`
+    (`unit_figures.unit_waveform_acg_figure` + a `_export_good_unit_figures` worker helper).
+  - **Bombcell cell-type classifier** added alongside C4 in the renamed **Cell Types** panel: a Method
+    selector (C4 / Bombcell) + Brain-region selector (Cortex / Striatum). [bombcell_classify.py](neuropyguin/bombcell_classify.py)
+    computes bombcell ephys properties (cached per dp, ~1 min, runs in the MAIN env - threshold-based, no
+    laplace) and classifies (cortex: Wide/Narrow-spiking; striatum: MSN/FSI/TAN/UIN). `unit_figures.bombcell_celltype_figure`
+    renders a colored per-unit strip + the feature scatter with the threshold lines. Verified on real units.
+  - **CSV + TSV output** for both classifiers: `cell_types_<method>.csv` (full fields) and a phy-compatible
+    `cluster_<method>_cell_type.tsv` written into the dataset folder on each run.
+  - **ACG decorations removed** (user preference): the shaded refractory band and the vertical dashed
+    (0-lag / +/-2 ms) lines are gone from every autocorrelogram (unit card, export card, npyx ACG grid, CCG-grid
+    diagonal); the off-diagonal CCG keeps its 0-lag reference line.
+  - **Advanced** trimmed to the 4 analyses that actually work on this data (3D ACG, 3D CCG, Stark-Abeles
+    monosynaptic significance, cross-ISI); `scaled_acg` and `STTC` are broken in vendored npyx 4.2.0 for this
+    dataset (numpy/neo type bugs) and were removed from the menu.
+  - **README** expanded with the Post Processing feature list + a "Cell-type classification (C4 and Bombcell)"
+    section incl. the isolated `npyx_c4` env setup; real per-tab use-case screenshots regenerated via
+    `tools/readme_screens.py`.
+
 ### Remaining optional polish (non-blocking)
 - Unit Basics IFR overlay on its own right-hand Hz axis (currently scaled into the raster).
 - Log-spaced ISI x-axis with a refractory marker; Raw Explorer uV scale bar.

@@ -44,6 +44,81 @@ def _is_bombcell_good_label(value: object) -> bool:
     return normalized in {"good", "non_soma", "non_soma_good", "nonsoma", "nonsomagood"}
 
 
+def _export_good_unit_figures(dataset, good_units, out_dir, dark=False, progress_cb=None) -> dict:
+    """Export per-unit waveform + ACG figures for every good unit (PNG + one PDF).
+
+    For each unit in ``good_units`` this builds the npyx-style two-panel card via
+    :func:`neuropyguin.unit_figures.unit_waveform_acg_figure`, writes it as
+    ``out_dir/unit_<id>_waveform_acg.png`` (dpi 150) and appends the same figure
+    as a page of a single multi-page PDF ``out_dir/good_units_waveform_acg.pdf``.
+    Each figure is closed immediately after use so memory stays bounded across
+    the (potentially ~77-unit) batch.
+
+    Designed to run off the GUI thread (it reads the AP binary per unit for the
+    +/-SEM waveform, so it takes minutes). ``progress_cb(i, n)`` is invoked
+    periodically with the number of units processed so far and the total.
+
+    Returns a dict ``{"n", "pdf", "png_dir", "error"}``. Per-unit render/save
+    errors are caught and logged into the result's ``error`` only when they are
+    fatal (e.g. the figure module is missing); individual failing units are
+    skipped so the batch keeps going.
+    """
+    # Lazy imports so a momentarily-missing dependency yields a clean error dict
+    # rather than crashing the worker / import of this module.
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=False)
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        from .. import unit_figures
+    except Exception as exc:  # noqa: BLE001
+        return {"n": 0, "pdf": None, "png_dir": str(out_dir), "error": f"export dependencies unavailable: {exc}"}
+
+    out_path = Path(out_dir)
+    units = [int(u) for u in good_units]
+    n = len(units)
+    if n == 0:
+        return {"n": 0, "pdf": None, "png_dir": str(out_path), "error": "No good units to export."}
+
+    try:
+        out_path.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"n": 0, "pdf": None, "png_dir": str(out_path), "error": f"Cannot create output folder: {exc}"}
+
+    pdf_path = out_path / "good_units_waveform_acg.pdf"
+    written = 0
+    try:
+        with PdfPages(str(pdf_path)) as pdf:
+            for i, unit in enumerate(units):
+                try:
+                    fig = unit_figures.unit_waveform_acg_figure(dataset, unit, dark=bool(dark))
+                except Exception:
+                    # A single bad unit must not abort the whole batch.
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(i + 1, n)
+                        except Exception:
+                            pass
+                    continue
+                try:
+                    fig.savefig(str(out_path / f"unit_{int(unit)}_waveform_acg.png"), dpi=150)
+                    pdf.savefig(fig)
+                    written += 1
+                except Exception:
+                    pass
+                finally:
+                    plt.close(fig)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(i + 1, n)
+                    except Exception:
+                        pass
+    except Exception as exc:  # noqa: BLE001
+        return {"n": written, "pdf": str(pdf_path), "png_dir": str(out_path), "error": f"{type(exc).__name__}: {exc}"}
+
+    return {"n": written, "pdf": str(pdf_path), "png_dir": str(out_path), "error": None}
+
+
 class PostProcessingTab(QtWidgets.QWidget):
     """Qt widget that hosts the post-processing analysis pages.
 
@@ -67,6 +142,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._show_grid = True
         self._busy = False
         self._c4_running = False
+        self._exporting_waveforms = False
         self._plot_detached = False
         self._plot_dialog: Optional[QtWidgets.QDialog] = None
         self._right_panel_layout: Optional[QtWidgets.QVBoxLayout] = None
@@ -105,18 +181,25 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_load = QtWidgets.QPushButton("Load dataset")
         self.btn_export = QtWidgets.QPushButton("Export plotted data")
         self.btn_export_units = QtWidgets.QPushButton("Export units to H5")
+        self.btn_export_waveforms = QtWidgets.QPushButton("Export waveforms")
+        self.btn_export_waveforms.setToolTip(
+            "Export every good unit's waveform + ACG figure to PNGs and one multi-page PDF "
+            "(runs off the GUI thread; can take a few minutes)."
+        )
         self.btn_detach_plots = QtWidgets.QPushButton("Detach plots")
         self.btn_detach_plots.setCheckable(True)
         self.btn_browse.setProperty("role", "secondary")
         self.btn_load.setProperty("role", "primary")
         self.btn_export.setProperty("role", "ghost")
         self.btn_export_units.setProperty("role", "secondary")
+        self.btn_export_waveforms.setProperty("role", "secondary")
         self.btn_detach_plots.setProperty("role", "ghost")
         top.addWidget(self.ed_folder, 1)
         top.addWidget(self.btn_browse)
         top.addWidget(self.btn_load)
         top.addWidget(self.btn_export)
         top.addWidget(self.btn_export_units)
+        top.addWidget(self.btn_export_waveforms)
         top.addWidget(self.btn_detach_plots)
 
         body = QtWidgets.QSplitter()
@@ -474,27 +557,34 @@ class PostProcessingTab(QtWidgets.QWidget):
         f_npyx.addRow("Description", self.txt_npyx_desc)
         _add_settings_page(t_npyx, "Advanced")
 
-        # Cell Types (C4): a button-driven cerebellar cell-type classifier that
-        # runs in an isolated subprocess env (~1 min) off the GUI thread.
+        # Cell Types: a button-driven cell-type classifier. Two methods are
+        # offered. "C4" is the NeuroPyxels cerebellar CNN ensemble (isolated env,
+        # ~1 min). "Bombcell" is a threshold-based region-specific classifier that
+        # runs in this env (~1 min to compute ephys properties). Both run off the
+        # GUI thread.
         t_c4 = QtWidgets.QWidget()
         f_c4 = _compact_form(QtWidgets.QFormLayout(t_c4))
-        self.lbl_c4_desc = QtWidgets.QLabel(
-            "NeuroPyxels C4 cerebellar cell-type classifier "
-            "(GoC / MLI / MFB / PkC_ss / PkC_cs). Runs in an isolated environment; "
-            "cerebellum-trained, so labels are indicative on other regions."
-        )
+        self.cb_celltype_method = QtWidgets.QComboBox()
+        self.cb_celltype_method.addItem("C4 (cerebellar)", userData="c4")
+        self.cb_celltype_method.addItem("Bombcell (cortex/striatum)", userData="bombcell")
+        self.cb_celltype_region = QtWidgets.QComboBox()
+        self.cb_celltype_region.addItem("Cortex", userData="cortex")
+        self.cb_celltype_region.addItem("Striatum", userData="striatum")
+        self.lbl_c4_desc = QtWidgets.QLabel()
         self.lbl_c4_desc.setWordWrap(True)
         self.lbl_c4_desc.setObjectName("psthMetaLabel")
         self.sp_c4_threshold = QtWidgets.QDoubleSpinBox()
         self.sp_c4_threshold.setRange(0.0, 50.0)
         self.sp_c4_threshold.setSingleStep(0.5)
         self.sp_c4_threshold.setValue(2.0)
-        self.btn_c4_run = QtWidgets.QPushButton("Run C4 classifier")
+        self.btn_c4_run = QtWidgets.QPushButton("Run classifier")
         self.btn_c4_run.setProperty("role", "primary")
+        f_c4.addRow("Method", with_help(self.cb_celltype_method, "C4: NeuroPyxels cerebellar CNN ensemble (isolated env). Bombcell: threshold-based region-specific classes (runs in this env)."))
+        f_c4.addRow("Brain region", with_help(self.cb_celltype_region, "Region-specific Bombcell classes (cortex or striatum). Only used by the Bombcell method."))
         f_c4.addRow(self.lbl_c4_desc)
-        f_c4.addRow("Confidence threshold", with_help(self.sp_c4_threshold, "Minimum confidence ratio for a confident C4 call; lower values keep more predictions."))
+        f_c4.addRow("Confidence threshold", with_help(self.sp_c4_threshold, "C4 only: minimum confidence ratio for a confident call; lower values keep more predictions."))
         f_c4.addRow(self.btn_c4_run)
-        _add_settings_page(t_c4, "Cell Types (C4)")
+        _add_settings_page(t_c4, "Cell Types")
 
         self.page_progress = QtWidgets.QProgressBar()
         self.page_progress.setRange(0, 100)
@@ -586,7 +676,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.view_tabs.addTab(psth_view, "Condition PSTH")
         self.view_tabs.addTab(net_view, "Network")
         self.view_tabs.addTab(npyx_view, "Advanced")
-        self.view_tabs.addTab(c4_view, "Cell Types (C4)")
+        self.view_tabs.addTab(c4_view, "Cell Types")
 
         # The settings panel: the per-analysis form stack with a small header,
         # docked on the right of the figure and collapsible via a chevron.
@@ -669,6 +759,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_load.clicked.connect(self._load_dataset)
         self.btn_export.clicked.connect(self._export_plotted_data)
         self.btn_export_units.clicked.connect(self._export_units_file)
+        self.btn_export_waveforms.clicked.connect(self._export_waveform_figures)
         self.btn_detach_plots.toggled.connect(self._toggle_plot_detach)
         self.btn_settings_toggle.clicked.connect(self._toggle_settings_panel)
         self.list_units.itemSelectionChanged.connect(self._on_units_selection_changed)
@@ -696,7 +787,8 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_psth_show.clicked.connect(self._show_psth)
         self.btn_net_compute.clicked.connect(self._compute_network)
         self.btn_net_show.clicked.connect(self._show_network)
-        self.btn_c4_run.clicked.connect(self._run_c4)
+        self.btn_c4_run.clicked.connect(self._run_celltypes)
+        self.cb_celltype_method.currentIndexChanged.connect(self._update_celltype_method_ui)
         self.cb_npyx_method.currentTextChanged.connect(self._refresh_current_page)
         self.cb_npyx_method.currentIndexChanged.connect(self._update_npyx_method_ui)
         self.tbl_npyx_params.itemChanged.connect(self._on_npyx_params_changed)
@@ -722,6 +814,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._apply_plot_style()
         self._update_psth_trial_status()
         self._update_npyx_method_ui()
+        self._update_celltype_method_ui()
         # Sync the settings stack to the initial analysis and restore the
         # last-used settings-panel visibility (default = shown).
         self._sync_settings_page(self.analysis_tabs.currentIndex())
@@ -1428,8 +1521,10 @@ class PostProcessingTab(QtWidgets.QWidget):
         normalize = self.cb_corr_norm.currentText()
         style = self.cb_corr_style.currentText()
         dark = self._plot_theme == "Dark"
-        max_units = 6
-        plot_units = units[:max_units]
+        # ACG is one panel per unit, so show all selected (generous safety cap).
+        # CCG is an N x N grid (quadratic), so keep a smaller cap to stay legible.
+        cap = 64 if mode == "ACG" else 8
+        plot_units = units[:cap]
 
         self._set_progress(20)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
@@ -1439,8 +1534,8 @@ class PostProcessingTab(QtWidgets.QWidget):
             else:
                 fig = ccg_grid_figure(dp, plot_units, cbin=cbin, cwin=cwin, fs=fs, normalize=normalize, style=style, dark=dark)
             self.corr_npyx.show_figure(fig)
-            if len(units) > max_units:
-                self._log(f"Correlogram: showing the first {max_units} of {len(units)} selected units for legibility.")
+            if len(units) > len(plot_units):
+                self._log(f"Correlogram ({mode}): showing {len(plot_units)} of {len(units)} selected units (cap {cap}).")
         except Exception as exc:
             self.corr_npyx.show_message(f"NeuroPyxels correlogram failed: {exc}")
             self._log(f"Correlogram render error: {exc}")
@@ -1578,45 +1673,98 @@ class PostProcessingTab(QtWidgets.QWidget):
             return
         self._visualize_network(r)
 
-    def _show_c4_idle(self) -> None:
-        """C4 page render: show the last result if present, else an instruction."""
-        if self._c4_running:
-            return
-        result = self.results.get("c4")
-        if result:
-            self._render_c4(result)
+    def _celltype_method(self) -> str:
+        """Return the selected cell-type method key ('c4' or 'bombcell')."""
+        data = self.cb_celltype_method.currentData()
+        return str(data) if data else "c4"
+
+    def _celltype_region(self) -> str:
+        """Return the selected Bombcell brain region key ('cortex' or 'striatum')."""
+        data = self.cb_celltype_region.currentData()
+        return str(data) if data else "cortex"
+
+    def _update_celltype_method_ui(self) -> None:
+        """Sync the Cell Types description and which controls are relevant per method.
+
+        The region combo is greyed for C4 (it only applies to Bombcell); the
+        confidence-threshold spinbox is greyed for Bombcell (C4-only). The
+        description label is rewritten to match the chosen method.
+        """
+        method = self._celltype_method()
+        is_bombcell = method == "bombcell"
+        self.cb_celltype_region.setEnabled(is_bombcell)
+        self.sp_c4_threshold.setEnabled(not is_bombcell)
+        if is_bombcell:
+            self.lbl_c4_desc.setText(
+                "Bombcell threshold-based, region-specific cell types. Cortex: "
+                "Wide vs Narrow (FS) from waveform duration. Striatum: MSN / FSI / TAN / "
+                "UIN from waveform duration, post-spike suppression and long-ISI proportion. "
+                "Runs in this environment (~1 min to compute ephys properties). "
+                "The confidence threshold is ignored for this method."
+            )
         else:
-            self.c4_view.show_message(
-                "NeuroPyxels C4 cell-type classifier.\n"
-                "Select units and click 'Run C4 classifier' (this can take ~1 min)."
+            self.lbl_c4_desc.setText(
+                "NeuroPyxels C4 cerebellar cell-type classifier "
+                "(GoC / MLI / MFB / PkC_ss / PkC_cs), a CNN ensemble run in an isolated "
+                "environment (~1 min). Cerebellum-trained, so labels are indicative on "
+                "other regions."
             )
 
-    def _render_c4(self, result: Dict[str, object]) -> None:
-        """Render a C4 result dict into the C4 canvas (graceful on errors)."""
+    def _show_c4_idle(self) -> None:
+        """Cell Types page render: show the last result if present, else an instruction."""
+        if self._c4_running:
+            return
+        result = self.results.get("celltypes")
+        if result:
+            self._render_celltypes(result)
+        else:
+            self.c4_view.show_message(
+                "Cell-type classifier.\n"
+                "Choose a Method (C4 or Bombcell), select units, then click 'Run classifier' "
+                "(this can take ~1 min)."
+            )
+
+    def _render_celltypes(self, result: Dict[str, object]) -> None:
+        """Render a cell-type result dict into the canvas (graceful on errors).
+
+        Branches on the result's ``method`` so a stored Bombcell result renders
+        via ``bombcell_celltype_figure`` and a C4 result via ``c4_figure``.
+        """
         try:
             from .. import unit_figures  # lazy import
         except Exception as exc:  # noqa: BLE001
-            self.c4_view.show_message(f"C4 figure module unavailable: {exc}")
+            self.c4_view.show_message(f"Cell-type figure module unavailable: {exc}")
             return
+        method = str(result.get("method", "")) if isinstance(result, dict) else ""
         try:
-            fig = unit_figures.c4_figure(result, dark=(self._plot_theme == "Dark"))
+            if method == "bombcell":
+                fig = unit_figures.bombcell_celltype_figure(result, dark=(self._plot_theme == "Dark"))
+            else:
+                fig = unit_figures.c4_figure(result, dark=(self._plot_theme == "Dark"))
             self.c4_view.show_figure(fig)
         except Exception as exc:  # noqa: BLE001
-            self.c4_view.show_message(f"C4 figure failed: {exc}")
-            self._log(f"C4 render error: {exc}")
+            self.c4_view.show_message(f"Cell-type figure failed: {exc}")
+            self._log(f"Cell-type render error: {exc}")
 
-    def _run_c4(self) -> None:
-        """Run the C4 classifier off the GUI thread via FunctionWorker."""
+    def _run_celltypes(self) -> None:
+        """Dispatch the Run-classifier button to the selected method (off-thread)."""
         if self._c4_running:
             return
         if self.dataset is None:
-            self._log("C4: load a dataset first.")
+            self._log("Cell types: load a dataset first.")
             return
         units = self._selected_units()
         if not units:
-            self._log("C4: select one or more units to classify.")
-            self.c4_view.show_message("Select one or more units, then click 'Run C4 classifier'.")
+            self._log("Cell types: select one or more units to classify.")
+            self.c4_view.show_message("Select one or more units, then click 'Run classifier'.")
             return
+        if self._celltype_method() == "bombcell":
+            self._run_bombcell_celltypes(units)
+        else:
+            self._run_c4(units)
+
+    def _run_c4(self, units: list[int]) -> None:
+        """Run the C4 classifier off the GUI thread via FunctionWorker."""
         try:
             from ..workers import FunctionWorker
             from ..c4_runner import run_c4_classifier
@@ -1641,12 +1789,42 @@ class PostProcessingTab(QtWidgets.QWidget):
         worker.signals.finished.connect(self._on_c4_finished)
         self.pool.start(worker)
 
+    def _run_bombcell_celltypes(self, units: list[int]) -> None:
+        """Run the Bombcell region-specific cell-type classifier off the GUI thread."""
+        try:
+            from ..workers import FunctionWorker
+            from ..bombcell_classify import run_bombcell_classifier
+        except Exception as exc:  # noqa: BLE001
+            self.c4_view.show_message(f"Bombcell runner unavailable: {exc}")
+            self._log(f"Bombcell unavailable: {exc}")
+            return
+
+        region = self._celltype_region()
+        self.view_tabs.setCurrentIndex(6)
+        self._c4_running = True
+        self.btn_c4_run.setEnabled(False)
+        self.btn_c4_run.setText("Running Bombcell...")
+        self._log(f"Running bombcell cell-type classification ({region}, ~1 min)...")
+        self.c4_view.show_message(
+            f"Running the Bombcell {region} cell-type classifier...\n"
+            "Computing ephys properties can take about a minute."
+        )
+        self._set_progress(10)
+        worker = FunctionWorker(
+            run_bombcell_classifier,
+            str(self.dataset.ks_folder),
+            list(units),
+            region=region,
+        )
+        worker.signals.finished.connect(self._on_bombcell_finished)
+        self.pool.start(worker)
+
     @QtCore.Slot(dict)
     def _on_c4_finished(self, payload: Dict[str, object]) -> None:
         """GUI-thread handler for the C4 worker result."""
         self._c4_running = False
         self.btn_c4_run.setEnabled(True)
-        self.btn_c4_run.setText("Run C4 classifier")
+        self.btn_c4_run.setText("Run classifier")
         self._set_progress(100)
         result = payload.get("result") if isinstance(payload, dict) else None
         if not payload.get("ok") or not isinstance(result, dict):
@@ -1654,7 +1832,8 @@ class PostProcessingTab(QtWidgets.QWidget):
             self.c4_view.show_message(msg)
             self._log(msg)
             return
-        self.results["c4"] = result
+        result["method"] = "c4"
+        self.results["celltypes"] = result
         err = result.get("error")
         if err:
             self._log(f"C4: {err}")
@@ -1663,26 +1842,109 @@ class PostProcessingTab(QtWidgets.QWidget):
             n_skipped = len(result.get("skipped_units", []))
             model = str(result.get("model_type", "C4"))
             self._log(f"C4 classified {n_units} unit(s) with {model}; {n_skipped} skipped.")
-        self._render_c4(result)
+        self._render_celltypes(result)
         # Build a non-crashing CSV export from the result.
         try:
             units_out = [int(u) for u in result.get("units", [])]
             predicted = [str(x) for x in result.get("predicted_type", [])]
             confidence = np.asarray(result.get("confidence", []), dtype=float)
             ratio = np.asarray(result.get("confidence_ratio", []), dtype=float)
+            votes = np.asarray(result.get("model_votes", []), dtype=float)
             rows = []
             for i, u in enumerate(units_out):
                 rows.append(
                     {
-                        "unit_id": int(u),
-                        "predicted_type": predicted[i] if i < len(predicted) else "",
+                        "cluster_id": int(u),
+                        "predicted_cell_type": predicted[i] if i < len(predicted) else "",
                         "confidence": float(confidence[i]) if i < confidence.size else np.nan,
                         "confidence_ratio": float(ratio[i]) if i < ratio.size else np.nan,
+                        "model_votes": float(votes[i]) if i < votes.size else np.nan,
                     }
                 )
-            self._export_payloads["c4"] = [("cell_types_c4.csv", pd.DataFrame(rows))]
+            df = pd.DataFrame(rows)
+            self._export_payloads["c4"] = [("cell_types_c4.csv", df)]
+            if not err:
+                self._write_celltype_files(df, "c4")
         except Exception:
             self._export_payloads["c4"] = [("cell_types_c4.csv", pd.DataFrame())]
+
+    @QtCore.Slot(dict)
+    def _on_bombcell_finished(self, payload: Dict[str, object]) -> None:
+        """GUI-thread handler for the Bombcell worker result."""
+        self._c4_running = False
+        self.btn_c4_run.setEnabled(True)
+        self.btn_c4_run.setText("Run classifier")
+        self._set_progress(100)
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not payload.get("ok") or not isinstance(result, dict):
+            msg = "Bombcell classification failed (see log)."
+            self.c4_view.show_message(msg)
+            self._log(msg)
+            return
+        result.setdefault("method", "bombcell")
+        self.results["celltypes"] = result
+        region = str(result.get("region", self._celltype_region()))
+        err = result.get("error")
+        if err:
+            self.c4_view.show_message(f"Bombcell: {err}")
+            self._log(f"Bombcell: {err}")
+            return
+        n_units = len(result.get("units", []))
+        n_skipped = len(result.get("skipped_units", []))
+        self._log(f"Bombcell classified {n_units} unit(s) ({region}); {n_skipped} skipped.")
+        self._render_celltypes(result)
+        # Build the CSV export + write the result files to the dataset folder.
+        try:
+            units_out = [int(u) for u in result.get("units", [])]
+            predicted = [str(x) for x in result.get("predicted_type", [])]
+            metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
+            wf = np.asarray(metrics.get("waveform_duration_us", []), dtype=float)
+            pss = np.asarray(metrics.get("post_spike_suppression_ms", []), dtype=float)
+            pli = np.asarray(metrics.get("prop_long_isi", []), dtype=float)
+            fr = np.asarray(metrics.get("firing_rate_hz", []), dtype=float)
+            rows = []
+            for i, u in enumerate(units_out):
+                rows.append(
+                    {
+                        "cluster_id": int(u),
+                        "predicted_cell_type": predicted[i] if i < len(predicted) else "",
+                        "region": region,
+                        "waveform_duration_us": float(wf[i]) if i < wf.size else np.nan,
+                        "post_spike_suppression_ms": float(pss[i]) if i < pss.size else np.nan,
+                        "prop_long_isi": float(pli[i]) if i < pli.size else np.nan,
+                        "firing_rate_hz": float(fr[i]) if i < fr.size else np.nan,
+                    }
+                )
+            df = pd.DataFrame(rows)
+            method_tag = f"bombcell_{region}"
+            self._export_payloads["c4"] = [(f"cell_types_{method_tag}.csv", df)]
+            self._write_celltype_files(df, method_tag)
+        except Exception as exc:  # noqa: BLE001
+            self._export_payloads["c4"] = [("cell_types_bombcell.csv", pd.DataFrame())]
+            self._log(f"Bombcell CSV/TSV build error: {exc}")
+
+    def _write_celltype_files(self, df: "pd.DataFrame", method: str) -> None:
+        """Write a CSV + phy-compatible TSV of cell-type predictions to the dataset folder.
+
+        ``df`` must carry ``cluster_id`` and ``predicted_cell_type`` columns plus
+        any method-specific extras (already present for both C4 and Bombcell). The
+        CSV keeps every column; the TSV is the two-column phy-friendly subset
+        named ``cluster_<method>_cell_type.tsv``. Failures are logged, never
+        raised, so a write error cannot crash the GUI.
+        """
+        if self.dataset is None or df is None or df.empty:
+            return
+        try:
+            folder = Path(self.dataset.ks_folder)
+            csv_path = folder / f"cell_types_{method}.csv"
+            tsv_path = folder / f"cluster_{method}_cell_type.tsv"
+            df.to_csv(csv_path, index=False)
+            tsv_df = df[["cluster_id", "predicted_cell_type"]].copy()
+            tsv_df.to_csv(tsv_path, sep="\t", index=False)
+            self._log(f"Cell types: wrote {csv_path}")
+            self._log(f"Cell types: wrote {tsv_path}")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Cell types: failed to write result files: {exc}")
 
     def _visualize_basic(self) -> None:
         """Render the npyx-style Unit Basics composite as a matplotlib canvas."""
@@ -2303,7 +2565,13 @@ class PostProcessingTab(QtWidgets.QWidget):
                 # Index matrices read top-to-bottom; coordinate images keep natural y.
                 if not has_coords:
                     plot.getViewBox().invertY(True)
-                self._annotate_image_values(plot, mat)
+                    # Per-cell value labels only make sense for small index matrices,
+                    # not coordinate images (acg_3D/ccg_3D); and guard the pyqtgraph
+                    # auto-range hiccup that adding many TextItems can trigger.
+                    try:
+                        self._annotate_image_values(plot, mat)
+                    except Exception:
+                        pass
                 try:
                     levels = img.getLevels()
                     cbar = pg.ColorBarItem(values=levels, colorMap=cm, label=str(res.get("cbar_label", "")), width=12)
@@ -2501,8 +2769,99 @@ class PostProcessingTab(QtWidgets.QWidget):
         finally:
             self._busy = False
 
+    def _export_waveform_figures(self) -> None:
+        """Export every good unit's waveform + ACG figure off the GUI thread.
+
+        Builds one PNG per good unit plus a single multi-page PDF, all written to
+        a user-chosen folder. The work reads the AP binary for each unit's +/-SEM
+        waveform (~minutes for the full good-unit set), so it runs on the thread
+        pool with periodic progress logging; the button is disabled meanwhile.
+        """
+        if self._exporting_waveforms:
+            return
+        if self.dataset is None:
+            self._log("Export waveforms: load a dataset first.")
+            return
+        good_units = sorted(self._good_unit_ids())
+        if not good_units:
+            self._log("Export waveforms: no good units under the current good-unit source.")
+            return
+        try:
+            from ..workers import FunctionWorker
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Export waveforms: worker unavailable: {exc}")
+            return
+
+        start = self.settings.value("paths/last_folder", str(self.dataset.ks_folder))
+        out_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select folder for waveform + ACG figures", str(start)
+        )
+        if not out_dir:
+            return
+        self.settings.setValue("paths/last_folder", str(out_dir))
+
+        n = len(good_units)
+        self._exporting_waveforms = True
+        self.btn_export_waveforms.setEnabled(False)
+        self.btn_export_waveforms.setText("Exporting...")
+        self._set_progress(0)
+        self._log(
+            f"Export waveforms: rendering {n} good-unit figure(s) to {out_dir} "
+            "(reads the AP binary per unit; this can take a few minutes)..."
+        )
+
+        # progress_cb runs on the worker thread, so it must only emit a Qt signal
+        # (delivered queued to the GUI thread) and never touch widgets directly.
+        worker = FunctionWorker(
+            _export_good_unit_figures,
+            self.dataset,
+            good_units,
+            str(out_dir),
+            dark=(self._plot_theme == "Dark"),
+        )
+
+        progress_signal = worker.signals.progress
+
+        def _progress_cb(i: int, total: int) -> None:
+            pct = int(100 * float(i) / float(max(total, 1)))
+            try:
+                progress_signal.emit(max(0, min(100, pct)))
+            except RuntimeError:
+                # Receiver/source may already be gone during shutdown.
+                pass
+
+        worker.kwargs["progress_cb"] = _progress_cb
+        worker.signals.progress.connect(self._on_waveform_export_progress)
+        worker.signals.finished.connect(self._on_waveform_export_finished)
+        self.pool.start(worker)
+
+    @QtCore.Slot(int)
+    def _on_waveform_export_progress(self, pct: int) -> None:
+        """GUI-thread progress handler for the waveform export worker."""
+        self._set_progress(int(pct))
+
+    @QtCore.Slot(dict)
+    def _on_waveform_export_finished(self, payload: Dict[str, object]) -> None:
+        """GUI-thread handler for the waveform export worker result."""
+        self._exporting_waveforms = False
+        self.btn_export_waveforms.setEnabled(True)
+        self.btn_export_waveforms.setText("Export waveforms")
+        self._set_progress(100)
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not payload.get("ok") or not isinstance(result, dict):
+            self._log("Export waveforms: failed (see log).")
+            return
+        err = result.get("error")
+        if err:
+            self._log(f"Export waveforms: {err}")
+            if not result.get("n"):
+                return
+        n = int(result.get("n", 0))
+        pdf = result.get("pdf")
+        self._log(f"Exported {n} good-unit figures to {pdf}")
+
     def is_busy(self) -> bool:
         """Return True while a compute/export task is running on this tab."""
-        return bool(self._busy)
+        return bool(self._busy or self._c4_running or self._exporting_waveforms)
 
 

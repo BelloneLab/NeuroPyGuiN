@@ -141,6 +141,29 @@ def main() -> int:
         suffix = "7_celltypes" if pname == "celltypes" else f"{idx}_{pname}"
         _grab(tab, f"{suffix}.png", app)
 
+    # Extra: Cell Types page switched to the Bombcell method + a region. This must
+    # NOT block on the ~1 min bombcell run: just flip the controls and grab the
+    # idle / needs-run message so the new selector is visible in the screenshot.
+    try:
+        tab.analysis_tabs.setCurrentIndex(6)
+        _select_units(tab, DEMO_UNITS)
+        _pump(app, 300)
+        m = tab.cb_celltype_method.findData("bombcell")
+        if m >= 0:
+            tab.cb_celltype_method.setCurrentIndex(m)
+        rg = tab.cb_celltype_region.findData("cortex")
+        if rg >= 0:
+            tab.cb_celltype_region.setCurrentIndex(rg)
+        _pump(app, 400)
+        _grab(tab, "7b_celltypes_bombcell.png", app)
+        # Leave the method back on C4 so any later captures are consistent.
+        c4i = tab.cb_celltype_method.findData("c4")
+        if c4i >= 0:
+            tab.cb_celltype_method.setCurrentIndex(c4i)
+        _pump(app, 200)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  !! bombcell celltypes capture error: {exc}")
+
     # Extra: Correlogram in CCG-grid mode (the canonical npyx ACG/CCG grid).
     try:
         tab.analysis_tabs.setCurrentIndex(2)

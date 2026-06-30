@@ -405,7 +405,7 @@ def _ensure_npyx_plot():
 
 
 def _draw_acg(ax, dataset, units, theme: _Theme, *, bin_ms, win_ms):
-    """Hertz-normalised ACG with a shaded 2 ms refractory band and a 0-lag dashed line."""
+    """Hertz-normalised autocorrelogram (clean bars; no refractory band or 0-lag marker)."""
     _style_axes(ax, theme)
     primary = int(units[0])
     nplt = _ensure_npyx_plot()
@@ -446,11 +446,6 @@ def _draw_acg(ax, dataset, units, theme: _Theme, *, bin_ms, win_ms):
     ax.set_xlabel("lag (ms)")
     ax.set_ylabel("firing rate (Hz)")
     ax.set_title("Autocorrelogram", color=theme.fg, fontsize=8.5)
-    # Refractory band + zero-lag marker, drawn on top of the bars.
-    ax.axvspan(-2.0, 2.0, color=theme.refband, alpha=0.22, lw=0, zorder=4)
-    for xv in (-2.0, 2.0):
-        ax.axvline(xv, color=theme.refband, ls="-", lw=0.6, alpha=0.55, zorder=4)
-    ax.axvline(0.0, color=theme.fg, ls="--", lw=0.7, alpha=0.6, zorder=5)
 
 
 # --------------------------------------------------------------------------- #
@@ -1506,5 +1501,304 @@ def c4_figure(results, *, dark=False):
 
     title_color = "#ffffff" if theme.dark else theme.fg
     fig.suptitle(f"C4 cell-type classification   |   {n} units   |   model: {model_type}",
+                 color=title_color, fontsize=12, fontweight="bold", x=0.012, ha="left")
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Public: single-unit waveform + ACG card (one per unit, for PDF batches)
+# --------------------------------------------------------------------------- #
+
+def unit_waveform_acg_figure(dataset, unit, *, acg_bin_ms=0.5, acg_win_ms=100.0,
+                             dark=False):
+    """Return a clean two-panel card for ONE unit, sized for a PDF page.
+
+    Left panel: the mean waveform laid out on the real probe geometry (peak channel
+    plus its physical neighbours from ``channel_positions``), with a uV/ms scalebar
+    and a shaded +/-SEM band built from real spike snippets read off the AP binary.
+    This reuses :func:`_draw_waveform_geometry` (the exact drawer used by
+    ``unit_basics_figure``), so a unit with no template waveform degrades to a clean
+    "no template waveform" note while the ACG is still drawn.
+
+    Right panel: the Hertz-normalised autocorrelogram with a shaded 2 ms refractory
+    band and a dashed zero-lag line, via :func:`_draw_acg` (npyx ``plot_acg`` path
+    with an engine-``correlogram`` fallback at
+    ``bin_ms=acg_bin_ms, win_ms=acg_win_ms``).
+
+    The bold figure title reads
+    ``Unit {id} | peak ch {ch} | {n_spikes} spikes | {mean_fr:.1f} Hz``.
+
+    The figure uses ``constrained_layout`` (no overlapping titles), top/right
+    despining, and the shared white / dark theme. It is fully self-contained so the
+    caller can build one per unit in a batch loop and write each to a PDF page.
+    """
+    theme = _Theme(dark)
+    unit = int(unit)
+
+    fig = Figure(figsize=(8.5, 4.2), dpi=110, constrained_layout=True)
+    fig.patch.set_facecolor(theme.bg)
+    fig.set_constrained_layout_pads(w_pad=0.07, h_pad=0.12, wspace=0.07)
+    # Reserve a top band for the bold title and side margins so neither the title
+    # text nor the ACG's right spine is clipped on this short single-row canvas
+    # (constrained_layout does not reserve suptitle space on its own here).
+    try:
+        fig.get_layout_engine().set(rect=(0.012, 0.0, 0.976, 0.88))
+    except Exception:
+        pass
+
+    # Slightly favour the waveform panel; it carries the multichannel geometry.
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.15, 1.0])
+    ax_wf = fig.add_subplot(gs[0, 0])
+    ax_acg = fig.add_subplot(gs[0, 1])
+
+    # Left: waveform on probe geometry (single unit -> mean +/- SEM, peak highlight).
+    _draw_waveform_geometry(ax_wf, dataset, [unit], theme)
+    # Right: Hertz ACG with refractory band + zero-lag line.
+    _draw_acg(ax_acg, dataset, [unit], theme, bin_ms=acg_bin_ms, win_ms=acg_win_ms)
+    # npyx's plot_acg (prettify) resets the figure-level facecolor to white; re-assert
+    # the theme background so the dark look (and a white title) survive.
+    fig.patch.set_facecolor(theme.bg)
+
+    # Title metrics.
+    t = dataset.unit_spike_times_s(unit)
+    dur = _session_duration_s(dataset)
+    n_spk = int(t.size)
+    mean_fr = (n_spk / dur) if dur > 0 else 0.0
+    _, peak_ch = _peak_channel(dataset, unit)
+    peak_str = "n/a" if peak_ch is None else str(peak_ch)
+    title_color = "#ffffff" if theme.dark else theme.fg
+    fig.suptitle(
+        f"Unit {unit}  |  peak ch {peak_str}  |  {n_spk:,} spikes  |  {mean_fr:.1f} Hz",
+        color=title_color, fontsize=11, fontweight="bold", x=0.012, y=0.955,
+        ha="left", va="center",
+    )
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Public: Bombcell region-specific cell-type classification
+# --------------------------------------------------------------------------- #
+
+# Fixed, distinct colours per Bombcell class. "Unknown" is always grey. Chosen from
+# the same colorblind-aware family as ``_UNIT_COLORS`` so the cards read on white
+# and dark, and so the strip + scatter share one legend.
+_BOMBCELL_GREY = "#9aa3b0"
+_BOMBCELL_CORTEX_COLORS = {
+    "Wide-spiking": "#0072B2",   # blue  (broad / regular-spiking, putative pyramidal)
+    "Narrow-spiking": "#D55E00",  # vermillion (fast-spiking, putative interneuron)
+    "Unknown": _BOMBCELL_GREY,
+}
+_BOMBCELL_STRIATUM_COLORS = {
+    "MSN": "#0072B2",   # blue  - medium spiny neuron
+    "FSI": "#D55E00",   # vermillion - fast-spiking interneuron
+    "TAN": "#009E73",   # bluish green - tonically active (cholinergic)
+    "UIN": "#CC79A7",   # reddish purple - unidentified interneuron
+    "Unknown": _BOMBCELL_GREY,
+}
+
+
+def _bombcell_palette(region: str) -> dict:
+    return (_BOMBCELL_STRIATUM_COLORS if str(region).lower() == "striatum"
+            else _BOMBCELL_CORTEX_COLORS)
+
+
+def _bombcell_color_for(label: str, palette: dict, fallback_idx: int) -> str:
+    if label in palette:
+        return palette[label]
+    if str(label).lower() in ("unknown", "unlabelled", "unlabeled", "none", "na", "n/a"):
+        return _BOMBCELL_GREY
+    return _UNIT_COLORS[fallback_idx % len(_UNIT_COLORS)]
+
+
+def _bombcell_legend(ax_leg, class_names, class_color, theme: _Theme, *, title="cell type"):
+    ax_leg.axis("off")
+    handles = [mpatches.Patch(facecolor=class_color.get(c, _BOMBCELL_GREY),
+                              edgecolor="none", label=c) for c in class_names]
+    if not handles:
+        return
+    leg = ax_leg.legend(handles=handles, loc="center left", frameon=False,
+                        fontsize=8, handlelength=1.0, title=title,
+                        labelspacing=0.5, borderaxespad=0.1)
+    leg.get_title().set_color(theme.fg)
+    leg.get_title().set_fontsize(8.5)
+    for txt in leg.get_texts():
+        txt.set_color(theme.fg)
+
+
+def _bombcell_strip(ax, units, predicted, class_color, theme: _Theme):
+    """Per-unit coloured strip (one bar per unit) annotated with id + predicted label."""
+    _style_axes(ax, theme)
+    n = len(units)
+    xpos = np.arange(n)
+    colors = [class_color.get(p, _BOMBCELL_GREY) for p in predicted]
+    ax.bar(xpos, np.ones(n), color=colors, edgecolor=theme.bg, linewidth=0.6,
+           width=0.92, zorder=3)
+    ax.set_ylim(0, 1.0)
+    ax.set_xlim(-0.6, n - 0.4)
+    ax.set_yticks([])
+    ax.spines["left"].set_visible(False)
+    ax.set_xticks(xpos)
+    ax.set_xticklabels([f"u{u}" for u in units], fontsize=6.5, color=theme.fg,
+                       rotation=90)
+    ax.set_title("Units by predicted cell type", color=theme.fg, fontsize=9.5)
+    # Predicted label printed inside each bar (vertical, dark text reads on every hue).
+    for x, p in zip(xpos, predicted):
+        ax.text(x, 0.5, p, ha="center", va="center", fontsize=6,
+                color="#15181d", rotation=90, zorder=5)
+
+
+def _bombcell_scatter(ax, x, y, predicted, class_color, theme: _Theme, *,
+                      xlabel, ylabel, vlines=(), hlines=(), log_y=False, title=""):
+    """One feature scatter coloured by predicted type, with dashed threshold lines."""
+    _style_axes(ax, theme)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    colors = [class_color.get(p, _BOMBCELL_GREY) for p in predicted]
+    if log_y:
+        ax.set_yscale("log")
+    # Threshold guide lines first (behind the points).
+    for xv, lab in vlines:
+        ax.axvline(xv, color=theme.muted, ls="--", lw=0.9, alpha=0.85, zorder=1)
+        ax.text(xv, 1.0, f" {lab}", transform=ax.get_xaxis_transform(),
+                ha="left", va="bottom", fontsize=6, color=theme.muted, rotation=0)
+    for yv, lab in hlines:
+        ax.axhline(yv, color=theme.muted, ls="--", lw=0.9, alpha=0.85, zorder=1)
+        ax.text(1.0, yv, f"{lab} ", transform=ax.get_yaxis_transform(),
+                ha="right", va="bottom", fontsize=6, color=theme.muted)
+    ax.scatter(x, y, s=34, c=colors, edgecolors=theme.fg, linewidths=0.45,
+               alpha=0.92, zorder=3)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    if title:
+        ax.set_title(title, color=theme.fg, fontsize=9.5)
+
+
+def bombcell_celltype_figure(results, *, dark=False):
+    """Return a matplotlib.figure.Figure of Bombcell region-specific cell types.
+
+    ``results`` is the Bombcell-runner dict::
+
+        { "units":[int...], "predicted_type":[str...], "class_names":[str...],
+          "region": "cortex"|"striatum", "method":"bombcell",
+          "metrics": {"waveform_duration_us":[float...],
+                      "post_spike_suppression_ms":[float...],
+                      "prop_long_isi":[float...], "firing_rate_hz":[float...]},
+          "skipped_units":[int...], "error": str|None }
+
+    All ``metrics`` arrays are aligned element-wise to ``units`` / ``predicted_type``.
+
+    Composes (constrained_layout, GridSpec):
+
+    - (a) a per-unit coloured strip: one bar per unit tinted by predicted cell type,
+      annotated with the unit id and its label, plus a colour -> cell-type legend.
+    - (b) the Bombcell feature scatter coloured by type:
+        * ``region == "cortex"``: ``waveform_duration_us`` (x) vs ``firing_rate_hz``
+          (y, log scale) with a dashed vertical line at the 400 us
+          Wide-vs-Narrow threshold.
+        * ``region == "striatum"``: two feature subpanels,
+          [``waveform_duration_us`` vs ``post_spike_suppression_ms``] and
+          [``waveform_duration_us`` vs ``prop_long_isi``], with dashed thresholds at
+          400 us, 40 ms and 0.1 respectively.
+
+    Fixed distinct colours per class ("Unknown" = grey). The title reads
+    ``Bombcell cell types ({region}) | {N} units`` and a discreet caption notes the
+    threshold-based MATLAB ``classifyCells`` provenance. When ``results["error"]`` is
+    set or there are no units, a clean centred message is rendered instead.
+    """
+    theme = _Theme(dark)
+    if not results or not isinstance(results, dict):
+        return _empty_message_figure(theme, "No Bombcell results to display.")
+    err = results.get("error")
+    if err:
+        return _empty_message_figure(theme, f"Bombcell classification failed:\n{err}")
+
+    units = [int(u) for u in results.get("units", [])]
+    if not units:
+        return _empty_message_figure(theme, "No Bombcell predictions to display.")
+
+    region = str(results.get("region", "cortex")).lower()
+    is_striatum = region == "striatum"
+    predicted = [str(p) for p in results.get("predicted_type", [])]
+    if len(predicted) != len(units):
+        predicted = (predicted + ["Unknown"] * len(units))[:len(units)]
+    n = len(units)
+
+    metrics = results.get("metrics", {}) or {}
+
+    def _metric(name):
+        arr = np.asarray(metrics.get(name, []), dtype=float)
+        if arr.size != n:
+            arr = np.full(n, np.nan)
+        return arr
+
+    dur_us = _metric("waveform_duration_us")
+    pss_ms = _metric("post_spike_suppression_ms")
+    long_isi = _metric("prop_long_isi")
+    fr_hz = _metric("firing_rate_hz")
+
+    palette = _bombcell_palette(region)
+    class_names = [str(c) for c in results.get("class_names", [])]
+    if not class_names:
+        # Preserve palette order, then append any extra predicted labels.
+        class_names = list(palette.keys())
+    class_color = {c: _bombcell_color_for(c, palette, i)
+                   for i, c in enumerate(class_names)}
+    for i, p in enumerate(predicted):
+        class_color.setdefault(p, _bombcell_color_for(p, palette, len(class_names) + i))
+    # Legend lists palette classes first, then any predicted label not already shown.
+    legend_classes = list(class_names)
+    for p in predicted:
+        if p not in legend_classes:
+            legend_classes.append(p)
+
+    fig = Figure(figsize=(12.4, 7.4), dpi=110, constrained_layout=True)
+    fig.patch.set_facecolor(theme.bg)
+    fig.set_constrained_layout_pads(w_pad=0.07, h_pad=0.12, wspace=0.07, hspace=0.16)
+
+    # Row 0: per-unit strip (+ legend column). Row 1: feature scatter(s).
+    # Row 2: a slim caption strip kept clear of the scatter axis labels.
+    gs = fig.add_gridspec(3, 2, width_ratios=[1.0, 0.30],
+                          height_ratios=[0.62, 1.0, 0.07])
+
+    # (a) per-unit strip + legend.
+    ax_strip = fig.add_subplot(gs[0, 0])
+    _bombcell_strip(ax_strip, units, predicted, class_color, theme)
+    ax_leg = fig.add_subplot(gs[0, 1])
+    _bombcell_legend(ax_leg, legend_classes, class_color, theme)
+
+    # (b) feature scatter(s).
+    if is_striatum:
+        gs_feat = gs[1, :].subgridspec(1, 2, wspace=0.28)
+        ax_f1 = fig.add_subplot(gs_feat[0, 0])
+        ax_f2 = fig.add_subplot(gs_feat[0, 1])
+        _bombcell_scatter(
+            ax_f1, dur_us, pss_ms, predicted, class_color, theme,
+            xlabel="waveform duration (us)", ylabel="post-spike suppression (ms)",
+            vlines=[(400.0, "400 us")], hlines=[(40.0, "40 ms")],
+            title="Duration vs post-spike suppression")
+        _bombcell_scatter(
+            ax_f2, dur_us, long_isi, predicted, class_color, theme,
+            xlabel="waveform duration (us)", ylabel="proportion long ISI",
+            vlines=[(400.0, "400 us")], hlines=[(0.1, "0.1")],
+            title="Duration vs long-ISI proportion")
+    else:
+        ax_feat = fig.add_subplot(gs[1, :])
+        _bombcell_scatter(
+            ax_feat, dur_us, fr_hz, predicted, class_color, theme,
+            xlabel="waveform duration (us)", ylabel="firing rate (Hz)",
+            vlines=[(400.0, "400 us (Wide / Narrow)")], log_y=True,
+            title="Waveform duration vs firing rate")
+
+    # (c) discreet caption strip.
+    skipped = list(results.get("skipped_units", []) or [])
+    ax_cap = fig.add_subplot(gs[2, :])
+    ax_cap.axis("off")
+    cap = ("Threshold-based region-specific classes (Bombcell / MATLAB classifyCells)."
+           + (f"  {len(skipped)} unit(s) skipped." if skipped else ""))
+    ax_cap.text(0.0, 0.2, cap, color=theme.muted, fontsize=7.5, ha="left",
+                va="center", transform=ax_cap.transAxes)
+
+    title_color = "#ffffff" if theme.dark else theme.fg
+    fig.suptitle(f"Bombcell cell types ({region})   |   {n} units",
                  color=title_color, fontsize=12, fontweight="bold", x=0.012, ha="left")
     return fig

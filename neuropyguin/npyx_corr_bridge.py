@@ -29,9 +29,7 @@ import inspect
 METHOD_LABELS: List[Tuple[str, str]] = [
     ("acg_3D", "3D ACG vs Firing Rate"),
     ("ccg_3D", "3D CCG vs Firing Rate"),
-    ("scaled_acg", "Scaled ACG (cell-type)"),
     ("StarkAbeles2009_ccg_sig", "Monosynaptic CCG significance (Stark-Abeles)"),
-    ("spike_time_tiling_coefficient", "Spike Time Tiling Coefficient (STTC)"),
     ("get_cisi", "Cross-ISI Distribution"),
 ]
 

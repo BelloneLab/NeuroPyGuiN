@@ -154,6 +154,9 @@ def _recolor_acg_axis(ax, color: str) -> None:
         style = line.get_linestyle()
         if style in ("-", "solid"):
             line.set_color(color)
+        else:
+            # Drop npyx's dashed refractory / zero-lag guide lines (user preference).
+            line.set_visible(False)
 
 
 def acg_grid_figure(
@@ -182,12 +185,12 @@ def acg_grid_figure(
         try:
             nplt.plot_acg(
                 dp, u, cbin=cbin, cwin=cwin, normalize=normalize, fs=int(fs),
-                ax=flat[i], saveFig=False, prettify=True, color=color,
+                ax=flat[i], saveFig=False, prettify=True, color=color, ref_per=False,
             )
         except TypeError:
             nplt.plot_acg(
                 dp, u, cbin=cbin, cwin=cwin, normalize=normalize, fs=int(fs),
-                ax=flat[i], saveFig=False, prettify=True, color=i % 6,
+                ax=flat[i], saveFig=False, prettify=True, color=i % 6, ref_per=False,
             )
         _recolor_acg_axis(flat[i], color)
         # Force a consistent, colour-matched per-unit title (npyx's own title is unreliable
@@ -257,8 +260,8 @@ def ccg_grid_figure(
         raise ValueError("Select at least two distinct units for a CCG grid.")
 
     n_total = len(units)
-    capped = n_total > 6
-    units = units[:6]
+    capped = n_total > 8
+    units = units[:8]
     n = len(units)
     th = _ccg_theme(dark)
 
@@ -300,12 +303,14 @@ def ccg_grid_figure(
                         va="center", color=th["muted"], fontsize=7)
             else:
                 x = lags[: y.size]
-                ax.axvline(0.0, color=th["zero"], ls="--", lw=0.7, zorder=1)
                 if i == j:
+                    # Diagonal = autocorrelogram: clean bars, no 0-lag marker.
                     color = OKABE_ITO[i % len(OKABE_ITO)]
                     ax.fill_between(x, y, step="mid", color=color, alpha=0.85,
                                     lw=0, zorder=2)
                 else:
+                    # Off-diagonal = cross-correlogram: keep the 0-lag reference.
+                    ax.axvline(0.0, color=th["zero"], ls="--", lw=0.7, zorder=1)
                     ax.fill_between(x, y, step="mid", color=th["ccg"], alpha=0.18,
                                     lw=0, zorder=2)
                     ax.plot(x, y, color=th["ccg"], lw=0.8, zorder=3)
