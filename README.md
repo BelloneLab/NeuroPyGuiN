@@ -39,7 +39,15 @@ coffee. Recorded the same neurons across several sessions? Select them, hit
 **Concatenate selected**, and sort them together so units keep the same identity
 across days.
 
+The preprocessing capture below is a real preflight from the `51543` mPFC-NAc
+SpikeGLX AP binary, with parsed metadata and the planned CatGT, Kilosort4,
+TPrime, waveform, quality-metric, and Bombcell steps visible.
+
 ![Preprocessing tab](./neuropyguin/assets/screenshots/01_preprocessing.png)
+
+The queue keeps the exact SpikeGLX AP binary visible before anything heavy runs.
+
+![Preprocessing queue](./neuropyguin/assets/screenshots/01_preprocessing_queue.png)
 
 ### 2. Curation: judge your units, fast
 
@@ -51,13 +59,78 @@ spike trains, with each session's events attached.
 
 ![Curation tab](./neuropyguin/assets/screenshots/02_curation.png)
 
+The label buckets and unit inspector stay live while you audit each cluster.
+This capture uses the preloaded Phy labels and selects unit `243` so the metrics
+table and plot overlays are visible.
+
+![Curation unit labels](./neuropyguin/assets/screenshots/04_curation_units.png)
+
 ### 3. Post Processing: see your neurons do their thing
 
-Load a curated dataset and the plots build themselves: rasters, firing rates,
-mean waveforms, autocorrelograms, ISI histograms, condition PSTHs, and network
-views. Filter to good units only, then export everything to a tidy HDF5 file.
+Load a curated dataset and the figures build themselves, in the clean
+[NeuroPyxels](https://github.com/m-beau/NeuroPyxels) style. A prominent unit list
+on the left, a collapsible settings panel on the right (one discrete arrow hides
+it so the figures go full-width), and seven analyses:
+
+- **Unit Basics** - a publication-style "unit card": mean waveform on the probe
+  geometry with a ±SEM band (how clean is this unit?), a Hertz auto-correlogram
+  with the refractory band, a log-ISI with the violation %, plus amplitude and
+  firing rate over the whole session.
+- **Raw Explorer** - stacked, filtered multichannel traces around the unit's peak
+  channel with its spikes overlaid (npyx `plot_raw_units` style).
+- **Correlogram** - the real npyx ACG/CCG grids (Hz), one colour per unit.
+- **Condition PSTH** - understands a wide binary behaviour matrix (one 0/1 column
+  per behaviour at video frame rate), turns each behaviour's 0->1 transitions into
+  event onsets, and shows mean ± SEM across units (with individual traces) or one
+  panel per unit, over a per-unit heatmap. Baseline subtraction and a trial range
+  are one click away.
+- **Network** - a hierarchically-sorted spike-count (noise) correlation matrix,
+  Okun population coupling vs depth, and a putative monosynaptic-connection matrix.
+- **Advanced** - a curated set of npyx power tools (3D ACG/CCG vs firing rate,
+  scaled ACG, Stark-Abeles monosynaptic significance, STTC, cross-ISI).
+- **Cell Types** - automatic cell-type classification (see below).
+
+Filter to good units only, **export all good-unit waveform+ACG cards to a single
+PDF (and per-unit PNGs)** with one button, or export everything to a tidy HDF5.
 
 ![Post Processing tab](./neuropyguin/assets/screenshots/03_postprocessing.png)
+
+### Cell-type classification (C4 and Bombcell)
+
+The **Cell Types** panel runs automatic cell-type classifiers and writes the
+results to a CSV plus a phy-compatible TSV (`cluster_*_cell_type.tsv`), with
+NeuroPyxels-style figures:
+
+- **C4** ([Beau et al.](https://github.com/m-beau/NeuroPyxels)) - a
+  Laplace-calibrated CNN ensemble that predicts **cerebellar** cell types
+  (GoC, MLI, MFB, PkC_ss, PkC_cs) from each unit's 3D autocorrelogram + waveform,
+  with per-class probabilities and a confidence. It is *cerebellum-trained*, so on
+  other regions the labels are indicative cell-type shapes rather than ground truth.
+- **Bombcell** ([Fabre et al.](https://github.com/Julie-Fabre/bombcell)) -
+  threshold-based, **region-specific** classification (cortex: wide- vs
+  narrow-spiking; striatum: MSN / FSI / TAN / UIN) from waveform duration,
+  post-spike suppression, proportion of long ISIs and firing rate, mirroring the
+  MATLAB `classifyCells`.
+
+**C4 runs in its own isolated environment.** C4's `laplace` dependency needs
+`torch >= 2.6`, which is incompatible with the main app env's CUDA `torch 2.5.1`
+(Kilosort). So, exactly like phy and the IBL GUI, C4 runs in a separate
+`npyx_c4` conda env via subprocess and the main env is never touched. To set it up
+once:
+
+```bash
+conda create -p <...>/.conda/envs/npyx_c4 python=3.10 -y
+<npyx_c4>/python -m pip install "npyx[c4]"
+# two post-install pins are required:
+<npyx_c4>/python -m pip install "setuptools<80"     # setuptools 81+ dropped pkg_resources (backpack needs it)
+<npyx_c4>/python -m pip install "scikit-learn<1.6"  # 1.6 removed _safe_tags (imbalanced-learn needs it)
+```
+
+The pretrained ensemble (~2.7 GB) downloads to `~/.npyx_c4_resources` on first use.
+Point the app at a non-default interpreter with the `NPYX_C4_PYTHON` environment
+variable. Never `pip install laplace-torch` into the main app env: it silently
+swaps in a CPU torch and breaks Kilosort's CUDA (restore with
+`pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124`).
 
 ### 4. Histology: put every channel on the map 🧠
 
@@ -73,6 +146,8 @@ slide scan to a per-channel brain-region map.
 
 A seven-stage rail walks you through localization, each step writing the same
 files the original tools use, so everything stays interoperable.
+
+![Histology setup](./neuropyguin/assets/screenshots/05_histology_setup.png)
 
 **Match each slice to the Allen CCF.** Dial in the coronal plane with an AP slider
 plus gentle tilts, flip between template, annotation, and overlay views, and the
@@ -97,18 +172,12 @@ region. The AP_histology path alone is enough to produce this.
 real ephys features? One button launches the unmodified IBL ephys-alignment GUI on
 your session. Save there, regenerate the channel map, done.
 
-![IBL ephys-alignment GUI](./neuropyguin/assets/screenshots/09_ibl_alignment.png)
+![IBL refine page](./neuropyguin/assets/screenshots/09_ibl_alignment.png)
 
 Outputs along the way: `histology_ccf.mat`, `atlas2histology_tform.mat`,
 `probe_ccf.mat` (+ friendly `.csv` versions), `xyz_picks_shankN.json`, and the
 final `channel_locations_all_shanks.json`. The MAT/JSON files are byte-compatible
 with the original toolchain.
-
-### Prefer the dark side? 🌙
-
-A single toggle flips the whole app (and every plot) between light and dark.
-
-![Dark theme](./neuropyguin/assets/screenshots/04_curation_dark.png)
 
 ## Why you might like it
 
@@ -177,6 +246,8 @@ the recommended path for rebuilding or packaging the app.
 - The Histology tab works without the IBL stack (AP_histology path is self-sufficient); the IBL GUI is optional refinement.
 - `probe_ccf.mat` is read by the IBL prep scripts, and the generated `channel_locations_all_shanks.json` reproduces the IBL GUI output exactly.
 - Settings, recents, and window layout are remembered between sessions.
+- Cell-type classification: **C4** (cerebellar) runs in a separate `npyx_c4` env via subprocess; **Bombcell** (cortex/striatum) runs in the main env. Both write `cell_types_*.csv` and a phy-compatible `cluster_*_cell_type.tsv` into the dataset folder.
+- "Export waveforms" writes a single `good_units_waveform_acg.pdf` plus per-unit PNGs for every good unit.
 
 ## Standing on the shoulders of giants
 
