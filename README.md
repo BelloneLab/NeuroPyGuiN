@@ -39,13 +39,10 @@ coffee. Recorded the same neurons across several sessions? Select them, hit
 **Concatenate selected**, and sort them together so units keep the same identity
 across days.
 
-The preprocessing capture below is a real preflight from the `51543` mPFC-NAc
-SpikeGLX AP binary, with parsed metadata and the planned CatGT, Kilosort4,
-TPrime, waveform, quality-metric, and Bombcell steps visible.
 
 ![Preprocessing tab](./neuropyguin/assets/screenshots/01_preprocessing.png)
 
-The queue keeps the exact SpikeGLX AP binary visible before anything heavy runs.
+
 
 ![Preprocessing queue](./neuropyguin/assets/screenshots/01_preprocessing_queue.png)
 
@@ -72,22 +69,14 @@ Load a curated dataset and the figures build themselves, in the clean
 on the left, a collapsible settings panel on the right (one discrete arrow hides
 it so the figures go full-width), and seven analyses:
 
-- **Unit Basics** - a publication-style "unit card": mean waveform on the probe
-  geometry with a ±SEM band (how clean is this unit?), a Hertz auto-correlogram
-  with the refractory band, a log-ISI with the violation %, plus amplitude and
+- **Unit Basics** -  mean waveform, auto-correlogram, log-ISI with the violation %, plus amplitude and
   firing rate over the whole session.
 - **Raw Explorer** - stacked, filtered multichannel traces around the unit's peak
   channel with its spikes overlaid (npyx `plot_raw_units` style).
-- **Correlogram** - the real npyx ACG/CCG grids (Hz), one colour per unit.
-- **Condition PSTH** - understands a wide binary behaviour matrix (one 0/1 column
-  per behaviour at video frame rate), turns each behaviour's 0->1 transitions into
-  event onsets, and shows mean ± SEM across units (with individual traces) or one
-  panel per unit, over a per-unit heatmap. Baseline subtraction and a trial range
-  are one click away.
-- **Network** - a hierarchically-sorted spike-count (noise) correlation matrix,
-  Okun population coupling vs depth, and a putative monosynaptic-connection matrix.
-- **Advanced** - a curated set of npyx power tools (3D ACG/CCG vs firing rate,
-  scaled ACG, Stark-Abeles monosynaptic significance, STTC, cross-ISI).
+- **Correlogram** - ACG/CCG grid.
+- **Condition PSTH**.
+- **Network** - correlation matrix, connection matrix.
+- **Advanced** - a curated set oftools (3D ACG/CCG, Stark-Abeles monosynaptic significance, STTC, cross-ISI).
 - **Cell Types** - automatic cell-type classification (see below).
 
 Filter to good units only, **export all good-unit waveform+ACG cards to a single
