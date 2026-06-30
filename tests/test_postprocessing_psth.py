@@ -5,7 +5,12 @@ from pathlib import Path
 import numpy as np
 
 from neuropyguin.postproc_engine import NeuropixelsDataset, cluster_synced_units
-from neuropyguin.postproc_events import inspect_event_csv, load_event_times
+from neuropyguin.postproc_events import (
+    behavior_columns,
+    inspect_event_csv,
+    is_behavior_matrix,
+    load_event_times,
+)
 
 
 def _dataset(tmp_path: Path, spike_times: np.ndarray, spike_clusters: np.ndarray) -> NeuropixelsDataset:
@@ -55,6 +60,65 @@ def test_load_event_times_filters_selected_event_label(tmp_path: Path) -> None:
     values = load_event_times(csv_path, selected_label="a").to_numpy(dtype=float)
 
     assert np.allclose(values, np.array([1.0, 3.5], dtype=float))
+
+
+def _behavior_matrix_csv(tmp_path: Path) -> Path:
+    # 10 Hz frames; 'approach' has two bouts (onsets at frames 2 and 6 -> 0.2s, 0.6s),
+    # 'freeze' one bout (onset frame 4 -> 0.4s). All columns binary -> behavior matrix.
+    csv_path = tmp_path / "behaviors.csv"
+    rows = ["approach,freeze,time"]
+    approach = [0, 0, 1, 1, 0, 0, 1, 0, 0, 0]
+    freeze = [0, 0, 0, 0, 1, 1, 1, 0, 0, 0]
+    for i, (a, f) in enumerate(zip(approach, freeze)):
+        rows.append(f"{a},{f},{i / 10.0}")
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return csv_path
+
+
+def test_inspect_detects_binary_behavior_matrix(tmp_path: Path) -> None:
+    info = inspect_event_csv(_behavior_matrix_csv(tmp_path))
+    assert info["kind"] == "behavior_matrix"
+    assert info["time_column"] == "time"
+    assert info["labels"] == ["approach", "freeze"]
+    assert abs(float(info["frame_rate"]) - 10.0) < 1e-6
+
+
+def test_behavior_matrix_onsets_use_time_column(tmp_path: Path) -> None:
+    csv_path = _behavior_matrix_csv(tmp_path)
+    approach = load_event_times(csv_path, selected_label="approach").to_numpy(dtype=float)
+    freeze = load_event_times(csv_path, selected_label="freeze").to_numpy(dtype=float)
+    assert np.allclose(approach, np.array([0.2, 0.6]))
+    assert np.allclose(freeze, np.array([0.4]))
+
+
+def test_behavior_matrix_offset_alignment(tmp_path: Path) -> None:
+    csv_path = _behavior_matrix_csv(tmp_path)
+    # 'freeze' bout spans frames 4..6 (1s); falling edge is the last active frame (6 -> 0.6s).
+    offsets = load_event_times(
+        csv_path, selected_label="freeze", alignment="Offset (falling)"
+    ).to_numpy(dtype=float)
+    assert np.allclose(offsets, np.array([0.6]))
+
+
+def test_long_format_events_still_supported(tmp_path: Path) -> None:
+    csv_path = tmp_path / "events.csv"
+    csv_path.write_text("event_type,cue_onset_s\na,1.0\nb,2.0\n", encoding="utf-8")
+    assert not is_behavior_matrix(inspect_event_csv(csv_path)["dataframe"])
+    assert inspect_event_csv(csv_path)["kind"] == "events"
+
+
+def test_correlogram_hertz_is_bin_invariant(tmp_path: Path) -> None:
+    # Poisson-like train; Hz normalization should not scale with bin width.
+    rng = np.random.RandomState(0)
+    times = np.cumsum(rng.exponential(scale=30.0, size=4000))  # samples at fs=1000 -> ~33 Hz
+    ds = _dataset(tmp_path, spike_times=times, spike_clusters=np.ones(times.size, dtype=int))
+    _, hz1 = ds.correlogram(1, 1, bin_ms=1.0, win_ms=50.0, remove_zero=True, normalize="Hertz")
+    _, hz2 = ds.correlogram(1, 1, bin_ms=2.0, win_ms=50.0, remove_zero=True, normalize="Hertz")
+    _, counts1 = ds.correlogram(1, 1, bin_ms=1.0, win_ms=50.0, remove_zero=True, normalize="Counts")
+    _, counts2 = ds.correlogram(1, 1, bin_ms=2.0, win_ms=50.0, remove_zero=True, normalize="Counts")
+    # Counts roughly double when the bin doubles; Hz stays in the same ballpark.
+    assert np.nanmean(counts2) > 1.6 * np.nanmean(counts1)
+    assert 0.6 < (np.nanmean(hz2) / max(np.nanmean(hz1), 1e-9)) < 1.4
 
 
 def test_psth_counts_zero_spike_trials_in_denominator(tmp_path: Path) -> None:

@@ -9,7 +9,6 @@ records the plotted values so they can be exported to CSV.
 
 from __future__ import annotations
 
-import json
 import math
 from itertools import combinations
 from pathlib import Path
@@ -17,12 +16,17 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-from ..postproc_events import inspect_event_csv, load_event_times
-from ..postproc_engine import NeuropixelsDataset, cluster_synced_units, export_units_h5
+from ..postproc_events import (
+    ALIGNMENT_OPTIONS as EVENT_ALIGNMENT_OPTIONS,
+    inspect_event_csv,
+    load_event_times,
+)
+from ..postproc_engine import NeuropixelsDataset, export_units_h5
 from ..npyx_corr_bridge import PAIRWISE_ONLY_METHODS, method_metadata, method_options, run_method
+from ..npyx_figures import NpyxFigureView, acg_grid_figure, ccg_grid_figure, waveform_figure
 
 
 def _is_bombcell_good_label(value: object) -> bool:
@@ -38,18 +42,6 @@ def _is_bombcell_good_label(value: object) -> bool:
     while "__" in normalized:
         normalized = normalized.replace("__", "_")
     return normalized in {"good", "non_soma", "non_soma_good", "nonsoma", "nonsomagood"}
-
-
-def _sync_group_color(group_id: int, alpha: int = 220) -> tuple[int, int, int, int]:
-    """Return an RGBA color for a synchrony group id.
-
-    Group ids of zero or below (ungrouped units) get a neutral gray; positive
-    ids map to distinct hues so clustered rows are easy to tell apart.
-    """
-    if int(group_id) <= 0:
-        return (120, 132, 150, alpha)
-    color = pg.intColor(int(group_id) - 1, hues=10, values=1, maxValue=235)
-    return (int(color.red()), int(color.green()), int(color.blue()), int(alpha))
 
 
 class PostProcessingTab(QtWidgets.QWidget):
@@ -71,24 +63,27 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._all_units: list[int] = []
         self.results: Dict[str, object] = {}
         self._export_payloads: Dict[str, list[tuple[str, pd.DataFrame]]] = {}
-        self._basic_cache: Dict[str, Dict[str, object]] = {}
         self._plot_theme = 'Light'
         self._show_grid = True
         self._busy = False
+        self._c4_running = False
         self._plot_detached = False
         self._plot_dialog: Optional[QtWidgets.QDialog] = None
         self._right_panel_layout: Optional[QtWidgets.QVBoxLayout] = None
+        self._analysis_area_layout: Optional[QtWidgets.QVBoxLayout] = None
+        self._figure_row_layout: Optional[QtWidgets.QHBoxLayout] = None
+        self._analysis_area: Optional[QtWidgets.QWidget] = None
         self._body_splitter: Optional[QtWidgets.QSplitter] = None
         self._right_panel: Optional[QtWidgets.QWidget] = None
-        self._basic_row2_layout: Optional[QtWidgets.QHBoxLayout] = None
+        self._settings_visible: bool = True
         self._body_sizes_before_detach: list[int] = []
         self._build_ui()
         self._restore_settings()
 
     def _build_ui(self) -> None:
         main = QtWidgets.QVBoxLayout(self)
-        main.setContentsMargins(18, 16, 18, 18)
-        main.setSpacing(14)
+        main.setContentsMargins(10, 10, 10, 10)
+        main.setSpacing(8)
         def with_help(widget: QtWidgets.QWidget, text: str) -> QtWidgets.QWidget:
             q = QtWidgets.QToolButton()
             q.setText("?")
@@ -127,47 +122,108 @@ class PostProcessingTab(QtWidgets.QWidget):
         body = QtWidgets.QSplitter()
         self._body_splitter = body
 
-        left_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        units_col = QtWidgets.QWidget()
-        units_col_l = QtWidgets.QVBoxLayout(units_col)
-        controls_col = QtWidgets.QWidget()
-        controls_col_l = QtWidgets.QVBoxLayout(controls_col)
-
+        # LEFT: a persistent, tall Units inspector. This is its own splitter
+        # child (no longer stacked above the controls), so the unit list keeps
+        # the full sidebar height and many units stay visible at once.
         grp_units = QtWidgets.QGroupBox("Units")
         u_l = QtWidgets.QVBoxLayout(grp_units)
+        u_l.setSpacing(8)
         unit_filter_row = QtWidgets.QHBoxLayout()
+        unit_filter_row.setSpacing(6)
         self.ed_unit_filter = QtWidgets.QLineEdit()
         self.ed_unit_filter.setPlaceholderText("Filter unit id")
-        self.btn_good_only = QtWidgets.QPushButton("Show good units only")
+        self.btn_good_only = QtWidgets.QPushButton("Good only")
+        self.btn_good_only.setToolTip("Show only units labelled good by the selected source.")
         self.btn_good_only.setCheckable(True)
         self.cb_good_source = QtWidgets.QComboBox()
         self.cb_good_source.addItems(["Auto", "Bombcell", "Phy", "KSLabel"])
         unit_filter_row.addWidget(self.ed_unit_filter, 1)
         unit_filter_row.addWidget(self.btn_good_only)
-        unit_filter_row.addWidget(QtWidgets.QLabel("Good source"))
-        unit_filter_row.addWidget(self.cb_good_source)
+        good_source_row = QtWidgets.QHBoxLayout()
+        good_source_row.setSpacing(6)
+        good_source_row.addWidget(QtWidgets.QLabel("Good source"))
+        good_source_row.addWidget(self.cb_good_source, 1)
 
         self.list_units = QtWidgets.QListWidget()
         self.list_units.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.list_units.setUniformItemSizes(True)
+        # A tall list is the whole point of the redesign: let it claim the
+        # sidebar height and never collapse below a generous minimum.
+        self.list_units.setMinimumHeight(360)
+        self.list_units.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        # Compact rows so many units are visible at once (the app-wide list style
+        # pads rows heavily for nav lists; the unit list wants density instead).
+        self.list_units.setStyleSheet(
+            "QListWidget::item { padding: 2px 8px; margin: 0px; border-radius: 6px; }"
+        )
+
+        self.lbl_units_count = QtWidgets.QLabel("No dataset loaded.")
+        self.lbl_units_count.setObjectName("psthMetaLabel")
 
         self.tbl_unit_quality = QtWidgets.QTableWidget(0, 2)
         self.tbl_unit_quality.setAlternatingRowColors(True)
         self.tbl_unit_quality.setHorizontalHeaderLabels(["Metric", "Value"])
         self.tbl_unit_quality.horizontalHeader().setStretchLastSection(True)
         self.tbl_unit_quality.verticalHeader().setVisible(False)
-        self.tbl_unit_quality.setMaximumHeight(220)
+        self.tbl_unit_quality.setMaximumHeight(180)
 
         u_l.addLayout(unit_filter_row)
+        u_l.addLayout(good_source_row)
+        u_l.addWidget(self.lbl_units_count, 0)
         u_l.addWidget(self.list_units, 1)
+        u_l.addWidget(QtWidgets.QLabel("Selected unit metrics"), 0)
         u_l.addWidget(self.tbl_unit_quality, 0)
+        # Keep the Units sidebar narrow so the figures stay dominant.
+        grp_units.setMinimumWidth(280)
+        grp_units.setMaximumWidth(440)
 
-        grp_menu = QtWidgets.QGroupBox("Analysis Pages")
-        m_l = QtWidgets.QVBoxLayout(grp_menu)
+        # RIGHT: the analysis area separates NAVIGATION from SETTINGS.
+        #   analysis_tabs : slim, always-visible nav tab bar (empty pages). It is
+        #                   the authoritative "current analysis" index and drives
+        #                   both the figure stack and the settings stack.
+        #   view_tabs     : the stacked figure pages (tab bar hidden).
+        #   settings_stack: the per-analysis control forms, docked in a
+        #                   collapsible panel on the right of the figure.
+        analysis_area = QtWidgets.QWidget()
+        analysis_area_l = QtWidgets.QVBoxLayout(analysis_area)
+        analysis_area_l.setContentsMargins(0, 0, 0, 0)
+        analysis_area_l.setSpacing(8)
+
         self.analysis_tabs = QtWidgets.QTabWidget()
-        m_l.addWidget(self.analysis_tabs)
+        self.analysis_tabs.setDocumentMode(True)
+        # Nav only: pages are empty, the bar just selects the analysis. Cap the
+        # height so the empty pane never steals room from the figures.
+        self.analysis_tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.analysis_tabs.setMaximumHeight(52)
+
+        # The settings forms live here, one page per analysis, kept in sync with
+        # the nav index.
+        self.settings_stack = QtWidgets.QStackedWidget()
+
+        def _compact_form(form: QtWidgets.QFormLayout) -> QtWidgets.QFormLayout:
+            """Tighten a controls form so the settings panel stays compact."""
+            form.setContentsMargins(6, 6, 6, 6)
+            form.setVerticalSpacing(6)
+            form.setHorizontalSpacing(8)
+            form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+            return form
+
+        def _scroll(widget: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
+            area = QtWidgets.QScrollArea()
+            area.setWidgetResizable(True)
+            area.setFrameShape(QtWidgets.QFrame.NoFrame)
+            area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            area.setWidget(widget)
+            return area
+
+        def _add_settings_page(widget: QtWidgets.QWidget, title: str) -> None:
+            """Add an empty nav tab + the matching settings page (kept in sync)."""
+            self.analysis_tabs.addTab(QtWidgets.QWidget(), title)
+            self.settings_stack.addWidget(_scroll(widget))
 
         t_basic = QtWidgets.QWidget()
-        f_basic = QtWidgets.QFormLayout(t_basic)
+        f_basic = _compact_form(QtWidgets.QFormLayout(t_basic))
         self.sp_basic_t0 = QtWidgets.QDoubleSpinBox()
         self.sp_basic_t0.setRange(0.0, 2e6)
         self.sp_basic_t0.setValue(0.0)
@@ -188,18 +244,6 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.sp_basic_acg_win.setRange(10.0, 1000.0)
         self.sp_basic_acg_win.setValue(100.0)
         self.sp_basic_acg_win.setSuffix(" ms")
-        self.sp_basic_acg_ratio = QtWidgets.QSpinBox()
-        self.sp_basic_acg_ratio.setRange(1, 12)
-        self.sp_basic_acg_ratio.setValue(2)
-        self.sp_basic_isi_ratio = QtWidgets.QSpinBox()
-        self.sp_basic_isi_ratio.setRange(1, 12)
-        self.sp_basic_isi_ratio.setValue(1)
-        ratio_row = QtWidgets.QWidget()
-        ratio_row_l = QtWidgets.QHBoxLayout(ratio_row)
-        ratio_row_l.setContentsMargins(0, 0, 0, 0)
-        ratio_row_l.addWidget(self.sp_basic_acg_ratio, 1)
-        ratio_row_l.addWidget(QtWidgets.QLabel(":"))
-        ratio_row_l.addWidget(self.sp_basic_isi_ratio, 1)
         self.ck_ifr = QtWidgets.QCheckBox("Overlay instantaneous firing rate")
         self.ck_ifr.setChecked(True)
         self.sp_ifr_smooth_ms = QtWidgets.QDoubleSpinBox()
@@ -211,24 +255,23 @@ class PostProcessingTab(QtWidgets.QWidget):
         f_basic.addRow("ISI max", with_help(self.sp_isi_max, "Maximum ISI bin range for histogram (ms)."))
         f_basic.addRow("ACG bin", with_help(self.sp_basic_acg_bin, "Auto-correlogram bin size (ms) for Unit Basics."))
         f_basic.addRow("ACG window", with_help(self.sp_basic_acg_win, "Auto-correlogram half-window (ms) for Unit Basics."))
-        f_basic.addRow("ACG:ISI ratio", with_help(ratio_row, "Width ratio for the Unit Basics row (ACG : ISI, with waveform centered)."))
         f_basic.addRow("IFR smooth", with_help(self.sp_ifr_smooth_ms, "Bin/smoothing window for instantaneous firing rate (ms)."))
         f_basic.addRow(self.ck_ifr)
-        self.analysis_tabs.addTab(t_basic, "Unit Basics")
+        _add_settings_page(t_basic, "Unit Basics")
 
         t_raw = QtWidgets.QWidget()
-        f_raw = QtWidgets.QFormLayout(t_raw)
+        f_raw = _compact_form(QtWidgets.QFormLayout(t_raw))
         self.sp_raw_t0 = QtWidgets.QDoubleSpinBox()
         self.sp_raw_t0.setRange(0.0, 2e6)
         self.sp_raw_t0.setValue(0.0)
         self.sp_raw_t0.setSuffix(" s")
         self.sp_raw_dur = QtWidgets.QDoubleSpinBox()
         self.sp_raw_dur.setRange(0.05, 60.0)
-        self.sp_raw_dur.setValue(1.0)
+        self.sp_raw_dur.setValue(0.15)
         self.sp_raw_dur.setSuffix(" s")
         self.sp_raw_ch = QtWidgets.QSpinBox()
         self.sp_raw_ch.setRange(4, 256)
-        self.sp_raw_ch.setValue(100)
+        self.sp_raw_ch.setValue(32)
         self.sp_raw_hp = QtWidgets.QDoubleSpinBox()
         self.sp_raw_hp.setRange(0.0, 10000.0)
         self.sp_raw_hp.setValue(300.0)
@@ -252,10 +295,10 @@ class PostProcessingTab(QtWidgets.QWidget):
         f_raw.addRow("Downsample", with_help(self.sp_raw_ds, "Downsampling factor for plotting speed."))
         f_raw.addRow("Y axis", with_help(self.cb_raw_y, "Y-axis mode: channel index or depth in mm."))
         f_raw.addRow(self.ck_raw_overlay)
-        self.analysis_tabs.addTab(t_raw, "Raw Explorer")
+        _add_settings_page(t_raw, "Raw Explorer")
 
         t_corr = QtWidgets.QWidget()
-        f_corr = QtWidgets.QFormLayout(t_corr)
+        f_corr = _compact_form(QtWidgets.QFormLayout(t_corr))
         self.cb_corr_mode = QtWidgets.QComboBox()
         self.cb_corr_mode.addItems(["ACG", "CCG"])
         self.sp_corr_bin = QtWidgets.QDoubleSpinBox()
@@ -266,15 +309,27 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.sp_corr_win.setRange(10.0, 1000.0)
         self.sp_corr_win.setValue(100.0)
         self.sp_corr_win.setSuffix(" ms")
-        f_corr.addRow("Mode", with_help(self.cb_corr_mode, "ACG for auto-correlogram, CCG for cross-correlogram."))
+        self.cb_corr_norm = QtWidgets.QComboBox()
+        self.cb_corr_norm.addItems(["Hertz", "Counts", "Pearson", "zscore"])
+        self.cb_corr_style = QtWidgets.QComboBox()
+        self.cb_corr_style.addItems(["bar", "line"])
+        f_corr.addRow("Mode", with_help(self.cb_corr_mode, "ACG: per-unit autocorrelogram grid. CCG: NeuroPyxels grid with ACGs on the diagonal and cross-correlograms off-diagonal."))
+        f_corr.addRow("Normalize", with_help(self.cb_corr_norm, "y-axis unit (NeuroPyxels convention): Hertz (firing rate), Counts, Pearson, or zscore. The CCG grid uses Hertz ACGs + z-scored CCGs ('mixte') when Hertz is chosen."))
+        f_corr.addRow("Style", with_help(self.cb_corr_style, "Histogram (bar) or line correlograms, as in NeuroPyxels."))
         f_corr.addRow("Bin", with_help(self.sp_corr_bin, "Correlogram bin size (ms)."))
-        f_corr.addRow("Window", with_help(self.sp_corr_win, "Half-window around zero lag (ms)."))
-        self.analysis_tabs.addTab(t_corr, "Correlogram")
+        f_corr.addRow("Window", with_help(self.sp_corr_win, "Full window around zero lag (ms)."))
+        self.lbl_corr_note = QtWidgets.QLabel("Rendered with NeuroPyxels (npyx.plot). First render caches into the dataset folder.")
+        self.lbl_corr_note.setObjectName("psthMetaLabel")
+        self.lbl_corr_note.setWordWrap(True)
+        f_corr.addRow(self.lbl_corr_note)
+        _add_settings_page(t_corr, "Correlogram")
         t_psth = QtWidgets.QWidget()
         v_psth = QtWidgets.QVBoxLayout(t_psth)
+        v_psth.setContentsMargins(6, 4, 6, 4)
+        v_psth.setSpacing(6)
         self.lbl_psth_hint = QtWidgets.QLabel(
-            "Single unit: the heatmap shows one row per trial and the PSTH shows mean \u00b1 SEM across the selected trials. "
-            "Multiple units: the heatmap shows one row per unit (trial-averaged) and the PSTH shows the mean across units."
+            "Single unit: per-trial rows + mean \u00b1 SEM across trials. "
+            "Multiple units: 'Average across units' shows one mean trace; 'Per-unit panels' shows one panel per unit."
         )
         self.lbl_psth_hint.setWordWrap(True)
         self.lbl_psth_hint.setObjectName("psthHintLabel")
@@ -288,12 +343,18 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_cond_add = QtWidgets.QPushButton("Add condition")
         self.btn_cond_remove = QtWidgets.QPushButton("Remove condition")
         self.btn_cond_browse = QtWidgets.QPushButton("Browse CSV for selected")
+        self.btn_cond_add_all = QtWidgets.QPushButton("Add all behaviors")
+        self.btn_cond_add_all.setToolTip(
+            "Pick a binary behavior-matrix CSV and create one PSTH condition per behavior column "
+            "(behaviors with no events are skipped)."
+        )
         b_cond.addWidget(self.btn_cond_add)
         b_cond.addWidget(self.btn_cond_remove)
         b_cond.addWidget(self.btn_cond_browse)
+        b_cond.addWidget(self.btn_cond_add_all)
         b_cond.addStretch(1)
 
-        f_psth = QtWidgets.QFormLayout()
+        f_psth = _compact_form(QtWidgets.QFormLayout())
         self.sp_psth_pre = QtWidgets.QDoubleSpinBox()
         self.sp_psth_pre.setRange(0.05, 20.0)
         self.sp_psth_pre.setValue(1.0)
@@ -306,6 +367,16 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.sp_psth_bin.setRange(0.5, 50.0)
         self.sp_psth_bin.setValue(5.0)
         self.sp_psth_bin.setSuffix(" ms")
+        self.cb_psth_align = QtWidgets.QComboBox()
+        self.cb_psth_align.addItems(list(EVENT_ALIGNMENT_OPTIONS))
+        self.sp_psth_fps = QtWidgets.QDoubleSpinBox()
+        self.sp_psth_fps.setRange(1.0, 10000.0)
+        self.sp_psth_fps.setDecimals(2)
+        self.sp_psth_fps.setValue(30.0)
+        self.sp_psth_fps.setSuffix(" fps")
+        self.ck_psth_baseline = QtWidgets.QCheckBox("Baseline-subtract (pre-window mean)")
+        self.cb_psth_mode = QtWidgets.QComboBox()
+        self.cb_psth_mode.addItems(["Average across units", "Per-unit panels"])
         self.sp_psth_trial_from = QtWidgets.QSpinBox()
         self.sp_psth_trial_from.setRange(1, 1_000_000)
         self.sp_psth_trial_from.setValue(1)
@@ -338,6 +409,10 @@ class PostProcessingTab(QtWidgets.QWidget):
         f_psth.addRow("Pre window", with_help(self.sp_psth_pre, "Seconds before event for PSTH window."))
         f_psth.addRow("Post window", with_help(self.sp_psth_post, "Seconds after event for PSTH window."))
         f_psth.addRow("Bin", with_help(self.sp_psth_bin, "PSTH bin size (ms)."))
+        f_psth.addRow("Event alignment", with_help(self.cb_psth_align, "For a binary behavior matrix: align to bout onset (rising 0->1), offset (falling 1->0), or bout midpoint."))
+        f_psth.addRow("Frame rate", with_help(self.sp_psth_fps, "Frame rate (fps) used to convert behavior frames to seconds when the CSV has no time column. Ignored when a time column is present."))
+        f_psth.addRow("Display mode", with_help(self.cb_psth_mode, "With multiple units selected: 'Average across units' shows one mean trace; 'Per-unit panels' shows one panel per unit. Single-unit selections show the per-trial view either way."))
+        f_psth.addRow(self.ck_psth_baseline)
         f_psth.addRow("Trial range", with_help(trial_row, "1-based inclusive trial range within each selected event label. 'last' uses the final available trial."))
         f_psth.addRow(psth_btn_row)
 
@@ -346,45 +421,31 @@ class PostProcessingTab(QtWidgets.QWidget):
         v_psth.addLayout(b_cond)
         v_psth.addLayout(f_psth)
         v_psth.addWidget(self.lbl_psth_trial_status)
-        self.analysis_tabs.addTab(t_psth, "Condition PSTH")
+        _add_settings_page(t_psth, "Condition PSTH")
 
         t_net = QtWidgets.QWidget()
-        f_net = QtWidgets.QFormLayout(t_net)
+        f_net = _compact_form(QtWidgets.QFormLayout(t_net))
+        # sp_net_bin is repurposed as the spike-count correlation bin (ms).
         self.sp_net_bin = QtWidgets.QDoubleSpinBox()
-        self.sp_net_bin.setRange(0.5, 20.0)
-        self.sp_net_bin.setValue(1.0)
+        self.sp_net_bin.setRange(1.0, 500.0)
+        self.sp_net_bin.setValue(25.0)
         self.sp_net_bin.setSuffix(" ms")
-        self.sp_net_win = QtWidgets.QDoubleSpinBox()
-        self.sp_net_win.setRange(10.0, 1000.0)
-        self.sp_net_win.setValue(100.0)
-        self.sp_net_win.setSuffix(" ms")
-        self.sp_sync_bin = QtWidgets.QDoubleSpinBox()
-        self.sp_sync_bin.setRange(1.0, 200.0)
-        self.sp_sync_bin.setValue(10.0)
-        self.sp_sync_bin.setSuffix(" ms")
-        self.sp_sync_win = QtWidgets.QDoubleSpinBox()
-        self.sp_sync_win.setRange(0.2, 60.0)
-        self.sp_sync_win.setValue(2.0)
-        self.sp_sync_win.setSuffix(" s")
-        self.sp_sync_step = QtWidgets.QDoubleSpinBox()
-        self.sp_sync_step.setRange(0.05, 20.0)
-        self.sp_sync_step.setValue(0.5)
-        self.sp_sync_step.setSuffix(" s")
+        self.sp_net_z = QtWidgets.QDoubleSpinBox()
+        self.sp_net_z.setRange(1.0, 20.0)
+        self.sp_net_z.setSingleStep(0.5)
+        self.sp_net_z.setValue(5.0)
         self.btn_net_compute = QtWidgets.QPushButton("Compute")
         self.btn_net_show = QtWidgets.QPushButton("Show")
         net_btn_row = QtWidgets.QHBoxLayout()
         net_btn_row.addWidget(self.btn_net_compute)
         net_btn_row.addWidget(self.btn_net_show)
-        f_net.addRow("CCG bin", with_help(self.sp_net_bin, "Bin size (ms) for pairwise CCG matrix."))
-        f_net.addRow("CCG window", with_help(self.sp_net_win, "Window (ms) for pairwise CCG matrix."))
-        f_net.addRow("Synchrony bin", with_help(self.sp_sync_bin, "Bin size (ms) for synchrony index."))
-        f_net.addRow("Synchrony window", with_help(self.sp_sync_win, "Window length (s) for synchrony index."))
-        f_net.addRow("Synchrony step", with_help(self.sp_sync_step, "Step size (s) for synchrony index over time."))
+        f_net.addRow("Correlation bin", with_help(self.sp_net_bin, "Bin size (ms) for the pairwise spike-count (noise) correlation matrix."))
+        f_net.addRow("Connection z-threshold", with_help(self.sp_net_z, "Z-score threshold for flagging putative short-latency CCG connections."))
         f_net.addRow(net_btn_row)
-        self.analysis_tabs.addTab(t_net, "Network")
+        _add_settings_page(t_net, "Network")
 
         t_npyx = QtWidgets.QWidget()
-        f_npyx = QtWidgets.QFormLayout(t_npyx)
+        f_npyx = _compact_form(QtWidgets.QFormLayout(t_npyx))
         self.cb_npyx_method = QtWidgets.QComboBox()
         self._npyx_methods = method_options()
         for key, label in self._npyx_methods:
@@ -411,50 +472,72 @@ class PostProcessingTab(QtWidgets.QWidget):
         f_npyx.addRow("Window", with_help(self.sp_npyx_win, "Window size (ms)."))
         f_npyx.addRow("Function parameters", self.tbl_npyx_params)
         f_npyx.addRow("Description", self.txt_npyx_desc)
-        self.analysis_tabs.addTab(t_npyx, "Advanced Corr")
+        _add_settings_page(t_npyx, "Advanced")
+
+        # Cell Types (C4): a button-driven cerebellar cell-type classifier that
+        # runs in an isolated subprocess env (~1 min) off the GUI thread.
+        t_c4 = QtWidgets.QWidget()
+        f_c4 = _compact_form(QtWidgets.QFormLayout(t_c4))
+        self.lbl_c4_desc = QtWidgets.QLabel(
+            "NeuroPyxels C4 cerebellar cell-type classifier "
+            "(GoC / MLI / MFB / PkC_ss / PkC_cs). Runs in an isolated environment; "
+            "cerebellum-trained, so labels are indicative on other regions."
+        )
+        self.lbl_c4_desc.setWordWrap(True)
+        self.lbl_c4_desc.setObjectName("psthMetaLabel")
+        self.sp_c4_threshold = QtWidgets.QDoubleSpinBox()
+        self.sp_c4_threshold.setRange(0.0, 50.0)
+        self.sp_c4_threshold.setSingleStep(0.5)
+        self.sp_c4_threshold.setValue(2.0)
+        self.btn_c4_run = QtWidgets.QPushButton("Run C4 classifier")
+        self.btn_c4_run.setProperty("role", "primary")
+        f_c4.addRow(self.lbl_c4_desc)
+        f_c4.addRow("Confidence threshold", with_help(self.sp_c4_threshold, "Minimum confidence ratio for a confident C4 call; lower values keep more predictions."))
+        f_c4.addRow(self.btn_c4_run)
+        _add_settings_page(t_c4, "Cell Types (C4)")
 
         self.page_progress = QtWidgets.QProgressBar()
         self.page_progress.setRange(0, 100)
         self.page_progress.setValue(0)
+        # A quiet footer-style bar (thin, no chrome) so it never competes with
+        # the figures for attention.
+        self.page_progress.setProperty("footerProgress", True)
+        self.page_progress.setTextVisible(False)
 
-        units_col_l.addWidget(grp_units, 1)
-        controls_col_l.addWidget(grp_menu, 1)
-        controls_col_l.addWidget(self.page_progress, 0)
-        left_split.addWidget(units_col)
-        left_split.addWidget(controls_col)
-        left_split.setStretchFactor(0, 3)
-        left_split.setStretchFactor(1, 4)
-
-        right = QtWidgets.QWidget()
-        self._right_panel = right
-        right_l = QtWidgets.QVBoxLayout(right)
         self.view_tabs = QtWidgets.QTabWidget()
+        self.view_tabs.setDocumentMode(True)
+        # The view tabs are now a pure stacked page container: hide their tab bar
+        # so the user sees only ONE navigation strip (analysis_tabs). Index sync
+        # is preserved in _on_analysis_page_changed.
+        self.view_tabs.tabBar().hide()
 
+        # Unit Basics is now a single matplotlib canvas (npyx-style composite),
+        # rendered through the shared NpyxFigureView.
+        self.basics_view = NpyxFigureView()
         basics_container = QtWidgets.QWidget()
         bl = QtWidgets.QVBoxLayout(basics_container)
-        self.plot_basic_spikes = pg.PlotWidget(title="Unit raster + instantaneous firing rate")
-        self.plot_basic_acg = pg.PlotWidget(title="Auto-correlogram")
-        self.plot_basic_isi = pg.PlotWidget(title="ISI")
-        self.gl_basic_wvf = pg.GraphicsLayoutWidget()
-        basic_row2 = QtWidgets.QWidget()
-        basic_row2_l = QtWidgets.QHBoxLayout(basic_row2)
-        basic_row2_l.setContentsMargins(0, 0, 0, 0)
-        self._basic_row2_layout = basic_row2_l
-        basic_row2_l.addWidget(self.plot_basic_acg, 2)
-        basic_row2_l.addWidget(self.gl_basic_wvf, 2)
-        basic_row2_l.addWidget(self.plot_basic_isi, 1)
-        bl.addWidget(self.plot_basic_spikes, 2)
-        bl.addWidget(basic_row2, 2)
+        bl.setContentsMargins(4, 4, 4, 4)
+        bl.setSpacing(0)
+        bl.addWidget(self.basics_view, 1)
 
-        self.plot_raw = pg.PlotWidget(title="Raw explorer")
+        # Raw Explorer is likewise a matplotlib canvas.
+        self.raw_view = NpyxFigureView()
+        raw_container = QtWidgets.QWidget()
+        raw_l = QtWidgets.QVBoxLayout(raw_container)
+        raw_l.setContentsMargins(4, 4, 4, 4)
+        raw_l.setSpacing(0)
+        raw_l.addWidget(self.raw_view, 1)
 
         corr_view = QtWidgets.QWidget()
         corr_v = QtWidgets.QVBoxLayout(corr_view)
-        self.gl_corr = pg.GraphicsLayoutWidget()
-        corr_v.addWidget(self.gl_corr, 1)
+        corr_v.setContentsMargins(4, 4, 4, 4)
+        self.corr_npyx = NpyxFigureView()
+        corr_v.addWidget(self.corr_npyx, 1)
 
         psth_view = QtWidgets.QWidget()
         psth_v = QtWidgets.QVBoxLayout(psth_view)
+        psth_v.setContentsMargins(4, 4, 4, 4)
+        psth_v.setSpacing(8)
         self.psth_summary_card = QtWidgets.QFrame()
         self.psth_summary_card.setObjectName("psthSummaryCard")
         psth_summary_l = QtWidgets.QVBoxLayout(self.psth_summary_card)
@@ -470,56 +553,116 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.lbl_psth_summary_meta.setObjectName("psthSummaryMeta")
         psth_summary_l.addWidget(self.lbl_psth_summary)
         psth_summary_l.addWidget(self.lbl_psth_summary_meta)
-        self.plot_psth_lines = pg.PlotWidget(title="Condition PSTH lines")
-        self.plot_psth_heat = pg.PlotWidget(title="Condition PSTH heatmap")
-        self.psth_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.psth_splitter.addWidget(self.plot_psth_lines)
-        self.psth_splitter.addWidget(self.plot_psth_heat)
-        self.psth_splitter.setStretchFactor(0, 3)
-        self.psth_splitter.setStretchFactor(1, 4)
+        # Condition PSTH is now a single matplotlib canvas (npyx-style),
+        # rendered through the shared NpyxFigureView.
+        self.psth_view = NpyxFigureView()
         psth_v.addWidget(self.psth_summary_card, 0)
-        psth_v.addWidget(self.psth_splitter, 1)
+        psth_v.addWidget(self.psth_view, 1)
 
+        # Network is now a single matplotlib canvas (3-panel network figure).
+        self.net_view = NpyxFigureView()
         net_view = QtWidgets.QWidget()
         net_v = QtWidgets.QVBoxLayout(net_view)
-        self.plot_net_matrix = pg.PlotWidget(title="Pairwise CCG matrix")
-        self.plot_net_sync = pg.PlotWidget(title="Synchrony index over time")
-        net_v.addWidget(self.plot_net_matrix, 1)
-        net_v.addWidget(self.plot_net_sync, 1)
+        net_v.setContentsMargins(4, 4, 4, 4)
+        net_v.setSpacing(0)
+        net_v.addWidget(self.net_view, 1)
 
         npyx_view = QtWidgets.QWidget()
         npyx_v = QtWidgets.QVBoxLayout(npyx_view)
         self.gl_npyx = pg.GraphicsLayoutWidget()
         npyx_v.addWidget(self.gl_npyx, 1)
 
+        # Cell Types (C4): a matplotlib canvas driven by the Run button.
+        self.c4_view = NpyxFigureView()
+        c4_view = QtWidgets.QWidget()
+        c4_v = QtWidgets.QVBoxLayout(c4_view)
+        c4_v.setContentsMargins(4, 4, 4, 4)
+        c4_v.setSpacing(0)
+        c4_v.addWidget(self.c4_view, 1)
+
         self.view_tabs.addTab(basics_container, "Unit Basics")
-        self.view_tabs.addTab(self.plot_raw, "Raw Explorer")
+        self.view_tabs.addTab(raw_container, "Raw Explorer")
         self.view_tabs.addTab(corr_view, "Correlogram")
         self.view_tabs.addTab(psth_view, "Condition PSTH")
         self.view_tabs.addTab(net_view, "Network")
-        self.view_tabs.addTab(npyx_view, "Advanced Corr")
+        self.view_tabs.addTab(npyx_view, "Advanced")
+        self.view_tabs.addTab(c4_view, "Cell Types (C4)")
 
-        right_l.addWidget(self.view_tabs, 1)
+        # The settings panel: the per-analysis form stack with a small header,
+        # docked on the right of the figure and collapsible via a chevron.
+        self.settings_panel = QtWidgets.QWidget()
+        self.settings_panel.setObjectName("settingsPanel")
+        settings_panel_l = QtWidgets.QVBoxLayout(self.settings_panel)
+        settings_panel_l.setContentsMargins(8, 6, 4, 6)
+        settings_panel_l.setSpacing(6)
+        self.lbl_settings_title = QtWidgets.QLabel("Settings")
+        self.lbl_settings_title.setObjectName("settingsPanelTitle")
+        settings_panel_l.addWidget(self.lbl_settings_title, 0)
+        settings_panel_l.addWidget(self.settings_stack, 1)
+        self.settings_panel.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        self.settings_panel.setMinimumWidth(300)
+        self.settings_panel.setMaximumWidth(340)
+
+        # The discrete chevron toggle, on the boundary between figure and panel.
+        self.btn_settings_toggle = QtWidgets.QToolButton()
+        self.btn_settings_toggle.setObjectName("settingsToggle")
+        self.btn_settings_toggle.setAutoRaise(True)
+        self.btn_settings_toggle.setCheckable(False)
+        self.btn_settings_toggle.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_settings_toggle.setToolTip("Hide settings")
+        self.btn_settings_toggle.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        self.btn_settings_toggle.setText("›")  # right chevron; flipped on toggle
+        self.btn_settings_toggle.setFixedWidth(22)
+
+        # Figure row: [ figures (expanding) ][ chevron ][ settings panel ].
+        figure_row = QtWidgets.QWidget()
+        figure_row_l = QtWidgets.QHBoxLayout(figure_row)
+        figure_row_l.setContentsMargins(0, 0, 0, 0)
+        figure_row_l.setSpacing(0)
+        figure_row_l.addWidget(self.view_tabs, 1)
+        figure_row_l.addWidget(self.btn_settings_toggle, 0)
+        figure_row_l.addWidget(self.settings_panel, 0)
+
+        # Assemble the right (analysis) panel: slim nav tab bar on top, the
+        # figure+settings row below, then the per-page progress bar.
+        analysis_area_l.addWidget(self.analysis_tabs, 0)
+        analysis_area_l.addWidget(figure_row, 1)
+        analysis_area_l.addWidget(self.page_progress, 0)
+        self._analysis_area_layout = analysis_area_l
+        self._figure_row_layout = figure_row_l
+        self._settings_visible = True
+
+        right = QtWidgets.QWidget()
+        self._right_panel = right
+        right_l = QtWidgets.QVBoxLayout(right)
+        right_l.setContentsMargins(0, 0, 0, 0)
+        right_l.addWidget(analysis_area, 1)
         self._right_panel_layout = right_l
+        self._analysis_area = analysis_area
 
-        body.addWidget(left_split)
+        body.addWidget(grp_units)
         body.addWidget(right)
-        body.setStretchFactor(0, 3)
-        body.setStretchFactor(1, 7)
+        body.setStretchFactor(0, 0)
+        body.setStretchFactor(1, 1)
+        body.setCollapsible(0, False)
+        body.setSizes([330, 1370])
 
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setProperty("logView", True)
         self.log.setPlaceholderText("Dataset load and analysis output will appear here.")
-        self.log.setMinimumHeight(90)
-        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        # Keep the log a thin strip so the figures own the vertical space.
+        self.log.setMinimumHeight(70)
+        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
 
         main.addLayout(top)
         self.vertical_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.vertical_split.addWidget(body)
         self.vertical_split.addWidget(self.log)
-        self.vertical_split.setStretchFactor(0, 8)
-        self.vertical_split.setStretchFactor(1, 2)
+        self.vertical_split.setStretchFactor(0, 9)
+        self.vertical_split.setStretchFactor(1, 1)
+        self.vertical_split.setCollapsible(1, True)
+        self.vertical_split.setSizes([900, 120])
         main.addWidget(self.vertical_split, 1)
 
         self.btn_browse.clicked.connect(self._pick)
@@ -527,15 +670,25 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_export.clicked.connect(self._export_plotted_data)
         self.btn_export_units.clicked.connect(self._export_units_file)
         self.btn_detach_plots.toggled.connect(self._toggle_plot_detach)
+        self.btn_settings_toggle.clicked.connect(self._toggle_settings_panel)
         self.list_units.itemSelectionChanged.connect(self._on_units_selection_changed)
         self.ed_unit_filter.textChanged.connect(self._refresh_units_list)
         self.btn_good_only.toggled.connect(self._refresh_units_list)
         self.cb_good_source.currentTextChanged.connect(self._on_good_source_changed)
         self.analysis_tabs.currentChanged.connect(self._on_analysis_page_changed)
         self.cb_corr_mode.currentTextChanged.connect(self._refresh_current_page)
+        self.cb_corr_norm.currentTextChanged.connect(self._refresh_current_page)
+        self.cb_corr_style.currentTextChanged.connect(self._refresh_current_page)
         self.btn_cond_add.clicked.connect(self._add_condition_row)
         self.btn_cond_remove.clicked.connect(self._remove_condition_row)
         self.btn_cond_browse.clicked.connect(self._browse_condition_csv)
+        self.btn_cond_add_all.clicked.connect(self._add_all_behaviors)
+        self.cb_psth_align.currentTextChanged.connect(self._on_psth_event_options_changed)
+        self.sp_psth_fps.valueChanged.connect(self._on_psth_event_options_changed)
+        # Baseline, display mode and trial range only change how the cached PSTH
+        # results are drawn, so they re-render rather than recompute.
+        self.ck_psth_baseline.toggled.connect(self._on_psth_display_options_changed)
+        self.cb_psth_mode.currentIndexChanged.connect(self._on_psth_display_options_changed)
         self.sp_psth_trial_from.valueChanged.connect(self._on_psth_trial_range_changed)
         self.sp_psth_trial_to.valueChanged.connect(self._on_psth_trial_range_changed)
         self.btn_psth_all_trials.clicked.connect(self._reset_psth_trial_range)
@@ -543,17 +696,19 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_psth_show.clicked.connect(self._show_psth)
         self.btn_net_compute.clicked.connect(self._compute_network)
         self.btn_net_show.clicked.connect(self._show_network)
+        self.btn_c4_run.clicked.connect(self._run_c4)
         self.cb_npyx_method.currentTextChanged.connect(self._refresh_current_page)
         self.cb_npyx_method.currentIndexChanged.connect(self._update_npyx_method_ui)
         self.tbl_npyx_params.itemChanged.connect(self._on_npyx_params_changed)
 
+        # Network and C4 are button-driven (potentially slow), so their controls
+        # are intentionally NOT in the auto-refresh list.
         auto_widgets = [
             self.sp_basic_t0, self.sp_basic_dur, self.sp_isi_max, self.sp_basic_acg_bin, self.sp_basic_acg_win,
-            self.sp_basic_acg_ratio, self.sp_basic_isi_ratio, self.ck_ifr, self.sp_ifr_smooth_ms,
+            self.ck_ifr, self.sp_ifr_smooth_ms,
             self.sp_raw_t0, self.sp_raw_dur, self.sp_raw_ch, self.sp_raw_hp, self.sp_raw_lp, self.sp_raw_ds,
             self.ck_raw_overlay, self.cb_raw_y, self.sp_corr_bin, self.sp_corr_win, self.sp_psth_pre,
-            self.sp_psth_post, self.sp_psth_bin, self.sp_net_bin, self.sp_net_win, self.sp_sync_bin,
-            self.sp_sync_win, self.sp_sync_step, self.sp_npyx_bin, self.sp_npyx_win,
+            self.sp_psth_post, self.sp_psth_bin, self.sp_npyx_bin, self.sp_npyx_win,
         ]
         for w in auto_widgets:
             if hasattr(w, "valueChanged"):
@@ -562,41 +717,57 @@ class PostProcessingTab(QtWidgets.QWidget):
                 w.currentTextChanged.connect(self._refresh_current_page)
             elif hasattr(w, "toggled"):
                 w.toggled.connect(self._refresh_current_page)
-        self.sp_basic_acg_ratio.valueChanged.connect(self._update_basic_plot_ratio)
-        self.sp_basic_isi_ratio.valueChanged.connect(self._update_basic_plot_ratio)
 
         self.tbl_conditions.itemChanged.connect(self._on_conditions_changed)
         self._apply_plot_style()
-        self._update_basic_plot_ratio()
         self._update_psth_trial_status()
         self._update_npyx_method_ui()
+        # Sync the settings stack to the initial analysis and restore the
+        # last-used settings-panel visibility (default = shown).
+        self._sync_settings_page(self.analysis_tabs.currentIndex())
+        show_settings = self.settings.value("post/settings_visible", True)
+        if isinstance(show_settings, str):
+            show_settings = show_settings.lower() not in {"false", "0", "no"}
+        self._set_settings_visible(bool(show_settings))
+
+    def _sync_settings_page(self, idx: int) -> None:
+        """Keep the right-docked settings stack and its title aligned to the nav."""
+        if 0 <= idx < self.settings_stack.count():
+            self.settings_stack.setCurrentIndex(idx)
+        title = self.analysis_tabs.tabText(idx) if 0 <= idx < self.analysis_tabs.count() else "Settings"
+        self.lbl_settings_title.setText(f"{title} settings")
+
+    def _set_settings_visible(self, visible: bool) -> None:
+        """Show/hide the right settings panel; the chevron always stays reachable."""
+        self._settings_visible = bool(visible)
+        self.settings_panel.setVisible(self._settings_visible)
+        # Chevron points toward the action: '›' hides (panel open), '‹' reveals.
+        self.btn_settings_toggle.setText("›" if self._settings_visible else "‹")
+        self.btn_settings_toggle.setToolTip("Hide settings" if self._settings_visible else "Show settings")
+        self.settings.setValue("post/settings_visible", self._settings_visible)
+
+    def _toggle_settings_panel(self) -> None:
+        self._set_settings_visible(not self._settings_visible)
+
     def set_plot_preferences(self, theme: str, show_grid: bool) -> None:
         """Apply the global plot theme (Light/Dark) and grid visibility."""
         self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
         self._show_grid = bool(show_grid)
         self._apply_plot_style()
+        # The matplotlib canvases bake the theme in at render time, so re-render
+        # the current page to pick up the new dark/light figures.
+        self._refresh_current_page()
 
     def _apply_plot_style(self) -> None:
         bg = "#0b0f14" if self._plot_theme == "Dark" else "#ffffff"
         fg = "#e8eef7" if self._plot_theme == "Dark" else "#1a1f29"
-        grid_alpha = 0.25 if self._show_grid else 0.0
         card_bg = "rgba(90, 128, 255, 0.14)" if self._plot_theme == "Dark" else "rgba(67, 128, 255, 0.08)"
         card_border = "rgba(142, 170, 255, 0.34)" if self._plot_theme == "Dark" else "rgba(67, 128, 255, 0.22)"
         meta_fg = "#aab6ca" if self._plot_theme == "Dark" else "#5b6778"
-        plots = [
-            self.plot_basic_spikes, self.plot_basic_acg, self.plot_basic_isi, self.plot_raw,
-            self.plot_psth_lines, self.plot_psth_heat,
-            self.plot_net_matrix, self.plot_net_sync,
-        ]
-        for p in plots:
-            p.setBackground(bg)
-            p.getAxis("left").setTextPen(pg.mkPen(fg))
-            p.getAxis("bottom").setTextPen(pg.mkPen(fg))
-            p.getAxis("left").setPen(pg.mkPen(fg))
-            p.getAxis("bottom").setPen(pg.mkPen(fg))
-            p.showGrid(x=self._show_grid, y=self._show_grid, alpha=grid_alpha)
-        self.gl_basic_wvf.setBackground(bg)
-        self.gl_corr.setBackground(bg)
+        # Unit Basics, Raw Explorer, Condition PSTH, Network and Cell Types are now
+        # matplotlib canvases (themed via the figure functions' dark arg), so the
+        # only remaining pyqtgraph surface is the Advanced graphics layout. A theme
+        # switch re-renders the canvases via _refresh_current_page.
         self.gl_npyx.setBackground(bg)
         self.psth_summary_card.setStyleSheet(
             "QFrame#psthSummaryCard {"
@@ -616,6 +787,44 @@ class PostProcessingTab(QtWidgets.QWidget):
         )
         self.lbl_psth_hint.setStyleSheet(f"color: {meta_fg}; font-size: 11px;")
         self.lbl_psth_trial_status.setStyleSheet(f"color: {meta_fg}; font-size: 11px;")
+        self.lbl_units_count.setStyleSheet(f"color: {meta_fg}; font-size: 11px; font-weight: 600;")
+        self.lbl_c4_desc.setStyleSheet(f"color: {meta_fg}; font-size: 11px;")
+
+        # Settings dock + chevron: a quiet, card-like panel with a discrete
+        # boundary toggle (no heavy chrome).
+        panel_bg = "rgba(20, 28, 40, 0.55)" if self._plot_theme == "Dark" else "rgba(244, 247, 251, 0.85)"
+        panel_border = "rgba(120, 150, 210, 0.30)" if self._plot_theme == "Dark" else "rgba(67, 128, 255, 0.18)"
+        chevron_fg = "#9fb3d0" if self._plot_theme == "Dark" else "#6a778d"
+        chevron_hover_bg = "rgba(120, 150, 210, 0.22)" if self._plot_theme == "Dark" else "rgba(67, 128, 255, 0.12)"
+        self.settings_panel.setStyleSheet(
+            "QWidget#settingsPanel {"
+            f"background: {panel_bg};"
+            f"border: 1px solid {panel_border};"
+            "border-radius: 12px;"
+            "}"
+            "QLabel#settingsPanelTitle {"
+            f"color: {fg};"
+            "font-size: 12px;"
+            "font-weight: 700;"
+            "padding: 2px 2px 4px 2px;"
+            "}"
+        )
+        chevron_rest_bg = "rgba(120, 150, 210, 0.10)" if self._plot_theme == "Dark" else "rgba(67, 128, 255, 0.06)"
+        self.btn_settings_toggle.setStyleSheet(
+            "QToolButton#settingsToggle {"
+            f"color: {chevron_fg};"
+            f"border: 1px solid {panel_border};"
+            f"background: {chevron_rest_bg};"
+            "border-radius: 6px;"
+            "margin: 40px 0px;"  # a centered, pill-like grip rather than a full-height bar
+            "font-size: 16px;"
+            "font-weight: 700;"
+            "}"
+            "QToolButton#settingsToggle:hover {"
+            f"background: {chevron_hover_bg};"
+            f"color: {fg};"
+            "}"
+        )
 
     def _subplot_shape(self, n: int) -> tuple[int, int]:
         if n <= 1:
@@ -627,38 +836,23 @@ class PostProcessingTab(QtWidgets.QWidget):
     def _style_plot_item(self, plot: pg.PlotItem, left: str = "", bottom: str = "") -> None:
         fg = "#e8eef7" if self._plot_theme == "Dark" else "#1a1f29"
         grid_alpha = 0.25 if self._show_grid else 0.0
+        tick_font = QtGui.QFont("Segoe UI", 9)
         plot.showGrid(x=self._show_grid, y=self._show_grid, alpha=grid_alpha)
-        plot.getAxis("left").setTextPen(pg.mkPen(fg))
-        plot.getAxis("bottom").setTextPen(pg.mkPen(fg))
-        plot.getAxis("left").setPen(pg.mkPen(fg))
-        plot.getAxis("bottom").setPen(pg.mkPen(fg))
+        for ax_name in ("left", "bottom"):
+            ax = plot.getAxis(ax_name)
+            ax.setTextPen(pg.mkPen(fg))
+            ax.setPen(pg.mkPen(fg, width=1.2))
+            try:
+                ax.setStyle(tickFont=tick_font, tickTextOffset=6)
+            except Exception:
+                pass
+        plot.hideAxis("top")
+        plot.hideAxis("right")
+        label_css = {"color": fg, "font-size": "11pt"}
         if left:
-            plot.setLabel("left", left)
+            plot.setLabel("left", left, **label_css)
         if bottom:
-            plot.setLabel("bottom", bottom)
-
-    def _psth_palette(self, count: int) -> list[tuple[int, int, int]]:
-        if self._plot_theme == "Dark":
-            base = [
-                (107, 174, 255),
-                (255, 122, 156),
-                (104, 218, 193),
-                (255, 210, 112),
-                (182, 148, 255),
-                (255, 164, 103),
-            ]
-        else:
-            base = [
-                (45, 128, 216),
-                (222, 78, 121),
-                (19, 165, 137),
-                (220, 162, 47),
-                (126, 95, 228),
-                (230, 126, 34),
-            ]
-        if count <= len(base):
-            return base[:count]
-        return [base[i % len(base)] for i in range(count)]
+            plot.setLabel("bottom", bottom, **label_css)
 
     def _update_psth_trial_status(self) -> None:
         start = int(self.sp_psth_trial_from.value())
@@ -679,6 +873,11 @@ class PostProcessingTab(QtWidgets.QWidget):
 
     def _on_psth_trial_range_changed(self) -> None:
         self._update_psth_trial_status()
+        if self.analysis_tabs.currentIndex() == 3 and "psth" in self.results:
+            self._show_psth()
+
+    def _on_psth_display_options_changed(self, *args) -> None:
+        """Baseline / display-mode are render-time options: re-render, don't recompute."""
         if self.analysis_tabs.currentIndex() == 3 and "psth" in self.results:
             self._show_psth()
 
@@ -727,172 +926,6 @@ class PostProcessingTab(QtWidgets.QWidget):
         if peaks.size == 0 or not np.any(np.isfinite(peaks)):
             return None
         return int(np.nanargmax(peaks))
-
-    def _waveform_support_indices(self, waveform: Optional[np.ndarray], limit: int = 24) -> np.ndarray:
-        """Pick the channel indices that carry the unit's waveform energy.
-
-        Keeps channels whose peak amplitude is at least 10% of the strongest
-        channel, then clamps the count to a sensible min/max around `limit`.
-        Returns a sorted int array (empty when the waveform is unusable).
-        """
-        if waveform is None or waveform.ndim != 2 or waveform.shape[1] == 0:
-            return np.array([], dtype=int)
-        peaks = np.nanmax(np.abs(waveform), axis=0)
-        peaks = np.nan_to_num(peaks, nan=0.0, posinf=0.0, neginf=0.0)
-        if peaks.size == 0 or float(np.max(peaks)) <= 0.0:
-            return np.array([], dtype=int)
-        max_keep = min(max(1, int(limit)), int(peaks.size))
-        min_keep = min(max_keep, max(10, min(24, int(peaks.size))))
-        support = np.flatnonzero(peaks >= (0.1 * float(np.max(peaks))))
-        if support.size < min_keep:
-            support = np.argsort(peaks)[-min_keep:]
-        if support.size > max_keep:
-            strong = np.argsort(peaks[support])[::-1][:max_keep]
-            support = support[strong]
-        return np.sort(support.astype(int))
-
-    def _nice_scale_value(self, value: float) -> float:
-        """Round a magnitude up to a "nice" 1/2/5 x 10^n value for scale bars."""
-        value = float(abs(value))
-        if value <= 0.0 or not np.isfinite(value):
-            return 1.0
-        exponent = math.floor(math.log10(value))
-        fraction = value / (10 ** exponent)
-        if fraction < 1.5:
-            nice = 1.0
-        elif fraction < 3.5:
-            nice = 2.0
-        elif fraction < 7.5:
-            nice = 5.0
-        else:
-            nice = 10.0
-        return nice * (10 ** exponent)
-
-    def _add_scale_bar(
-        self,
-        plot: pg.PlotItem,
-        x0: float,
-        y0: float,
-        dx: float,
-        dy: float,
-        x_label: str,
-        y_label: str,
-    ) -> None:
-        fg = "#e8eef7" if self._plot_theme == "Dark" else "#1a1f29"
-        pen = pg.mkPen(fg, width=2)
-        plot.plot([x0, x0 + dx], [y0, y0], pen=pen)
-        plot.plot([x0, x0], [y0, y0 + dy], pen=pen)
-        x_margin = 0.10 * abs(dx if dx != 0 else 1.0)
-        y_margin = 0.12 * abs(dy if dy != 0 else 1.0)
-        x_text = pg.TextItem(text=x_label, color=fg, anchor=(0.5, 0.0))
-        x_text.setPos(x0 + 0.5 * dx, y0 - y_margin)
-        plot.addItem(x_text)
-        y_text = pg.TextItem(text=y_label, color=fg, anchor=(0.0, 1.0))
-        y_text.setPos(x0 + x_margin, y0 + dy + 0.35 * y_margin)
-        plot.addItem(y_text)
-
-    def _render_multichannel_waveform(self, unit: int, waveform: Optional[np.ndarray]) -> list[dict]:
-        self.gl_basic_wvf.clear()
-        if waveform is None or waveform.ndim != 2 or waveform.shape[1] == 0:
-            return []
-        fg = "#e8eef7" if self._plot_theme == "Dark" else "#1a1f29"
-        self.gl_basic_wvf.ci.layout.setHorizontalSpacing(18)
-        self.gl_basic_wvf.ci.layout.setVerticalSpacing(16)
-
-        support = self._waveform_support_indices(waveform, limit=4)
-        if support.size == 0:
-            best = self._best_channel_index(unit, waveform)
-            if best is None:
-                return []
-            support = np.array([best], dtype=int)
-        peaks = np.nanmax(np.abs(waveform), axis=0)
-        peaks = np.nan_to_num(peaks, nan=0.0, posinf=0.0, neginf=0.0)
-        best = self._best_channel_index(unit, waveform)
-        if best is None:
-            best = int(support[np.argmax(peaks[support])])
-        anchor_idx = int(np.nanargmax(np.abs(waveform[:, best])))
-        t_ms = (np.arange(waveform.shape[0], dtype=float) - float(anchor_idx)) / float(self.dataset.sample_rate) * 1000.0
-        amp_peak = max(float(np.nanmax(np.abs(waveform[:, support]))), 1.0)
-
-        positions = None
-        if self.dataset is not None and self.dataset.channel_positions is not None:
-            pos = np.asarray(self.dataset.channel_positions, dtype=float)
-            if pos.ndim == 2 and pos.shape[0] > int(np.max(support)) and pos.shape[1] >= 2:
-                positions = pos
-
-        if positions is not None:
-            order = np.lexsort((positions[support, 0], positions[support, 1]))
-            support = support[order]
-        else:
-            support = support[np.argsort(peaks[support])[::-1]]
-
-        waveform_rows: list[dict] = []
-        base_color = (91, 155, 255) if self._plot_theme == "Dark" else (67, 128, 255)
-        glow_color = (91, 155, 255, 80) if self._plot_theme == "Dark" else (67, 128, 255, 70)
-        y_lim = 1.18 * amp_peak
-        panel_y_min = -1.34 * y_lim
-        x_min = float(t_ms.min())
-        x_max = float(t_ms.max())
-        rows = 2 if support.size > 2 else 1
-        cols = 2 if support.size > 1 else 1
-        first_plot: Optional[pg.PlotItem] = None
-        for idx, ch in enumerate(support):
-            trace = np.asarray(waveform[:, int(ch)], dtype=float)
-            channel_id = int(ch)
-            if self.dataset is not None and self.dataset.channel_map is not None and self.dataset.channel_map.size > int(ch):
-                channel_id = int(np.asarray(self.dataset.channel_map).squeeze()[int(ch)])
-            is_best = int(ch) == int(best)
-            plot = self.gl_basic_wvf.addPlot(row=idx // cols, col=idx % cols)
-            if first_plot is None:
-                first_plot = plot
-            title = f"Unit {unit} | ch {channel_id}" if idx == 0 else f"ch {channel_id}"
-            if idx == 0:
-                plot.setTitle(f"Waveform | {title}", color=fg)
-            else:
-                plot.setTitle(str(channel_id), color=fg)
-            plot.showGrid(x=False, y=False, alpha=0.0)
-            plot.hideAxis("left")
-            plot.hideAxis("bottom")
-            plot.hideButtons()
-            plot.setMouseEnabled(x=False, y=False)
-            plot.setXRange(x_min, x_max, padding=0.0)
-            plot.setYRange(panel_y_min, y_lim, padding=0.0)
-            plot.plot([x_min, x_max], [0.0, 0.0], pen=pg.mkPen((160, 176, 198, 50), width=1))
-            plot.plot(t_ms, trace, pen=pg.mkPen(glow_color, width=9 if is_best else 7))
-            plot.plot(t_ms, trace, pen=pg.mkPen(base_color, width=2.8 if is_best else 2.0))
-            waveform_rows.extend(
-                [
-                    {
-                        "unit_id": int(unit),
-                        "channel_order": int(ch),
-                        "channel_id": channel_id,
-                        "time_ms": float(tm),
-                        "amplitude_uv": float(tv),
-                        "subplot_row": int(idx // cols),
-                        "subplot_col": int(idx % cols),
-                    }
-                    for tm, tv in zip(t_ms, trace)
-                ]
-            )
-
-        bar_ms = self._nice_scale_value(max(0.25, 0.24 * (x_max - x_min)))
-        bar_uv = self._nice_scale_value(max(20.0, 0.18 * amp_peak))
-        scale_plot = self.gl_basic_wvf.ci.getItem(rows - 1, 0)
-        if scale_plot is None:
-            scale_plot = first_plot
-        x0 = x_min + 0.06 * (x_max - x_min)
-        y0 = panel_y_min + 0.08 * (y_lim - panel_y_min)
-        if scale_plot is not None:
-            self._add_scale_bar(
-                scale_plot,
-                x0=x0,
-                y0=y0,
-                dx=bar_ms,
-                dy=bar_uv,
-                x_label=f"{bar_ms:g} ms",
-                y_label=f"{bar_uv:g} uV",
-            )
-        return waveform_rows
 
     def _annotate_image_values(self, plot: pg.PlotItem, mat: np.ndarray) -> None:
         if mat.ndim != 2 or mat.size == 0:
@@ -964,16 +997,6 @@ class PostProcessingTab(QtWidgets.QWidget):
         if self.analysis_tabs.currentIndex() == 5:
             self._refresh_current_page()
 
-    def _update_basic_plot_ratio(self) -> None:
-        if self._basic_row2_layout is None:
-            return
-        acg_r = max(1, int(self.sp_basic_acg_ratio.value()))
-        isi_r = max(1, int(self.sp_basic_isi_ratio.value()))
-        waveform_r = max(2, int(round((acg_r + isi_r) / 2.0)))
-        self._basic_row2_layout.setStretch(0, acg_r)
-        self._basic_row2_layout.setStretch(1, waveform_r)
-        self._basic_row2_layout.setStretch(2, isi_r)
-
     def _recording_duration_s(self) -> float:
         if self.dataset is None:
             return 0.0
@@ -1008,11 +1031,11 @@ class PostProcessingTab(QtWidgets.QWidget):
             self._attach_plots()
 
     def _detach_plots(self) -> None:
-        if self._plot_detached or self._right_panel_layout is None:
+        if self._plot_detached or self._figure_row_layout is None:
             return
         if self._body_splitter is not None:
             self._body_sizes_before_detach = self._body_splitter.sizes()
-        self._right_panel_layout.removeWidget(self.view_tabs)
+        self._figure_row_layout.removeWidget(self.view_tabs)
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Post Processing plots")
         dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
@@ -1033,13 +1056,15 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_detach_plots.setText("Attach plots")
 
     def _attach_plots(self) -> None:
-        if not self._plot_detached or self._right_panel_layout is None:
+        if not self._plot_detached or self._figure_row_layout is None:
             self.btn_detach_plots.setChecked(False)
             self.btn_detach_plots.setText("Detach plots")
             return
         if self._plot_dialog is not None:
             self._plot_dialog.layout().removeWidget(self.view_tabs)
-        self._right_panel_layout.addWidget(self.view_tabs, 1)
+        # Re-insert the figure stack at the left of the figure row (before the
+        # chevron + settings panel) so the layout returns to its original order.
+        self._figure_row_layout.insertWidget(0, self.view_tabs, 1)
         if self._plot_dialog is not None and self._plot_dialog.isVisible():
             self._plot_dialog.blockSignals(True)
             self._plot_dialog.close()
@@ -1052,7 +1077,7 @@ class PostProcessingTab(QtWidgets.QWidget):
             if self._body_sizes_before_detach:
                 self._body_splitter.setSizes(self._body_sizes_before_detach)
             else:
-                self._body_splitter.setSizes([3, 7])
+                self._body_splitter.setSizes([330, 1370])
         self.btn_detach_plots.blockSignals(True)
         self.btn_detach_plots.setChecked(False)
         self.btn_detach_plots.blockSignals(False)
@@ -1191,7 +1216,6 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._all_units = [int(u) for u in self.dataset.units.tolist()]
         self._update_basic_time_bounds()
         self._refresh_units_list()
-        self._basic_cache.clear()
         self._log(f"Loaded dataset with {len(self._all_units)} units")
         self._set_progress(0)
         self._refresh_current_page()
@@ -1247,14 +1271,23 @@ class PostProcessingTab(QtWidgets.QWidget):
         filt = self.ed_unit_filter.text().strip().lower()
         good_only = self.btn_good_only.isChecked()
         self.list_units.clear()
+        shown = 0
         for u in self._all_units:
             if filt and filt not in str(u):
                 continue
             if good_only and not self._unit_is_good(u):
                 continue
             self.list_units.addItem(str(u))
+            shown += 1
             if u in prev:
                 self.list_units.item(self.list_units.count() - 1).setSelected(True)
+        total = len(self._all_units)
+        if total == 0:
+            self.lbl_units_count.setText("No dataset loaded.")
+        elif shown == total:
+            self.lbl_units_count.setText(f"{total} units")
+        else:
+            self.lbl_units_count.setText(f"{shown} of {total} units shown")
 
     def _selected_units(self) -> list[int]:
         return [int(i.text()) for i in self.list_units.selectedItems()]
@@ -1315,6 +1348,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.tbl_unit_quality.resizeColumnsToContents()
     def _on_analysis_page_changed(self, idx: int) -> None:
         self.view_tabs.setCurrentIndex(idx)
+        self._sync_settings_page(idx)
         self._refresh_current_page()
 
     def _refresh_current_page(self) -> None:
@@ -1339,6 +1373,10 @@ class PostProcessingTab(QtWidgets.QWidget):
                 self._show_network()
             elif idx == 5:
                 self._show_npyx_corr()
+            elif idx == 6:
+                # Cell Types (C4) is expensive and runs only on the Run button.
+                # Leave the last result shown; otherwise prompt to run.
+                self._show_c4_idle()
         except Exception as exc:
             self._log(f"Page render error: {exc}")
 
@@ -1369,13 +1407,62 @@ class PostProcessingTab(QtWidgets.QWidget):
         return items
 
     def _show_corr(self) -> None:
-        items = self._corr_items_from_selection()
-        if not items:
-            self.gl_corr.clear()
+        """Render the Correlogram view with real NeuroPyxels figures (npyx.plot)."""
+        if self.dataset is None:
+            return
+        units = self._selected_units()
+        mode = self.cb_corr_mode.currentText()
+        if not units:
+            self.corr_npyx.show_message("Select unit(s) in the Units list to render the NeuroPyxels correlogram.")
             self._export_payloads["corr"] = []
             return
-        self._set_progress(100)
-        self._visualize_corr({"mode": self.cb_corr_mode.currentText(), "items": items})
+        if mode == "CCG" and len(units) < 2:
+            self.corr_npyx.show_message("Select at least two units for a cross-correlogram (CCG) grid.")
+            self._export_payloads["corr"] = []
+            return
+
+        dp = str(self.dataset.ks_folder)
+        fs = float(self.dataset.sample_rate)
+        cbin = float(self.sp_corr_bin.value())
+        cwin = float(self.sp_corr_win.value())
+        normalize = self.cb_corr_norm.currentText()
+        style = self.cb_corr_style.currentText()
+        dark = self._plot_theme == "Dark"
+        max_units = 6
+        plot_units = units[:max_units]
+
+        self._set_progress(20)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            if mode == "ACG":
+                fig = acg_grid_figure(dp, plot_units, cbin=cbin, cwin=cwin, fs=fs, normalize=normalize, dark=dark)
+            else:
+                fig = ccg_grid_figure(dp, plot_units, cbin=cbin, cwin=cwin, fs=fs, normalize=normalize, style=style, dark=dark)
+            self.corr_npyx.show_figure(fig)
+            if len(units) > max_units:
+                self._log(f"Correlogram: showing the first {max_units} of {len(units)} selected units for legibility.")
+        except Exception as exc:
+            self.corr_npyx.show_message(f"NeuroPyxels correlogram failed: {exc}")
+            self._log(f"Correlogram render error: {exc}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._set_progress(100)
+
+        try:
+            self._export_payloads["corr"] = self._corr_export_rows()
+        except Exception:
+            self._export_payloads["corr"] = []
+
+    def _corr_export_rows(self) -> list[tuple[str, "pd.DataFrame"]]:
+        """Build the CSV export rows for the current correlogram selection (engine arrays)."""
+        items = self._corr_items_from_selection()
+        flat: list[dict] = []
+        for it in items:
+            centers = np.asarray(it.get("centers", []), dtype=float)
+            counts = np.asarray(it.get("counts", []), dtype=float)
+            for c, v in zip(centers, counts):
+                flat.append({"unit_a": int(it["u1"]), "unit_b": int(it["u2"]), "lag_ms": float(c), "value": float(v)})
+        return [("correlogram.csv", pd.DataFrame(flat))]
 
     def _compute_psth(self) -> None:
         units = self._selected_units()
@@ -1461,346 +1548,268 @@ class PostProcessingTab(QtWidgets.QWidget):
         units = self._selected_units()
         if len(units) < 2:
             self._log("Network compute: select at least 2 units.")
+            self.net_view.show_message("Select at least two units to compute network metrics.")
             return
         self._busy = True
-        self._log("Computing network metrics...")
+        self._log("Computing network analysis...")
         self._set_progress(10)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            mat = self.dataset.ccg_matrix(units, bin_ms=float(self.sp_net_bin.value()), win_ms=float(self.sp_net_win.value()))
-            grouping = cluster_synced_units(units, mat)
-            self._set_progress(60)
-            t_s, idx = self.dataset.synchrony_over_time(
-                bin_ms=float(self.sp_sync_bin.value()), window_s=float(self.sp_sync_win.value()), step_s=float(self.sp_sync_step.value())
+            self.results["network"] = self.dataset.network_analysis(
+                units,
+                bin_ms=float(self.sp_net_bin.value()),
+                conn_z=float(self.sp_net_z.value()),
             )
-            self.results["network"] = {
-                "mat": mat,
-                "t_s": t_s,
-                "idx": idx,
-                "units": np.asarray(units, dtype=int),
-                "order": grouping["order"],
-                "sorted_units": grouping["sorted_units"],
-                "group_labels": grouping["group_labels"],
-                "sync_group_threshold": grouping["threshold"],
-            }
             self._set_progress(100)
-            self._log("Network metrics computed.")
+            n_sig = int(self.results["network"].get("n_significant", 0))
+            self._log(f"Network analysis computed ({len(units)} units, {n_sig} significant connections).")
             self._show_network()
+        except Exception as exc:  # noqa: BLE001
+            self.net_view.show_message(f"Network analysis failed: {exc}")
+            self._log(f"Network compute error: {exc}")
         finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
             self._busy = False
 
     def _show_network(self) -> None:
         r = self.results.get("network")
         if not r:
+            self.net_view.show_message("Select units and click Compute to run the network analysis.")
             return
         self._visualize_network(r)
 
-    def _visualize_basic(self) -> None:
+    def _show_c4_idle(self) -> None:
+        """C4 page render: show the last result if present, else an instruction."""
+        if self._c4_running:
+            return
+        result = self.results.get("c4")
+        if result:
+            self._render_c4(result)
+        else:
+            self.c4_view.show_message(
+                "NeuroPyxels C4 cell-type classifier.\n"
+                "Select units and click 'Run C4 classifier' (this can take ~1 min)."
+            )
+
+    def _render_c4(self, result: Dict[str, object]) -> None:
+        """Render a C4 result dict into the C4 canvas (graceful on errors)."""
+        try:
+            from .. import unit_figures  # lazy import
+        except Exception as exc:  # noqa: BLE001
+            self.c4_view.show_message(f"C4 figure module unavailable: {exc}")
+            return
+        try:
+            fig = unit_figures.c4_figure(result, dark=(self._plot_theme == "Dark"))
+            self.c4_view.show_figure(fig)
+        except Exception as exc:  # noqa: BLE001
+            self.c4_view.show_message(f"C4 figure failed: {exc}")
+            self._log(f"C4 render error: {exc}")
+
+    def _run_c4(self) -> None:
+        """Run the C4 classifier off the GUI thread via FunctionWorker."""
+        if self._c4_running:
+            return
+        if self.dataset is None:
+            self._log("C4: load a dataset first.")
+            return
         units = self._selected_units()
         if not units:
+            self._log("C4: select one or more units to classify.")
+            self.c4_view.show_message("Select one or more units, then click 'Run C4 classifier'.")
             return
-        u0 = int(units[0])
-        t0 = float(self.sp_basic_t0.value())
-        rec_dur = self._recording_duration_s()
-        t1 = t0 + float(self.sp_basic_dur.value())
-        if rec_dur > 0.0:
-            t1 = min(t1, rec_dur)
-        self.plot_basic_spikes.clear()
-        self.plot_basic_acg.clear()
-        self.plot_basic_isi.clear()
-        self.gl_basic_wvf.clear()
-        payload = {
-            "units": [int(u) for u in units],
-            "t0": t0,
-            "dur": float(self.sp_basic_dur.value()),
-            "isi_max": float(self.sp_isi_max.value()),
-            "ifr": bool(self.ck_ifr.isChecked()),
-            "ifr_smooth_ms": float(self.sp_ifr_smooth_ms.value()),
-            "acg_bin_ms": float(self.sp_basic_acg_bin.value()),
-            "acg_win_ms": float(self.sp_basic_acg_win.value()),
-        }
-        cache_key = json.dumps(payload, sort_keys=True)
-        basic = self._basic_cache.get(cache_key)
-        if basic is None:
-            spike_items: list[dict] = []
-            ifr_items: list[dict] = []
-            for i, u in enumerate(units):
-                spikes = self.dataset.unit_spike_times_s(u)
-                st = spikes[(spikes >= t0) & (spikes <= t1)]
-                spike_items.append({"unit": int(u), "row": int(i + 1), "st": st - t0})
-                if self.ck_ifr.isChecked() and st.size:
-                    bin_s = max(float(self.sp_ifr_smooth_ms.value()) / 1000.0, 0.005)
-                    edges = np.arange(t0, t1 + bin_s, bin_s)
-                    c, _ = np.histogram(st, bins=edges)
-                    rate = c / bin_s
-                    centers = 0.5 * (edges[:-1] + edges[1:]) - t0
-                    ifr_items.append({"unit": int(u), "row": int(i + 1), "centers": centers, "rate": rate})
-            isi_edges, isi_hist = self.dataset.isi_hist(u0, max_ms=float(self.sp_isi_max.value()), bins=80)
-            acg_centers, acg_counts = self.dataset.correlogram(
-                u0,
-                u0,
-                bin_ms=float(self.sp_basic_acg_bin.value()),
-                win_ms=float(self.sp_basic_acg_win.value()),
-                remove_zero=True,
-            )
-            waveform = self.dataset.mean_template_waveform(u0)
-            basic = {
-                "spike_items": spike_items,
-                "ifr_items": ifr_items,
-                "waveform_unit": u0,
-                "waveform": waveform,
-                "isi_edges": isi_edges,
-                "isi_hist": isi_hist,
-                "acg_centers": acg_centers,
-                "acg_counts": acg_counts,
-            }
-            self._basic_cache[cache_key] = basic
+        try:
+            from ..workers import FunctionWorker
+            from ..c4_runner import run_c4_classifier
+        except Exception as exc:  # noqa: BLE001
+            self.c4_view.show_message(f"C4 runner unavailable: {exc}")
+            self._log(f"C4 unavailable: {exc}")
+            return
 
-        spike_rows: list[dict] = []
-        ifr_rows: list[dict] = []
-        wvf_rows: list[dict] = []
-        acg_rows: list[dict] = []
-        isi_rows: list[dict] = []
+        self.view_tabs.setCurrentIndex(6)
+        self._c4_running = True
+        self.btn_c4_run.setEnabled(False)
+        self.btn_c4_run.setText("Running C4...")
+        self._log(f"Running C4 on {len(units)} unit(s) (this can take ~1 min)...")
+        self.c4_view.show_message("Running the C4 classifier in an isolated environment...\nThis can take about a minute.")
+        self._set_progress(10)
+        worker = FunctionWorker(
+            run_c4_classifier,
+            str(self.dataset.ks_folder),
+            list(units),
+            threshold=float(self.sp_c4_threshold.value()),
+        )
+        worker.signals.finished.connect(self._on_c4_finished)
+        self.pool.start(worker)
 
-        for i, item in enumerate(basic.get("spike_items", [])):
-            u = int(item["unit"])
-            st_rel = np.asarray(item["st"], dtype=float)
-            row = float(item["row"])
-            if st_rel.size:
-                y = np.full_like(st_rel, row, dtype=float)
-                self.plot_basic_spikes.plot(st_rel, y, pen=None, symbol="o", symbolSize=3, symbolBrush=pg.intColor(i, hues=max(len(units), 4)))
-                spike_rows.extend([{"unit_id": u, "time_s": float(v)} for v in st_rel])
-
-        for i, item in enumerate(basic.get("ifr_items", [])):
-            centers = np.asarray(item["centers"], dtype=float)
-            rate = np.asarray(item["rate"], dtype=float)
-            if centers.size == 0 or rate.size == 0:
-                continue
-            row = float(item["row"])
-            scale = 0.35 / max(float(np.max(rate)), 1e-9)
-            self.plot_basic_spikes.plot(centers, row + rate * scale, pen=pg.mkPen(pg.intColor(i), width=1.5))
-            ifr_rows.extend([{"unit_id": int(item["unit"]), "time_s": float(tc), "ifr_hz": float(rv)} for tc, rv in zip(centers, rate)])
-        self.plot_basic_spikes.setYRange(0.5, len(units) + 1.2)
-        self.plot_basic_spikes.setLabel("left", "Selected unit index")
-        self.plot_basic_spikes.setLabel("bottom", "Time (s)")
-
-        acg_centers = np.asarray(basic.get("acg_centers", []), dtype=float)
-        acg_counts = np.asarray(basic.get("acg_counts", []), dtype=float)
-        if acg_centers.size and acg_counts.size:
-            acg_width = float(np.median(np.diff(acg_centers))) if acg_centers.size > 1 else float(self.sp_corr_bin.value())
-            bar_rgb = (108, 168, 255) if self._plot_theme == "Dark" else (74, 144, 226)
-            bar_alpha = 170 if self._plot_theme == "Dark" else 185
-            bar_width = abs(acg_width) * 0.90
-            for cx, cc in zip(acg_centers, acg_counts):
-                self.plot_basic_acg.addItem(
-                    pg.BarGraphItem(
-                        x=[float(cx)],
-                        height=[float(cc)],
-                        width=bar_width,
-                        brush=bar_rgb + (bar_alpha,),
-                        pen=pg.mkPen(bar_rgb + (min(bar_alpha + 20, 255),), width=0.7),
-                    )
+    @QtCore.Slot(dict)
+    def _on_c4_finished(self, payload: Dict[str, object]) -> None:
+        """GUI-thread handler for the C4 worker result."""
+        self._c4_running = False
+        self.btn_c4_run.setEnabled(True)
+        self.btn_c4_run.setText("Run C4 classifier")
+        self._set_progress(100)
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not payload.get("ok") or not isinstance(result, dict):
+            msg = "C4 classification failed (see log)."
+            self.c4_view.show_message(msg)
+            self._log(msg)
+            return
+        self.results["c4"] = result
+        err = result.get("error")
+        if err:
+            self._log(f"C4: {err}")
+        else:
+            n_units = len(result.get("units", []))
+            n_skipped = len(result.get("skipped_units", []))
+            model = str(result.get("model_type", "C4"))
+            self._log(f"C4 classified {n_units} unit(s) with {model}; {n_skipped} skipped.")
+        self._render_c4(result)
+        # Build a non-crashing CSV export from the result.
+        try:
+            units_out = [int(u) for u in result.get("units", [])]
+            predicted = [str(x) for x in result.get("predicted_type", [])]
+            confidence = np.asarray(result.get("confidence", []), dtype=float)
+            ratio = np.asarray(result.get("confidence_ratio", []), dtype=float)
+            rows = []
+            for i, u in enumerate(units_out):
+                rows.append(
+                    {
+                        "unit_id": int(u),
+                        "predicted_type": predicted[i] if i < len(predicted) else "",
+                        "confidence": float(confidence[i]) if i < confidence.size else np.nan,
+                        "confidence_ratio": float(ratio[i]) if i < ratio.size else np.nan,
+                    }
                 )
-            refractory_ms = min(2.0, max(0.5, 2.0 * abs(acg_width)))
-            self.plot_basic_acg.addItem(
-                pg.LinearRegionItem(
-                    values=(-refractory_ms, refractory_ms),
-                    orientation="vertical",
-                    brush=pg.mkBrush(92, 154, 255, 22),
-                    pen=pg.mkPen((92, 154, 255, 0)),
-                    movable=False,
-                )
-            )
-            self.plot_basic_acg.setLabel("left", "count")
-            self.plot_basic_acg.setLabel("bottom", "Lag (ms)")
-            self.plot_basic_acg.addItem(pg.InfiniteLine(pos=0.0, angle=90, pen=pg.mkPen((150, 150, 150), width=1, style=QtCore.Qt.DashLine)))
-            self.plot_basic_acg.setXRange(float(acg_centers.min()) - abs(acg_width), float(acg_centers.max()) + abs(acg_width), padding=0.0)
-            self.plot_basic_acg.setYRange(0.0, float(np.max(acg_counts)) * 1.18 if np.max(acg_counts) > 0 else 1.0, padding=0.0)
-            acg_rows.extend([{"unit_id": int(units[0]), "lag_ms": float(cx), "count": float(cc)} for cx, cc in zip(acg_centers, acg_counts)])
+            self._export_payloads["c4"] = [("cell_types_c4.csv", pd.DataFrame(rows))]
+        except Exception:
+            self._export_payloads["c4"] = [("cell_types_c4.csv", pd.DataFrame())]
 
-        isi_edges = np.asarray(basic.get("isi_edges", []), dtype=float)
-        isi_hist = np.asarray(basic.get("isi_hist", []), dtype=float)
-        if isi_edges.size and isi_hist.size:
-            widths = np.diff(isi_edges)
-            self.plot_basic_isi.addItem(
-                pg.BarGraphItem(
-                    x=isi_edges[:-1],
-                    height=isi_hist,
-                    width=widths * 0.92,
-                    brush=(245, 171, 66, 210),
-                    pen=pg.mkPen((125, 82, 18), width=0.8),
-                )
-            )
-            self.plot_basic_isi.setXRange(float(isi_edges[0]), float(isi_edges[-1]), padding=0.0)
-            self.plot_basic_isi.setYRange(0.0, float(np.max(isi_hist)) * 1.18 if np.max(isi_hist) > 0 else 1.0, padding=0.0)
-            self.plot_basic_isi.setLabel("left", "count")
-            self.plot_basic_isi.setLabel("bottom", "ISI (ms)")
-            isi_rows.extend([{"unit_id": int(units[0]), "isi_left_ms": float(l), "isi_right_ms": float(r), "count": float(h)} for l, r, h in zip(isi_edges[:-1], isi_edges[1:], isi_hist)])
-
-        waveform = basic.get("waveform")
-        if isinstance(waveform, np.ndarray):
-            wvf_rows = self._render_multichannel_waveform(int(basic.get("waveform_unit", u0)), waveform)
-        self._export_payloads["basic"] = [
-            ("unit_basics_raster.csv", pd.DataFrame(spike_rows)),
-            ("unit_basics_ifr.csv", pd.DataFrame(ifr_rows)),
-            ("unit_basics_autocorrelogram.csv", pd.DataFrame(acg_rows)),
-            ("unit_basics_isi.csv", pd.DataFrame(isi_rows)),
-            ("unit_basics_waveform.csv", pd.DataFrame(wvf_rows)),
-        ]
+    def _visualize_basic(self) -> None:
+        """Render the npyx-style Unit Basics composite as a matplotlib canvas."""
         self.view_tabs.setCurrentIndex(0)
+        units = self._selected_units()
+        if not units:
+            self.basics_view.show_message("Select unit(s) in the Units list to render the Unit Basics figure.")
+            self._export_payloads["basic"] = []
+            return
+        try:
+            from .. import unit_figures  # lazy import: tolerate a momentarily absent module
+        except Exception as exc:  # noqa: BLE001
+            self.basics_view.show_message(f"Unit Basics figure module unavailable: {exc}")
+            self._export_payloads["basic"] = []
+            return
+
+        self._set_progress(20)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            fig = unit_figures.unit_basics_figure(
+                self.dataset,
+                self._selected_units(),
+                window_start_s=float(self.sp_basic_t0.value()),
+                window_s=float(self.sp_basic_dur.value()),
+                ifr_bin_ms=float(self.sp_ifr_smooth_ms.value()),
+                acg_bin_ms=float(self.sp_basic_acg_bin.value()),
+                acg_win_ms=float(self.sp_basic_acg_win.value()),
+                isi_max_ms=float(self.sp_isi_max.value()),
+                show_ifr=bool(self.ck_ifr.isChecked()),
+                dark=(self._plot_theme == "Dark"),
+            )
+            self.basics_view.show_figure(fig)
+        except Exception as exc:  # noqa: BLE001
+            self.basics_view.show_message(f"Unit Basics figure failed: {exc}")
+            self._log(f"Unit Basics render error: {exc}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._set_progress(100)
+
+        # A simple, non-crashing export summary of the current selection/window.
+        try:
+            self._export_payloads["basic"] = [
+                (
+                    "unit_basics_summary.csv",
+                    pd.DataFrame(
+                        [
+                            {
+                                "units": ",".join(str(int(u)) for u in units),
+                                "window_start_s": float(self.sp_basic_t0.value()),
+                                "window_s": float(self.sp_basic_dur.value()),
+                                "ifr_bin_ms": float(self.sp_ifr_smooth_ms.value()),
+                                "acg_bin_ms": float(self.sp_basic_acg_bin.value()),
+                                "acg_win_ms": float(self.sp_basic_acg_win.value()),
+                                "isi_max_ms": float(self.sp_isi_max.value()),
+                                "show_ifr": bool(self.ck_ifr.isChecked()),
+                            }
+                        ]
+                    ),
+                )
+            ]
+        except Exception:
+            self._export_payloads["basic"] = []
 
     def _visualize_raw(self) -> None:
-        self.plot_raw.clear()
+        """Render the Raw Explorer as a matplotlib canvas (npyx-style)."""
+        self.view_tabs.setCurrentIndex(1)
+        try:
+            from .. import unit_figures  # lazy import: tolerate a momentarily absent module
+        except Exception as exc:  # noqa: BLE001
+            self.raw_view.show_message(f"Raw Explorer figure module unavailable: {exc}")
+            self._export_payloads["raw"] = []
+            return
+
         units = self._selected_units()
         focus_unit = int(units[0]) if units else None
-        focus_waveform = self.dataset.mean_template_waveform(focus_unit) if focus_unit is not None else None
-        focus_center = self._best_channel_index(focus_unit, focus_waveform) if focus_unit is not None else None
-        t, x, channel_ids, channel_order = self.dataset.raw_explorer_chunk(
-            t0_s=float(self.sp_raw_t0.value()),
-            dur_s=float(self.sp_raw_dur.value()),
-            max_channels=int(self.sp_raw_ch.value()),
-            hp_hz=float(self.sp_raw_hp.value()),
-            lp_hz=float(self.sp_raw_lp.value()),
-            downsample=int(self.sp_raw_ds.value()),
-            center_channel=focus_center,
-        )
-        if x.size == 0:
-            return
-        n_ch = int(x.shape[1])
-        channel_ids = np.asarray(channel_ids, dtype=int)
-        channel_order = np.asarray(channel_order, dtype=int)
-        axis_labels: list[str]
-        if (
-            self.cb_raw_y.currentText().startswith("Depth")
-            and self.dataset.channel_positions is not None
-            and np.max(channel_order) < int(self.dataset.channel_positions.shape[0])
-        ):
-            y_values = np.asarray(self.dataset.channel_positions, dtype=float)[channel_order, 1] / 1000.0
-            axis_labels = [f"{float(v):.3f}" for v in y_values]
-            y_label = "Depth (mm)"
-        else:
-            y_values = channel_ids.astype(float)
-            axis_labels = [str(int(v)) for v in channel_ids]
-            y_label = "Channel ID"
-        y_base = np.arange(n_ch, dtype=float)
-        x_centered = x - np.nanmedian(x, axis=0, keepdims=True)
-        amp = max(float(np.nanpercentile(np.abs(x_centered), 99.8)), 1.0)
-        spacing = 1.0
-        scale = 0.32 / amp
-        self.plot_raw.setLabel("left", y_label)
-        left_axis = self.plot_raw.getAxis("left")
-        tick_step = max(1, int(math.ceil(float(n_ch) / 10.0)))
-        tick_pairs = [(float(y_base[i]), axis_labels[i]) for i in range(0, n_ch, tick_step)]
-        if tick_pairs[-1][0] != float(y_base[-1]):
-            tick_pairs.append((float(y_base[-1]), axis_labels[-1]))
-        left_axis.setTicks([tick_pairs])
-        raw_pen = pg.mkPen((220, 228, 240, 150), width=0.8) if self._plot_theme == "Dark" else pg.mkPen((28, 36, 48, 145), width=0.8)
-        raw_focus_pen = pg.mkPen((255, 255, 255, 205), width=1.05) if self._plot_theme == "Dark" else pg.mkPen((20, 24, 30, 205), width=1.05)
-        for c in range(n_ch):
-            pen = raw_pen
-            if focus_center is not None and int(channel_order[c]) == int(focus_center):
-                pen = raw_focus_pen
-            self.plot_raw.plot(t, y_base[c] + x_centered[:, c] * scale, pen=pen)
+        focus_center = None
+        if focus_unit is not None:
+            focus_waveform = self.dataset.mean_template_waveform(focus_unit)
+            focus_center = self._best_channel_index(focus_unit, focus_waveform)
+        overlay_units = tuple(units) if self.ck_raw_overlay.isChecked() else ()
+        y_mode = "depth" if self.cb_raw_y.currentText().startswith("Depth") else "channel"
 
-        if focus_waveform is not None:
-            focus_support = self._waveform_support_indices(focus_waveform, limit=min(32, n_ch))
-            display_mask = np.isin(channel_order, focus_support)
-            if np.any(display_mask):
-                support_y = y_base[display_mask]
-                pad = 0.36 * spacing
-                band = pg.LinearRegionItem(
-                    values=(float(np.min(support_y)) - pad, float(np.max(support_y)) + pad),
-                    orientation="horizontal",
-                    brush=pg.mkBrush(67, 128, 255, 12),
-                    pen=pg.mkPen((67, 128, 255, 35), width=0.8),
-                    movable=False,
+        self._set_progress(20)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            fig = unit_figures.raw_explorer_figure(
+                self.dataset,
+                t0_s=float(self.sp_raw_t0.value()),
+                dur_s=float(self.sp_raw_dur.value()),
+                n_channels=int(self.sp_raw_ch.value()),
+                hp_hz=float(self.sp_raw_hp.value()),
+                lp_hz=float(self.sp_raw_lp.value()),
+                center_channel=focus_center,
+                overlay_units=overlay_units,
+                y_mode=y_mode,
+                dark=(self._plot_theme == "Dark"),
+            )
+            self.raw_view.show_figure(fig)
+        except Exception as exc:  # noqa: BLE001
+            self.raw_view.show_message(f"Raw Explorer figure failed: {exc}")
+            self._log(f"Raw Explorer render error: {exc}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._set_progress(100)
+
+        try:
+            self._export_payloads["raw"] = [
+                (
+                    "raw_explorer_summary.csv",
+                    pd.DataFrame(
+                        [
+                            {
+                                "t0_s": float(self.sp_raw_t0.value()),
+                                "dur_s": float(self.sp_raw_dur.value()),
+                                "n_channels": int(self.sp_raw_ch.value()),
+                                "hp_hz": float(self.sp_raw_hp.value()),
+                                "lp_hz": float(self.sp_raw_lp.value()),
+                                "center_channel": (-1 if focus_center is None else int(focus_center)),
+                                "y_mode": y_mode,
+                                "overlay_units": ",".join(str(int(u)) for u in overlay_units),
+                            }
+                        ]
+                    ),
                 )
-                self.plot_raw.addItem(band)
-
-        if self.ck_raw_overlay.isChecked():
-            for i, u in enumerate(units):
-                st = self.dataset.unit_spike_times_s(u)
-                st = st[(st >= t[0]) & (st <= t[-1])]
-                if st.size == 0:
-                    continue
-                wvf = self.dataset.mean_template_waveform(u)
-                support = self._waveform_support_indices(wvf, limit=min(28, n_ch))
-                if support.size == 0:
-                    best = self._best_channel_index(u, wvf)
-                    support = np.array([best], dtype=int) if best is not None else np.array([], dtype=int)
-                mask = np.isin(channel_order, support)
-                if not np.any(mask):
-                    continue
-                if st.size > 36:
-                    stride = int(math.ceil(float(st.size) / 36.0))
-                    st = st[::stride]
-                color = pg.intColor(i, hues=max(len(units), 4))
-                overlay_pen = pg.mkPen(color, width=1.0)
-                for ch_local in np.flatnonzero(mask):
-                    y0 = float(y_base[ch_local] - 0.28 * spacing)
-                    y1 = float(y_base[ch_local] + 0.28 * spacing)
-                    xs = np.empty(st.size * 3, dtype=float)
-                    ys = np.empty(st.size * 3, dtype=float)
-                    xs[0::3] = st
-                    xs[1::3] = st
-                    xs[2::3] = np.nan
-                    ys[0::3] = y0
-                    ys[1::3] = y1
-                    ys[2::3] = np.nan
-                    self.plot_raw.plot(xs, ys, pen=overlay_pen)
-        self.plot_raw.setLabel("bottom", "Time (s)")
-        self.plot_raw.setXRange(float(t[0]), float(t[-1]), padding=0.0)
-        self.plot_raw.setYRange(float(np.min(y_base) - spacing), float(np.max(y_base) + spacing), padding=0.0)
-        raw_rows: list[dict] = []
-        for c in range(n_ch):
-            raw_rows.extend(
-                [
-                    {
-                        "time_s": float(tv),
-                        "channel_index": int(channel_order[c]),
-                        "channel_id": int(channel_ids[c]),
-                        "axis_value": float(y_base[c]),
-                        "signal_scaled": float(y_base[c] + xv * scale),
-                    }
-                    for tv, xv in zip(t, x_centered[:, c])
-                ]
-            )
-        self._export_payloads["raw"] = [("raw_explorer.csv", pd.DataFrame(raw_rows))]
-        self.view_tabs.setCurrentIndex(1)
-
-    def _visualize_corr(self, r: Dict[str, object]) -> None:
-        self.gl_corr.clear()
-        items = r.get("items", [])
-        if not isinstance(items, list) or not items:
-            centers = np.asarray(r.get("centers", []), dtype=float)
-            counts = np.asarray(r.get("counts", []), dtype=float)
-            if centers.size and counts.size:
-                items = [{"u1": int(r.get("u1", 0)), "u2": int(r.get("u2", 0)), "centers": centers, "counts": counts}]
-            else:
-                return
-        rows, cols = self._subplot_shape(len(items))
-        corr_rows: list[dict] = []
-        for i, item in enumerate(items):
-            centers = np.asarray(item.get("centers", []), dtype=float)
-            counts = np.asarray(item.get("counts", []), dtype=float)
-            if centers.size == 0 or counts.size == 0:
-                continue
-            u1 = int(item.get("u1", -1))
-            u2 = int(item.get("u2", -1))
-            plot = self.gl_corr.addPlot(row=i // cols, col=i % cols, title=f"{u1} vs {u2}")
-            self._style_plot_item(plot, left="Count", bottom="Lag (ms)")
-            width = float(np.median(np.diff(centers))) if centers.size > 1 else float(self.sp_corr_bin.value())
-            plot.addItem(pg.BarGraphItem(x=centers, height=counts, width=abs(width), brush=(255, 180, 120, 110)))
-            y = pd.Series(counts).rolling(window=max(3, int(5.0 / max(abs(width), 1e-6))), center=True, min_periods=1).mean().to_numpy()
-            plot.plot(centers, y, pen=pg.mkPen((80, 150, 255), width=2))
-            plot.addItem(pg.InfiniteLine(pos=0.0, angle=90, pen=pg.mkPen((150, 150, 150), width=1, style=QtCore.Qt.DashLine)))
-            corr_rows.extend(
-                [
-                    {"unit_a": u1, "unit_b": u2, "lag_ms": float(cx), "count": float(cc), "smoothed_count": float(cs)}
-                    for cx, cc, cs in zip(centers, counts, y)
-                ]
-            )
-        self._export_payloads["corr"] = [("correlogram.csv", pd.DataFrame(corr_rows))]
-        self.view_tabs.setCurrentIndex(2)
+            ]
+        except Exception:
+            self._export_payloads["raw"] = []
 
     def _add_condition_row(self) -> None:
         r = self.tbl_conditions.rowCount()
@@ -1840,7 +1849,9 @@ class PostProcessingTab(QtWidgets.QWidget):
         widget = self.tbl_conditions.cellWidget(row, 1)
         return widget if isinstance(widget, QtWidgets.QComboBox) else None
 
-    def _set_condition_label_options(self, row: int, labels: List[str], selected_label: str = "") -> None:
+    def _set_condition_label_options(
+        self, row: int, labels: List[str], selected_label: str = "", all_label: str = "All events"
+    ) -> None:
         combo = self._condition_label_combo(row)
         if combo is None:
             combo = QtWidgets.QComboBox(self.tbl_conditions)
@@ -1849,7 +1860,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         current = str(selected_label or combo.currentData() or "").strip()
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem("All events", "")
+        combo.addItem(all_label, "")
         for label in labels:
             combo.addItem(str(label), str(label))
         if current:
@@ -1922,11 +1933,20 @@ class PostProcessingTab(QtWidgets.QWidget):
         if (not preserve_name) or (not current_name) or current_name.startswith("cond_"):
             self.tbl_conditions.setItem(row, 0, QtWidgets.QTableWidgetItem(auto_name))
         del blocker
-        self._set_condition_label_options(row, labels, selected_label)
+        is_matrix = info.get("kind") == "behavior_matrix"
+        all_label = "All behaviors (pooled)" if is_matrix else "All events"
+        self._set_condition_label_options(row, labels, selected_label, all_label=all_label)
         time_column = str(info.get("time_column") or "")
         label_column = str(info.get("label_column") or "")
         if announce:
-            if time_column and label_column:
+            if is_matrix:
+                fps = float(info.get("frame_rate") or 30.0)
+                tnote = f"time='{time_column}'" if time_column else f"no time column (using {fps:g} fps)"
+                self._log(
+                    f"Behavior matrix loaded: {Path(csv_path).name} | {len(labels)} behaviors | "
+                    f"{tnote}. Pick a behavior in the Event label column (use 'Add all behaviors' for all)."
+                )
+            elif time_column and label_column:
                 self._log(
                     f"Events CSV loaded: {Path(csv_path).name} | time='{time_column}' | "
                     f"label='{label_column}' ({len(labels)} labels)"
@@ -1953,370 +1973,241 @@ class PostProcessingTab(QtWidgets.QWidget):
             self._refresh_current_page()
 
     def _load_event_csv(self, path: str, selected_label: str = "") -> np.ndarray:
-        return load_event_times(path, selected_label=selected_label).to_numpy(dtype=float)
+        return load_event_times(
+            path,
+            selected_label=selected_label,
+            frame_rate=float(self.sp_psth_fps.value()),
+            alignment=self.cb_psth_align.currentText(),
+        ).to_numpy(dtype=float)
+
+    def _on_psth_event_options_changed(self, *args) -> None:
+        """Recompute the PSTH when event-derivation options (alignment, fps, baseline) change."""
+        if self.analysis_tabs.currentIndex() == 3 and self.tbl_conditions.rowCount() > 0:
+            self._compute_psth()
+
+    def _add_all_behaviors(self) -> None:
+        """Create one PSTH condition per behavior column of a chosen binary-matrix CSV."""
+        path = ""
+        for r in range(self.tbl_conditions.rowCount()):
+            path = self._condition_path_for_row(r)
+            if path:
+                break
+        if not path:
+            start = self.settings.value("paths/last_folder", str(Path.cwd()))
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Select behavior-matrix CSV", str(start), "CSV files (*.csv)"
+            )
+            if not path:
+                return
+            self.settings.setValue("paths/last_folder", str(Path(path).parent))
+        try:
+            info = inspect_event_csv(path)
+        except Exception as exc:
+            self._log(f"Add all behaviors: failed to read CSV: {exc}")
+            return
+        if info.get("kind") != "behavior_matrix":
+            self._log("Add all behaviors: this CSV is not a binary behavior matrix.")
+            return
+        behaviors = [str(b) for b in info.get("labels", [])]
+        existing = {self._condition_name_for_row(r) for r in range(self.tbl_conditions.rowCount())}
+        added = 0
+        for b in behaviors:
+            ev = self._load_event_csv(path, selected_label=b)
+            if ev.size == 0 or b in existing:
+                continue
+            r = self.tbl_conditions.rowCount()
+            blocker = QtCore.QSignalBlocker(self.tbl_conditions)
+            self.tbl_conditions.insertRow(r)
+            self.tbl_conditions.setItem(r, 0, QtWidgets.QTableWidgetItem(b))
+            self.tbl_conditions.setItem(r, 2, QtWidgets.QTableWidgetItem(str(path)))
+            del blocker
+            self._set_condition_label_options(r, behaviors, b, all_label="All behaviors (pooled)")
+            added += 1
+        self._log(f"Add all behaviors: created {added} condition(s) from {Path(path).name}.")
+        if added:
+            self._compute_psth()
 
     def _visualize_condition_psth(self, r: Dict[str, object]) -> None:
-        self.plot_psth_lines.clear()
-        self.plot_psth_heat.clear()
+        """Render the Condition PSTH as a matplotlib canvas (npyx-style)."""
+        self.view_tabs.setCurrentIndex(3)
         t_ms = np.asarray(r.get("t_ms", []), dtype=float)
         conditions = list(r.get("conditions", []))
         units = [int(v) for v in r.get("units", [])]
+        mode = "per_unit" if self.cb_psth_mode.currentText().startswith("Per-unit") else "average"
+        baseline = bool(self.ck_psth_baseline.isChecked())
+        trial_from = int(self.sp_psth_trial_from.value())
+        trial_to = int(self.sp_psth_trial_to.value())
+
         if t_ms.size == 0 or not conditions:
             self.lbl_psth_summary.setText("Condition PSTH is ready after you compute it.")
             self.lbl_psth_summary_meta.setText(
-                "Select units, choose an event label, then use Compute. Trial-range changes are applied on the displayed heatmap and averages."
+                "Select units, choose an event label, then use Compute. Trial-range and display-mode changes apply on the displayed figure."
             )
+            self.psth_view.show_message("Add a condition CSV, select units, then Compute to render the Condition PSTH.")
+            self._export_payloads["psth"] = self._psth_export_rows(r)
             return
 
-        single_unit = len(units) == 1
-        fg = "#e8eef7" if self._plot_theme == "Dark" else "#1a1f29"
-        title_color = fg
-        zero_pen = pg.mkPen((120, 120, 120), width=1, style=QtCore.Qt.DashLine)
-        pre_ms = float(r.get("pre_s", self.sp_psth_pre.value())) * 1000.0
-        pre_region_brush = pg.mkBrush(91, 155, 255, 20) if self._plot_theme == "Dark" else pg.mkBrush(67, 128, 255, 16)
-        palette = self._psth_palette(len(conditions))
+        try:
+            from .. import unit_figures  # lazy import: tolerate a momentarily absent module
+        except Exception as exc:  # noqa: BLE001
+            self.psth_view.show_message(f"Condition PSTH figure module unavailable: {exc}")
+            self._export_payloads["psth"] = self._psth_export_rows(r)
+            return
 
-        plot_item = self.plot_psth_lines.getPlotItem()
-        if plot_item.legend is not None:
-            plot_item.legend.scene().removeItem(plot_item.legend)
-            plot_item.legend = None
-        plot_item.addLegend(offset=(12, 12))
-        self._style_plot_item(plot_item, left="Rate (Hz)", bottom="Time (ms) relative to event")
-        self.plot_psth_lines.setTitle(
-            "Condition PSTH | mean \u00b1 SEM across trials" if single_unit else "Condition PSTH | mean across units",
-            color=title_color,
-            size="11pt",
-        )
-        if pre_ms > 0:
-            self.plot_psth_lines.addItem(
-                pg.LinearRegionItem(
-                    values=(-pre_ms, 0.0),
-                    orientation="vertical",
-                    brush=pre_region_brush,
-                    pen=pg.mkPen((0, 0, 0, 0)),
-                    movable=False,
-                )
+        self._set_progress(20)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            fig = unit_figures.condition_psth_figure(
+                self.results.get("psth"),
+                mode=mode,
+                baseline=baseline,
+                trial_from=trial_from,
+                trial_to=trial_to,
+                dark=(self._plot_theme == "Dark"),
             )
-        self.plot_psth_lines.addItem(pg.InfiniteLine(pos=0.0, angle=90, movable=False, pen=zero_pen))
+            self.psth_view.show_figure(fig)
+        except Exception as exc:  # noqa: BLE001
+            self.psth_view.show_message(f"Condition PSTH figure failed: {exc}")
+            self._log(f"Condition PSTH render error: {exc}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._set_progress(100)
 
-        heat_rows: list[np.ndarray] = []
-        heat_labels: list[str] = []
-        heat_meta: list[dict] = []
-        heat_boundaries: list[int] = []
-        mean_rows: list[dict] = []
+        # Update the summary banner from the results + current trial range.
+        single_unit = len(units) == 1
         summary_parts: list[str] = []
-        valid_conditions = 0
-
         for i, entry in enumerate(conditions):
             condition_name = str(entry.get("condition", f"cond_{i + 1}"))
-            unit_ids = [int(v) for v in entry.get("unit_ids", units)]
-            unit_trial_mats = [np.asarray(v, dtype=float) for v in entry.get("unit_trial_mats", [])]
-            if not unit_trial_mats:
-                continue
-            trial_slice, trial_info = self._condition_trial_slice(int(entry.get("trial_count", 0)))
-            used_trials = int(trial_info.get("used_trials", 0))
-            if used_trials <= 0:
-                continue
-
-            color = palette[valid_conditions % len(palette)]
-            valid_conditions += 1
-            if single_unit:
-                trial_mat = unit_trial_mats[0][trial_slice]
-                if trial_mat.size == 0:
-                    continue
-                line_mean = np.nanmean(trial_mat, axis=0)
-                line_sem = (
-                    np.nanstd(trial_mat, axis=0, ddof=1) / math.sqrt(float(trial_mat.shape[0]))
-                    if trial_mat.shape[0] > 1
-                    else np.zeros(trial_mat.shape[1], dtype=float)
-                )
-                upper = pg.PlotCurveItem(t_ms, line_mean + line_sem, pen=pg.mkPen(color[0], color[1], color[2], 0))
-                lower = pg.PlotCurveItem(
-                    t_ms,
-                    np.maximum(0.0, line_mean - line_sem),
-                    pen=pg.mkPen(color[0], color[1], color[2], 0),
-                )
-                plot_item.addItem(upper)
-                plot_item.addItem(lower)
-                plot_item.addItem(
-                    pg.FillBetweenItem(
-                        upper,
-                        lower,
-                        brush=pg.mkBrush(color[0], color[1], color[2], 48 if self._plot_theme == "Dark" else 36),
-                    )
-                )
-                legend_name = f"{condition_name} (n={trial_mat.shape[0]} trials)"
-                for offset, row_values in enumerate(trial_mat):
-                    actual_trial = int(trial_info["actual_start"]) + offset
-                    display_label = f"T{actual_trial}" if len(conditions) == 1 else f"{condition_name} \u00b7 T{actual_trial}"
-                    heat_rows.append(np.asarray(row_values, dtype=float))
-                    heat_labels.append(display_label)
-                    heat_meta.append(
-                        {
-                            "condition": condition_name,
-                            "row_kind": "trial",
-                            "unit_id": int(unit_ids[0]),
-                            "trial_index": actual_trial,
-                            "n_trials_averaged": 1,
-                            "display_label": display_label,
-                        }
-                    )
-                aggregate_count = int(trial_mat.shape[0])
-                aggregate_mode = "trial_mean_sem"
-            else:
-                unit_rows: list[np.ndarray] = []
-                for unit_id, unit_trial_mat in zip(unit_ids, unit_trial_mats):
-                    visible_trials = np.asarray(unit_trial_mat[trial_slice], dtype=float)
-                    if visible_trials.size == 0:
-                        continue
-                    unit_mean = np.nanmean(visible_trials, axis=0)
-                    unit_rows.append(unit_mean)
-                    display_label = str(int(unit_id)) if len(conditions) == 1 else f"{condition_name} \u00b7 {int(unit_id)}"
-                    heat_rows.append(np.asarray(unit_mean, dtype=float))
-                    heat_labels.append(display_label)
-                    heat_meta.append(
-                        {
-                            "condition": condition_name,
-                            "row_kind": "unit_average",
-                            "unit_id": int(unit_id),
-                            "trial_index": -1,
-                            "n_trials_averaged": int(visible_trials.shape[0]),
-                            "display_label": display_label,
-                        }
-                    )
-                if not unit_rows:
-                    continue
-                unit_mat = np.vstack(unit_rows)
-                line_mean = np.nanmean(unit_mat, axis=0)
-                line_sem = None
-                legend_name = f"{condition_name} (n={unit_mat.shape[0]} units)"
-                aggregate_count = int(unit_mat.shape[0])
-                aggregate_mode = "unit_mean"
-
-            self.plot_psth_lines.plot(
-                t_ms,
-                line_mean,
-                pen=pg.mkPen(color, width=2.4),
-                name=legend_name,
-            )
-            mean_rows.extend(
-                [
-                    {
-                        "condition": condition_name,
-                        "time_ms": float(tv),
-                        "mean_rate_hz": float(rv),
-                        "sem_rate_hz": float(line_sem[idx]) if line_sem is not None else np.nan,
-                        "aggregation": aggregate_mode,
-                        "n_rows": aggregate_count,
-                        "trial_start": int(trial_info["actual_start"]),
-                        "trial_stop": int(trial_info["actual_stop"]),
-                        "total_trials": int(trial_info["total_trials"]),
-                    }
-                    for idx, (tv, rv) in enumerate(zip(t_ms, line_mean))
-                ]
-            )
-            heat_boundaries.append(len(heat_rows))
+            _slice, trial_info = self._condition_trial_slice(int(entry.get("trial_count", 0)))
             summary_parts.append(
                 f"{condition_name}: {int(trial_info['used_trials'])}/{int(trial_info['total_trials'])} trials"
             )
-
-        if valid_conditions == 0:
-            self.lbl_psth_summary.setText("Condition PSTH is ready after you compute it.")
-            self.lbl_psth_summary_meta.setText("No conditions matched the selected trial range.")
-            self._export_payloads["psth"] = []
-            return
-
-        heat_mat = np.vstack(heat_rows) if heat_rows else np.zeros((0, t_ms.size), dtype=float)
-        heat_plot_item = self.plot_psth_heat.getPlotItem()
-        self._style_plot_item(
-            heat_plot_item,
-            left="Trial" if single_unit else "Unit average",
-            bottom="Time (ms) relative to event",
-        )
-        self.plot_psth_heat.setTitle(
-            "Condition PSTH heatmap | trial rows" if single_unit else "Condition PSTH heatmap | unit-average rows",
-            color=title_color,
-            size="11pt",
-        )
-        if pre_ms > 0:
-            self.plot_psth_heat.addItem(
-                pg.LinearRegionItem(
-                    values=(-pre_ms, 0.0),
-                    orientation="vertical",
-                    brush=pre_region_brush,
-                    pen=pg.mkPen((0, 0, 0, 0)),
-                    movable=False,
-                )
-            )
-        if heat_mat.size:
-            img = pg.ImageItem(heat_mat)
-            cm = (
-                pg.colormap.get("CET-L17")
-                or pg.colormap.get("CET-L9" if self._plot_theme == "Dark" else "CET-L4")
-            )
-            if cm is not None:
-                img.setLookupTable(cm.getLookupTable(nPts=256))
-            vmax = float(np.nanpercentile(heat_mat, 99.0)) if np.isfinite(np.nanmax(heat_mat)) else 1.0
-            img.setLevels((0.0, max(vmax, 1.0)))
-            dt = float(np.median(np.diff(t_ms))) if t_ms.size > 1 else 1.0
-            x0 = float(t_ms[0] - 0.5 * dt)
-            img.setRect(QtCore.QRectF(x0, 0.0, float(dt * heat_mat.shape[1]), float(heat_mat.shape[0])))
-            self.plot_psth_heat.addItem(img)
-            self.plot_psth_heat.addItem(pg.InfiniteLine(pos=0.0, angle=90, movable=False, pen=zero_pen))
-            for boundary in heat_boundaries[:-1]:
-                self.plot_psth_heat.addItem(pg.InfiniteLine(pos=float(boundary), angle=0, movable=False, pen=zero_pen))
-            self.plot_psth_heat.getViewBox().invertY(True)
-            if heat_labels:
-                stride = max(1, int(math.ceil(len(heat_labels) / 18.0)))
-                ticks = [(float(i) + 0.5, heat_labels[i]) for i in range(0, len(heat_labels), stride)]
-                self.plot_psth_heat.getAxis("left").setTicks([ticks])
-        heat_export_rows: list[dict] = []
-        for row_index, (row_meta, row_values) in enumerate(zip(heat_meta, heat_mat), start=1):
-            heat_export_rows.extend(
-                [
-                    {
-                        "row_index": int(row_index),
-                        "condition": str(row_meta.get("condition", "")),
-                        "row_kind": str(row_meta.get("row_kind", "")),
-                        "display_label": str(row_meta.get("display_label", "")),
-                        "unit_id": int(row_meta.get("unit_id", -1)),
-                        "trial_index": int(row_meta.get("trial_index", -1)),
-                        "n_trials_averaged": int(row_meta.get("n_trials_averaged", 0)),
-                        "time_ms": float(tv),
-                        "rate_hz": float(rv),
-                    }
-                    for tv, rv in zip(t_ms, row_values)
-                ]
-            )
-        trial_mode_text = (
-            "Heatmap rows show trials; lines show mean \u00b1 SEM across the selected trials."
-            if single_unit
-            else "Heatmap rows show unit averages across the selected trials; lines show the mean across units."
-        )
+        if single_unit:
+            mode_text = "Single unit: per-trial rows + mean ± SEM across the selected trials."
+        elif mode == "per_unit":
+            mode_text = "Per-unit panels: one panel per selected unit (mean across the selected trials)."
+        else:
+            mode_text = "Average across units: one mean trace per condition across the selected units."
         requested_range_text = self.lbl_psth_trial_status.text().replace("Trial filter: ", "").strip()
         self.lbl_psth_summary.setText(
-            f"Condition PSTH \u00b7 {len(units)} selected unit{'s' if len(units) != 1 else ''} \u00b7 {requested_range_text}"
+            f"Condition PSTH · {len(units)} selected unit{'s' if len(units) != 1 else ''} · {requested_range_text}"
         )
-        self.lbl_psth_summary_meta.setText(
-            f"{trial_mode_text}  {'  |  '.join(summary_parts)}"
-        )
-        self._export_payloads["psth"] = [
-            ("condition_psth_average.csv", pd.DataFrame(mean_rows)),
-            ("condition_psth_heatmap.csv", pd.DataFrame(heat_export_rows)),
-        ]
-        self.view_tabs.setCurrentIndex(3)
+        self.lbl_psth_summary_meta.setText(f"{mode_text}  {'  |  '.join(summary_parts)}")
+        self._export_payloads["psth"] = self._psth_export_rows(r)
+
+    def _psth_export_rows(self, r: Dict[str, object]) -> list[tuple[str, "pd.DataFrame"]]:
+        """Build a non-crashing PSTH CSV export straight from the results dict.
+
+        Produces a per-(condition, unit, time) mean-rate table over the currently
+        selected trial range, honoring the baseline-subtract option. Independent
+        of the matplotlib figure artists so export never depends on rendering.
+        """
+        try:
+            t_ms = np.asarray(r.get("t_ms", []), dtype=float)
+            conditions = list(r.get("conditions", []))
+            if t_ms.size == 0 or not conditions:
+                return [("condition_psth.csv", pd.DataFrame())]
+            baseline = bool(self.ck_psth_baseline.isChecked())
+            pre_mask = t_ms < 0.0
+            rows: list[dict] = []
+            for ci, entry in enumerate(conditions):
+                condition_name = str(entry.get("condition", f"cond_{ci + 1}"))
+                unit_ids = [int(v) for v in entry.get("unit_ids", r.get("units", []))]
+                unit_trial_mats = [np.asarray(v, dtype=float) for v in entry.get("unit_trial_mats", [])]
+                trial_slice, trial_info = self._condition_trial_slice(int(entry.get("trial_count", 0)))
+                if int(trial_info.get("used_trials", 0)) <= 0:
+                    continue
+                for unit_id, trial_mat in zip(unit_ids, unit_trial_mats):
+                    visible = np.asarray(trial_mat[trial_slice], dtype=float)
+                    if visible.size == 0:
+                        continue
+                    unit_mean = np.nanmean(visible, axis=0)
+                    if baseline and np.any(pre_mask):
+                        unit_mean = unit_mean - float(np.nanmean(unit_mean[pre_mask]))
+                    n_trials = int(visible.shape[0])
+                    rows.extend(
+                        {
+                            "condition": condition_name,
+                            "unit_id": int(unit_id),
+                            "time_ms": float(tv),
+                            "mean_rate_hz": float(rv),
+                            "n_trials": n_trials,
+                            "trial_start": int(trial_info["actual_start"]),
+                            "trial_stop": int(trial_info["actual_stop"]),
+                            "total_trials": int(trial_info["total_trials"]),
+                            "baseline_subtracted": bool(baseline),
+                        }
+                        for tv, rv in zip(t_ms, unit_mean)
+                    )
+            return [("condition_psth.csv", pd.DataFrame(rows))]
+        except Exception:
+            return [("condition_psth.csv", pd.DataFrame())]
 
     def _visualize_network(self, r: Dict[str, object]) -> None:
-        self.plot_net_matrix.clear()
-        self.plot_net_sync.clear()
-        mat = np.asarray(r.get("mat", []), dtype=float)
-        order = np.asarray(r.get("order", []), dtype=int)
-        sorted_units = np.asarray(r.get("sorted_units", []), dtype=int)
-        group_labels = np.asarray(r.get("group_labels", []), dtype=int)
-        t_s = np.asarray(r.get("t_s", []), dtype=float)
-        idx = np.asarray(r.get("idx", []), dtype=float)
-        if mat.size:
-            if (
-                order.size == mat.shape[0]
-                and sorted_units.size == mat.shape[0]
-                and group_labels.size == mat.shape[0]
-            ):
-                display_mat = mat[np.ix_(order, order)]
-            else:
-                display_mat = mat
-                sorted_units = np.asarray(self._selected_units(), dtype=int)
-                group_labels = np.zeros(display_mat.shape[0], dtype=int)
-            self.plot_net_matrix.setTitle("Pairwise CCG matrix | synced units clustered row-wise")
-            img = pg.ImageItem(display_mat)
-            img.setRect(QtCore.QRectF(0, 0, display_mat.shape[1], display_mat.shape[0]))
-            cm = pg.colormap.get("CET-L9" if self._plot_theme == "Dark" else "CET-L4")
-            if cm is not None:
-                img.setLookupTable(cm.getLookupTable(nPts=256))
-            self.plot_net_matrix.addItem(img)
-            n_rows = int(display_mat.shape[0])
-            n_cols = int(display_mat.shape[1])
-            for row, group_id in enumerate(group_labels):
-                gid = int(group_id)
-                if gid <= 0:
-                    continue
-                stripe = QtWidgets.QGraphicsRectItem(0, row, n_cols, 1.0)
-                stripe.setBrush(pg.mkBrush(_sync_group_color(gid, alpha=38)))
-                stripe.setPen(pg.mkPen((0, 0, 0, 0)))
-                stripe.setZValue(5)
-                self.plot_net_matrix.addItem(stripe)
-                bar = QtWidgets.QGraphicsRectItem(-0.55, row, 0.35, 1.0)
-                bar.setBrush(pg.mkBrush(_sync_group_color(gid, alpha=235)))
-                bar.setPen(pg.mkPen((0, 0, 0, 0)))
-                bar.setZValue(6)
-                self.plot_net_matrix.addItem(bar)
-            for gid in sorted(int(v) for v in np.unique(group_labels) if int(v) > 0):
-                rows = np.flatnonzero(group_labels == gid)
-                if rows.size == 0:
-                    continue
-                label = pg.TextItem(f"G{gid}", color=_sync_group_color(gid, alpha=255), anchor=(1.0, 0.5))
-                label.setPos(-0.64, float(rows.mean()) + 0.5)
-                label.setZValue(7)
-                self.plot_net_matrix.addItem(label)
-            unit_ticks = [(i + 0.5, str(int(unit))) for i, unit in enumerate(sorted_units)]
-            if len(unit_ticks) <= 60:
-                self.plot_net_matrix.getAxis("left").setTicks([unit_ticks])
-                self.plot_net_matrix.getAxis("bottom").setTicks([unit_ticks])
-            else:
-                self.plot_net_matrix.getAxis("left").setTicks([])
-                self.plot_net_matrix.getAxis("bottom").setTicks([])
-            self.plot_net_matrix.setLabel("left", "Unit (clustered)")
-            self.plot_net_matrix.setLabel("bottom", "Unit (clustered)")
-            self.plot_net_matrix.setXRange(-0.75, n_cols, padding=0.02)
-            self.plot_net_matrix.setYRange(0, n_rows, padding=0.02)
-            self.plot_net_matrix.getViewBox().invertY(True)
-        if t_s.size:
-            self.plot_net_sync.plot(t_s, idx, pen=pg.mkPen((180, 120, 255), width=1.7))
-        net_rows = []
-        if mat.size:
-            if order.size == mat.shape[0] and sorted_units.size == mat.shape[0]:
-                export_order = order
-                export_units = sorted_units
-                export_groups = group_labels
-                export_mat = mat[np.ix_(export_order, export_order)]
-            else:
-                export_order = np.arange(mat.shape[0], dtype=int)
-                export_units = np.asarray(self._selected_units(), dtype=int)
-                export_groups = np.zeros(mat.shape[0], dtype=int)
-                export_mat = mat
-            for i in range(export_mat.shape[0]):
-                for j in range(export_mat.shape[1]):
-                    net_rows.append(
-                        {
-                            "row": int(i),
-                            "col": int(j),
-                            "unit_a": int(export_units[i]) if i < export_units.size else int(i),
-                            "unit_b": int(export_units[j]) if j < export_units.size else int(j),
-                            "group_a": int(export_groups[i]) if i < export_groups.size else 0,
-                            "group_b": int(export_groups[j]) if j < export_groups.size else 0,
-                            "value": float(export_mat[i, j]),
-                        }
-                    )
-            group_rows = [
-                {
-                    "sorted_row": int(i),
-                    "source_row": int(export_order[i]) if i < export_order.size else int(i),
-                    "unit_id": int(export_units[i]) if i < export_units.size else int(i),
-                    "sync_group": int(export_groups[i]) if i < export_groups.size else 0,
-                    "sync_group_threshold": float(r.get("sync_group_threshold", np.nan)),
-                }
-                for i in range(export_units.size)
-            ]
-        else:
-            group_rows = []
-        sync_rows = [{"time_s": float(tv), "synchrony_index": float(iv)} for tv, iv in zip(t_s, idx)] if t_s.size else []
-        self._export_payloads["network"] = [
-            ("network_matrix.csv", pd.DataFrame(net_rows)),
-            ("network_sync_groups.csv", pd.DataFrame(group_rows)),
-            ("network_synchrony.csv", pd.DataFrame(sync_rows)),
-        ]
+        """Render the population network analysis as a matplotlib canvas."""
         self.view_tabs.setCurrentIndex(4)
+        try:
+            from .. import unit_figures  # lazy import: tolerate a momentarily absent module
+        except Exception as exc:  # noqa: BLE001
+            self.net_view.show_message(f"Network figure module unavailable: {exc}")
+            self._export_payloads["network"] = self._network_export_rows(r)
+            return
+        try:
+            fig = unit_figures.network_figure(r, dark=(self._plot_theme == "Dark"))
+            self.net_view.show_figure(fig)
+        except Exception as exc:  # noqa: BLE001
+            self.net_view.show_message(f"Network figure failed: {exc}")
+            self._log(f"Network render error: {exc}")
+        self._export_payloads["network"] = self._network_export_rows(r)
+
+    def _network_export_rows(self, r: Dict[str, object]) -> list[tuple[str, "pd.DataFrame"]]:
+        """Build non-crashing CSV exports straight from the network results dict."""
+        try:
+            labels = [str(x) for x in r.get("labels", r.get("units", []))]
+            n = len(labels)
+            corr = np.asarray(r.get("corr_matrix", []), dtype=float)
+            coupling = np.asarray(r.get("population_coupling", []), dtype=float)
+            depths = r.get("depths_um")
+            conn = r.get("connections")
+            matrix_rows: list[dict] = []
+            if corr.ndim == 2 and corr.shape == (n, n):
+                conn_arr = np.asarray(conn, dtype=float) if conn is not None else None
+                for i in range(n):
+                    for j in range(n):
+                        row = {
+                            "unit_a": labels[i],
+                            "unit_b": labels[j],
+                            "corr": float(corr[i, j]),
+                        }
+                        if conn_arr is not None and conn_arr.shape == (n, n):
+                            row["connection_z"] = float(conn_arr[i, j])
+                        matrix_rows.append(row)
+            depths_arr = np.asarray(depths, dtype=float) if depths is not None else None
+            unit_rows = [
+                {
+                    "unit_id": labels[i],
+                    "population_coupling": float(coupling[i]) if i < coupling.size else np.nan,
+                    "depth_um": (float(depths_arr[i]) if depths_arr is not None and i < depths_arr.size else np.nan),
+                }
+                for i in range(n)
+            ]
+            return [
+                ("network_correlation_matrix.csv", pd.DataFrame(matrix_rows)),
+                ("network_units.csv", pd.DataFrame(unit_rows)),
+            ]
+        except Exception:
+            return [("network.csv", pd.DataFrame())]
 
     def _show_npyx_corr(self) -> None:
+        # Guard the pyqtgraph rendering so a transient re-entrant repaint (e.g. a
+        # queued refresh firing mid scene-rebuild) is attributed clearly and does
+        # not surface as a generic page-render error.
+        try:
+            self._render_npyx_corr()
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Advanced render error: {exc}")
+
+    def _render_npyx_corr(self) -> None:
         self.gl_npyx.clear()
         units = self._selected_units()
         if not units:
@@ -2337,10 +2228,11 @@ class PostProcessingTab(QtWidgets.QWidget):
                 bin_ms=float(self.sp_npyx_bin.value()),
                 win_ms=float(self.sp_npyx_win.value()),
                 params=self._collect_npyx_params(),
+                fs=float(self.dataset.sample_rate),
             )
             self._set_progress(100)
         except Exception as exc:
-            self._log(f"Advanced corr error ({key}): {exc}")
+            self._log(f"Advanced error ({key}): {exc}")
             self._busy = False
             return
         finally:
@@ -2349,14 +2241,16 @@ class PostProcessingTab(QtWidgets.QWidget):
         requested_dp = str(res.get("requested_dp", ""))
         resolved_dp = str(res.get("resolved_dp", ""))
         if requested_dp and resolved_dp and requested_dp != resolved_dp:
-            self._log(f"Advanced corr datapath fallback: {requested_dp} -> {resolved_dp}")
+            self._log(f"Advanced datapath fallback: {requested_dp} -> {resolved_dp}")
 
         kind = str(res.get("kind", "text"))
         title = str(res.get("title", str(key)))
         cmap_name = "CET-L9" if self._plot_theme == "Dark" else "CET-L4"
+        x_label = str(res.get("x_label", "x"))
+        y_label = str(res.get("y_label", "value"))
         if kind in {"line", "hist"}:
             plot = self.gl_npyx.addPlot(row=0, col=0, title=title)
-            self._style_plot_item(plot, left="value", bottom="x")
+            self._style_plot_item(plot, left=y_label, bottom=x_label)
             x = np.asarray(res.get("x", []), dtype=float)
             y = np.asarray(res.get("y", []), dtype=float)
             if x.size and y.size:
@@ -2370,7 +2264,7 @@ class PostProcessingTab(QtWidgets.QWidget):
             ]
         elif kind == "multi_line":
             plot = self.gl_npyx.addPlot(row=0, col=0, title=title)
-            self._style_plot_item(plot, left="value", bottom="x")
+            self._style_plot_item(plot, left=y_label, bottom=x_label)
             x = np.asarray(res.get("x", []), dtype=float)
             series = res.get("series", [])
             out_rows: list[dict] = []
@@ -2389,18 +2283,33 @@ class PostProcessingTab(QtWidgets.QWidget):
             self._export_payloads["npyx"] = [("npyx_corr_multi_line.csv", pd.DataFrame(out_rows))]
         elif kind == "image":
             plot = self.gl_npyx.addPlot(row=0, col=0, title=title)
-            self._style_plot_item(plot, left="row", bottom="col")
+            self._style_plot_item(plot, left=str(res.get("y_label", "row")), bottom=str(res.get("x_label", "col")))
             mat = np.asarray(res.get("mat", []), dtype=float)
             if mat.size:
                 img = pg.ImageItem(mat)
-                if mat.ndim == 2:
+                xv = np.asarray(res.get("x", []), dtype=float)
+                yv = np.asarray(res.get("y", []), dtype=float)
+                has_coords = xv.size >= 2 and yv.size >= 2 and mat.ndim == 2
+                if has_coords:
+                    x0, x1 = float(xv[0]), float(xv[-1])
+                    y0, y1 = float(yv[0]), float(yv[-1])
+                    img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+                elif mat.ndim == 2:
                     img.setRect(QtCore.QRectF(0, 0, float(mat.shape[1]), float(mat.shape[0])))
                 cm = pg.colormap.get(cmap_name)
                 if cm is not None:
                     img.setLookupTable(cm.getLookupTable(nPts=256))
                 plot.addItem(img)
-                plot.getViewBox().invertY(True)
+                # Index matrices read top-to-bottom; coordinate images keep natural y.
+                if not has_coords:
+                    plot.getViewBox().invertY(True)
                 self._annotate_image_values(plot, mat)
+                try:
+                    levels = img.getLevels()
+                    cbar = pg.ColorBarItem(values=levels, colorMap=cm, label=str(res.get("cbar_label", "")), width=12)
+                    cbar.setImageItem(img, insert_in=plot)
+                except Exception:
+                    pass
             self._export_payloads["npyx"] = [("npyx_corr_matrix.csv", pd.DataFrame(mat))]
         elif kind == "corr_pairs":
             items = res.get("items", [])
@@ -2490,7 +2399,8 @@ class PostProcessingTab(QtWidgets.QWidget):
     def _export_plotted_data(self) -> None:
         """Write the current page's recorded plot data to CSV files in a folder."""
         idx = self.view_tabs.currentIndex()
-        key = ["basic", "raw", "corr", "psth", "network", "npyx"][idx] if 0 <= idx < 6 else ""
+        keys = ["basic", "raw", "corr", "psth", "network", "npyx", "c4"]
+        key = keys[idx] if 0 <= idx < len(keys) else ""
         payloads = self._export_payloads.get(key, [])
         if not payloads:
             self._log("Export: no plotted data available for current page.")

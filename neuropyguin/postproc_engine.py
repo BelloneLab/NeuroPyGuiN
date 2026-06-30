@@ -294,13 +294,28 @@ class NeuropixelsDataset:
         hist, edges = np.histogram(isi_ms, bins=bins, range=(0, max_ms))
         return edges, hist.astype(float)
 
-    def correlogram(self, unit_a: int, unit_b: int, bin_ms: float, win_ms: float, remove_zero: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (bin centers in ms, counts) for the cross/auto-correlogram of two units.
+    def correlogram(
+        self,
+        unit_a: int,
+        unit_b: int,
+        bin_ms: float,
+        win_ms: float,
+        remove_zero: bool = False,
+        normalize: str = "Hertz",
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (bin centers in ms, values) for the cross/auto-correlogram of two units.
 
-        Result is cached on disk. ``remove_zero`` drops the exact-zero lag, which is
-        used for autocorrelograms to suppress the trivial self-coincidence peak.
+        ``normalize`` selects the y-axis unit following the NeuroPyxels convention:
+        ``"Counts"`` returns raw spike-pair counts, ``"Hertz"`` (the default)
+        returns a firing rate ``counts / (N_ref_spikes * bin_s)`` that is invariant
+        to bin width and reference-spike count and matches npyx's ``acg``/``ccg``.
+        Result is cached on disk. ``remove_zero`` drops the exact-zero lag (used for
+        autocorrelograms to suppress the trivial self-coincidence peak).
         """
-        payload = {"ua": int(unit_a), "ub": int(unit_b), "bin_ms": float(bin_ms), "win_ms": float(win_ms), "rz": bool(remove_zero)}
+        payload = {
+            "ua": int(unit_a), "ub": int(unit_b), "bin_ms": float(bin_ms),
+            "win_ms": float(win_ms), "rz": bool(remove_zero), "norm": str(normalize),
+        }
         cached = self._cache_get("corr", payload)
         if cached is not None:
             return cached["centers"], cached["counts"]
@@ -318,18 +333,20 @@ class NeuropixelsDataset:
             m = (dt >= -win_s) & (dt <= win_s)
             if np.any(m):
                 all_dt.append(dt[m])
+        centers = 0.5 * (edges[:-1] + edges[1:]) * 1000.0
         if not all_dt:
-            centers = 0.5 * (edges[:-1] + edges[1:]) * 1000.0
-            counts = np.zeros_like(centers)
-            return centers, counts
+            return centers, np.zeros_like(centers)
         vals = np.concatenate(all_dt)
         if remove_zero:
             vals = vals[np.abs(vals) > 1e-12]
         counts, _ = np.histogram(vals, bins=edges)
-        centers = 0.5 * (edges[:-1] + edges[1:]) * 1000.0
-        out_counts = counts.astype(float)
-        self._cache_set("corr", payload, {"centers": centers, "counts": out_counts})
-        return centers, out_counts
+        out = counts.astype(float)
+        if str(normalize).lower().startswith("hert"):
+            n_ref = float(t1.size)
+            if n_ref > 0:
+                out = out / (n_ref * bin_s)
+        self._cache_set("corr", payload, {"centers": centers, "counts": out})
+        return centers, out
 
     def mean_template_waveform(self, unit: int) -> Optional[np.ndarray]:
         """Return the unit's dominant Kilosort template (in microvolts), or None.
@@ -642,6 +659,135 @@ class NeuropixelsDataset:
                 sd = float(np.std(arr))
                 sync_idx[k] = 0.0 if mu <= 1e-12 else sd / mu
         return centers, sync_idx
+
+    def _unit_depth_um(self, unit: int) -> float:
+        """Return the depth (um, probe y) of a unit's peak template channel, or NaN."""
+        if self.channel_positions is None:
+            return float("nan")
+        wvf = self.mean_template_waveform(unit)
+        if wvf is None or wvf.ndim != 2 or wvf.shape[1] == 0:
+            return float("nan")
+        best = int(np.nanargmax(np.nanmax(np.abs(wvf), axis=0)))
+        pos = np.asarray(self.channel_positions, dtype=float)
+        if pos.ndim == 2 and pos.shape[1] >= 2 and best < pos.shape[0]:
+            return float(pos[best, 1])
+        return float("nan")
+
+    def network_analysis(
+        self,
+        units: Iterable[int],
+        *,
+        bin_ms: float = 25.0,
+        compute_connections: bool = True,
+        conn_bin_ms: float = 0.5,
+        conn_win_ms: float = 50.0,
+        conn_z: float = 5.0,
+        max_conn_units: int = 16,
+    ) -> Dict[str, object]:
+        """Population network analysis for the selected units.
+
+        Returns a dict with a hierarchically-sorted pairwise spike-count (noise)
+        correlation matrix, the Okun population-coupling per unit (z-scored), unit
+        depths (um), and an optional signed significant-connection matrix derived
+        from short-latency CCG deviations. All matrices/vectors are returned in the
+        same sorted display order; ``labels`` holds the unit ids in that order.
+        """
+        u = [int(x) for x in units]
+        n = len(u)
+        empty = {
+            "units": u, "labels": [str(x) for x in u],
+            "corr_matrix": np.zeros((n, n), dtype=float), "corr_bin_ms": float(bin_ms),
+            "population_coupling": np.zeros(n, dtype=float), "depths_um": None,
+            "connections": None, "n_significant": 0,
+        }
+        if n == 0:
+            return empty
+
+        fs = float(self.sample_rate)
+        t_end = float(self.spike_times.max()) / fs if self.spike_times.size else 0.0
+        if t_end <= 0:
+            return empty
+        bin_s = max(float(bin_ms), 1.0) / 1000.0
+        edges = np.arange(0.0, t_end + bin_s, bin_s)
+        nb = max(edges.size - 1, 1)
+        counts = np.zeros((n, nb), dtype=float)
+        for i, uu in enumerate(u):
+            st = self.unit_spike_times_s(uu)
+            if st.size:
+                h, _ = np.histogram(st, bins=edges)
+                counts[i] = h.astype(float)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.corrcoef(counts) if n > 1 else np.array([[1.0]])
+        corr = np.atleast_2d(np.nan_to_num(np.asarray(corr, dtype=float), nan=0.0))
+
+        order = np.arange(n, dtype=int)
+        if n >= 3:
+            try:
+                from scipy.cluster.hierarchy import leaves_list, linkage
+                from scipy.spatial.distance import squareform
+                dist = 1.0 - corr
+                dist = 0.5 * (dist + dist.T)
+                np.fill_diagonal(dist, 0.0)
+                dist[dist < 0] = 0.0
+                z = linkage(squareform(dist, checks=False), method="average")
+                order = np.asarray(leaves_list(z), dtype=int)
+            except Exception:
+                order = np.arange(n, dtype=int)
+
+        # Okun population coupling: each unit's binned rate vs the rest-of-population rate.
+        pop = counts.sum(axis=0)
+        coupling = np.zeros(n, dtype=float)
+        for i in range(n):
+            rest = pop - counts[i]
+            if np.std(counts[i]) > 0 and np.std(rest) > 0:
+                coupling[i] = float(np.corrcoef(counts[i], rest)[0, 1])
+        if n > 1 and np.std(coupling) > 0:
+            coupling = (coupling - np.mean(coupling)) / np.std(coupling)
+
+        depths = np.array([self._unit_depth_um(uu) for uu in u], dtype=float)
+
+        connections = None
+        n_sig = 0
+        if compute_connections and 2 <= n <= int(max_conn_units):
+            conn = np.zeros((n, n), dtype=float)
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    centers, c = self.correlogram(
+                        u[i], u[j], bin_ms=conn_bin_ms, win_ms=conn_win_ms,
+                        remove_zero=False, normalize="Counts",
+                    )
+                    if centers.size == 0 or c.size == 0:
+                        continue
+                    flank = np.abs(centers) > 10.0
+                    near = (np.abs(centers) >= 0.5) & (np.abs(centers) <= 4.0)
+                    if not np.any(flank) or not np.any(near):
+                        continue
+                    mu = float(np.mean(c[flank]))
+                    sd = float(np.std(c[flank]))
+                    if sd <= 1e-9:
+                        continue
+                    seg = c[near]
+                    z_peak = (float(np.max(seg)) - mu) / sd
+                    z_trough = (float(np.min(seg)) - mu) / sd
+                    conn[i, j] = z_peak if abs(z_peak) >= abs(z_trough) else z_trough
+            connections = conn[np.ix_(order, order)]
+            off = ~np.eye(n, dtype=bool)
+            n_sig = int(np.sum(np.abs(conn[off]) >= float(conn_z)))
+
+        depths_sorted = depths[order]
+        return {
+            "units": u,
+            "labels": [str(u[k]) for k in order],
+            "corr_matrix": corr[np.ix_(order, order)],
+            "corr_bin_ms": float(bin_ms),
+            "population_coupling": coupling[order],
+            "depths_um": depths_sorted if np.any(np.isfinite(depths_sorted)) else None,
+            "connections": connections,
+            "n_significant": n_sig,
+        }
 
 
 _H5_TEXT_DTYPE = h5py.string_dtype(encoding="utf-8")

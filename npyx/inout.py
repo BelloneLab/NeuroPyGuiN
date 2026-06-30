@@ -361,8 +361,15 @@ def chan_map(dp=None, y_orig='surface', probe_version=None):
                              specified (rather than a predefined version), \
                              the datapath needs to be provided to load the channel map.")
         dp = Path(dp)
-        c_ind = np.load(dp / 'channel_map.npy')
-        cp    = np.load(dp / 'channel_positions.npy')
+        c_ind = np.asarray(np.load(dp / 'channel_map.npy'))
+        cp    = np.asarray(np.load(dp / 'channel_positions.npy'))
+        # Kilosort 4 saves channel_map.npy as a 1D (N,) array; older formats save
+        # (N,1). Normalise to a column vector so the horizontal concat with the
+        # (N,2) positions always works (NeuroPyGuiN local robustness patch).
+        if c_ind.ndim == 1:
+            c_ind = c_ind.reshape(-1, 1)
+        if cp.ndim == 1:
+            cp = cp.reshape(-1, 1)
         cm    = np.concatenate([c_ind, cp], axis=1).astype(int)
 
     if y_orig == 'surface':

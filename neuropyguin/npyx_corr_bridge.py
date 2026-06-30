@@ -20,59 +20,28 @@ from scipy import signal as scipy_signal
 import inspect
 
 
+# Curated, user-facing analysis menu. This is deliberately a SHORT list of the
+# correlation analyses a systems neuroscientist actually wants, not a 1:1 dump of
+# npyx.corr. Internal helpers (numba kernels, joblib workers, cache-name builders,
+# feasibility checks) and text-only repr methods are intentionally excluded; the
+# run_method dispatcher still understands the wider set if called directly.
 # key, clear label
 METHOD_LABELS: List[Tuple[str, str]] = [
-    ("make_phy_like_spikeClustersTimes", "Build Spike Vectors (Phy-like)"),
-    ("make_matrix_2xNevents", "Build 2xN Events Matrix"),
-    ("crosscorrelate_cyrille", "Crosscorrelate (Cyrille wrapper)"),
-    ("crosscorr_cyrille", "Crosscorrelograms (all-pairs core)"),
-    ("get_log_bins_samples", "Log-Bin Edges (samples)"),
-    ("ccg", "Cross-Correlogram (CCG)"),
-    ("ccg_hz", "Cross-Correlogram in Hz"),
-    ("ccg_2d_numba", "Event-aligned CCG 2D (Numba)"),
-    ("ccg_2d", "Event-aligned CCG 2D"),
-    ("acg", "Auto-Correlogram (ACG)"),
-    ("scaled_acg", "Scaled ACG"),
     ("acg_3D", "3D ACG vs Firing Rate"),
     ("ccg_3D", "3D CCG vs Firing Rate"),
-    ("crosscorr_vs_firing_rate", "Crosscorr vs Firing Rate"),
-    ("ccg_vs_fr", "CCG vs Firing Rate"),
-    ("convert_acg_log", "Convert ACG to Log Scale"),
-    ("get_ccgstack_fullname", "CCG Stack Cache Name"),
-    ("ccg_stack", "CCG Stack (bulk pairs)"),
-    ("compute_ccgs_bulk", "Compute CCGs in Bulk"),
-    ("get_ustack_i", "Find Pair Index in CCG Stack"),
-    ("canUse_Nbins", "Triplet-Bin Feasibility"),
-    ("KopelowitzCohen2014_ccg_significance", "CCG Significance (Kopelowitz-Cohen 2014)"),
-    ("StarkAbeles2009_ccg_sig", "CCG Predictor + p-values (Stark-Abeles 2009)"),
-    ("StarkAbeles2009_ccg_significance", "CCG Significance (Stark-Abeles 2009)"),
-    ("get_cross_features", "CCG Cross Features"),
-    ("get_ccg_sig", "Get CCG Significance"),
-    ("ccg_sig_stack", "CCG Significance Stack"),
-    ("gen_sfc", "Generate Functional Correlation Graph (SFC)"),
-    ("cisi_numba_para", "Cross-ISI (Parallel Numba)"),
-    ("cisi_numba", "Cross-ISI (Numba)"),
-    ("cisi_chunk", "Cross-ISI Chunk Kernel"),
-    ("get_cisi", "Cross-ISI"),
-    ("par_process", "Cross-ISI Parallel Worker"),
-    ("get_cisi_parprocess", "Cross-ISI (Parallel Process)"),
-    ("pearson_corr", "Pearson Correlation Matrix"),
-    ("pearson_corr_trn", "Pearson Correlation Matrix (from Trains)"),
-    ("correlation_index", "Correlation Index (Wong-Meister-Shatz 1993)"),
-    ("synchrony_regehr", "Synchrony (Regehr-style)"),
-    ("synchrony", "Synchrony Index"),
-    ("synchrony_zscore", "Synchrony Z-score"),
-    ("synchrony_deltaproba", "Synchrony Delta-Probability"),
-    ("covariance", "Covariance"),
-    ("convert_ccg_to_covariance", "CCG -> Covariance"),
-    ("cofiring_tags", "Co-firing Tags"),
-    ("frac_pop_sync_old", "Population Synchrony Fraction (old)"),
-    ("frac_pop_sync", "Population Synchrony Fraction"),
-    ("fraction_pop_sync", "Population Synchrony Fraction (wrapper)"),
-    ("get_cm", "Correlation Matrix"),
+    ("scaled_acg", "Scaled ACG (cell-type)"),
+    ("StarkAbeles2009_ccg_sig", "Monosynaptic CCG significance (Stark-Abeles)"),
     ("spike_time_tiling_coefficient", "Spike Time Tiling Coefficient (STTC)"),
-    ("PSDxy", "Cross Power Spectral Density (PSDxy)"),
+    ("get_cisi", "Cross-ISI Distribution"),
 ]
+
+# Minimum distinct units each method needs (the GUI uses this to guide the user).
+METHOD_MIN_UNITS: Dict[str, int] = {
+    "ccg": 2, "get_cm": 2, "pearson_corr_trn": 2, "correlation_index": 2,
+    "get_cisi": 2, "synchrony_zscore": 2, "fraction_pop_sync": 2,
+    "spike_time_tiling_coefficient": 2, "ccg_sig_stack": 2,
+    "StarkAbeles2009_ccg_sig": 2, "ccg_3D": 2,
+}
 
 METHOD_META: Dict[str, Dict[str, object]] = {
     "default": {
@@ -359,15 +328,18 @@ def _cross_counts(corr, dp: str, u0: int, u1: int, cbin: float, cwin: float) -> 
     return m[0, 1] if m.ndim == 3 and m.shape[0] > 1 else np.ravel(m)
 
 
-def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms: float, params: Dict[str, object] | None = None) -> Dict[str, object]:
+def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms: float, params: Dict[str, object] | None = None, fs: float = 30000.0) -> Dict[str, object]:
     """Dispatch a single npyx.corr analysis and return a render payload.
 
     Resolves the datapath, de-duplicates ``units`` (preserving order), validates
     the selection, then routes to the per-method branch matching ``method_key``.
     Each branch returns a dict (via ``_meta_payload``) describing the result and
     how to render it; an unrecognized ``method_key`` returns a fallback text payload.
+    ``fs`` is the recording sample rate (Hz), threaded in from the dataset so the
+    lag/tiling axes are correct for non-30 kHz probes.
     """
     corr = _ensure_npyx()
+    fs = int(round(float(fs))) if fs else 30000
     requested_dp = dp
     dp = resolve_analysis_datapath(dp)
     params = params or {}
@@ -402,8 +374,9 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
         corr.sgnl.triang = scipy_signal.triang
 
     if method_key == "acg":
-        y = np.asarray(corr.acg(dp, u0, cbin, cwin, normalize="Hertz"), dtype=float)
-        return _meta_payload({"kind": "line", "title": f"ACG u{u0}", "x": bins[: y.size], "y": y}, requested_dp, dp)
+        y = np.asarray(corr.acg(dp, u0, cbin, cwin, fs=fs, normalize="Hertz"), dtype=float)
+        return _meta_payload({"kind": "line", "title": f"ACG u{u0}", "x": bins[: y.size], "y": y,
+                              "x_label": "Lag (ms)", "y_label": "Firing rate (Hz)"}, requested_dp, dp)
 
     if method_key == "ccg_hz":
         pairs = [(int(a), int(b)) for i, a in enumerate(units) for b in units[i + 1 :]]
@@ -433,6 +406,7 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
             "mat": np.asarray(mat, dtype=float),
             "x": np.asarray(t_bins, dtype=float),
             "y": np.asarray(f_bins, dtype=float),
+            "x_label": "Lag (ms)", "y_label": "Firing rate (Hz)", "cbar_label": "CCG (Hz)",
         }, requested_dp, dp)
 
     if method_key == "acg_3D":
@@ -443,6 +417,7 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
             "mat": np.asarray(mat, dtype=float),
             "x": np.asarray(t_bins, dtype=float),
             "y": np.asarray(f_bins, dtype=float),
+            "x_label": "Lag (ms)", "y_label": "Firing rate (Hz)", "cbar_label": "ACG (Hz)",
         }, requested_dp, dp)
 
     if method_key == "convert_acg_log":
@@ -458,7 +433,8 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
 
     if method_key == "get_cm":
         mat = np.asarray(corr.get_cm(dp, units, cbin=cbin, cwin=cwin, corrEvaluator="CCG"), dtype=float)
-        return _meta_payload({"kind": "image", "title": "Correlation Matrix (CCG synchrony)", "mat": mat}, requested_dp, dp)
+        return _meta_payload({"kind": "image", "title": "Correlation Matrix (CCG synchrony)", "mat": mat,
+                              "x_label": "Unit #", "y_label": "Unit #", "cbar_label": "CCG synchrony"}, requested_dp, dp)
 
     if method_key in {"synchrony_regehr", "synchrony", "synchrony_zscore", "synchrony_deltaproba"}:
         sync_win = float(_p("sync_win_ms", 1.0))
@@ -534,8 +510,10 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
         cisi = cisi[np.isfinite(cisi)]
         if cisi.size == 0:
             return _meta_payload({"kind": "text", "title": "Cross-ISI", "text": "No finite cross-ISI values."}, requested_dp, dp)
-        hist, edges = np.histogram(cisi, bins=min(120, max(20, int(np.sqrt(cisi.size)))))
-        return _meta_payload({"kind": "hist", "title": f"Cross-ISI u{u0}<->u{u1}", "x": edges[:-1], "y": hist.astype(float), "w": np.diff(edges)}, requested_dp, dp)
+        cisi_ms = cisi / float(fs) * 1000.0  # samples -> ms
+        hist, edges = np.histogram(cisi_ms, bins=min(120, max(20, int(np.sqrt(cisi_ms.size)))))
+        return _meta_payload({"kind": "hist", "title": f"Cross-ISI u{u0}<->u{u1}", "x": edges[:-1], "y": hist.astype(float),
+                              "w": np.diff(edges), "x_label": "Cross-ISI (ms)", "y_label": "Count"}, requested_dp, dp)
 
     if method_key == "pearson_corr":
         rows = [np.asarray(corr.trnb(dp, u, 5), dtype=float) for u in units]
@@ -615,7 +593,9 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
     if method_key == "scaled_acg":
         acgs, isi_mode, _, _, _ = corr.scaled_acg(dp, units)
         acgs = np.asarray(acgs, dtype=float)
-        return _meta_payload({"kind": "image", "title": "Scaled ACG (units x lag)", "mat": acgs, "text": f"Median ISI mode: {np.nanmedian(np.asarray(isi_mode, dtype=float)):.3f} ms"}, requested_dp, dp)
+        return _meta_payload({"kind": "image", "title": "Scaled ACG (units x lag)", "mat": acgs,
+                              "x_label": "Scaled lag bin", "y_label": "Unit #", "cbar_label": "ACG (Hz)",
+                              "text": f"Median ISI mode: {np.nanmedian(np.asarray(isi_mode, dtype=float)):.3f} ms"}, requested_dp, dp)
 
     if method_key in {"crosscorr_vs_firing_rate", "ccg_vs_fr"}:
         t1 = _train(corr, dp, u0)
@@ -792,17 +772,22 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
             return _meta_payload({"kind": "text", "title": "Pearson Corr (train-binned)", "text": "Need at least two selected units."}, requested_dp, dp)
         rec_len = int(np.load(Path(dp) / "spike_times.npy")[-1])
         b_ms = float(_p("bin_ms", max(1.0, cbin)))
-        rows = [np.asarray(corr.binarize(t, b_ms, 30000, rec_len), dtype=float) for t in trains]
+        rows = [np.asarray(corr.binarize(t, b_ms, fs, rec_len), dtype=float) for t in trains]
         M = np.vstack(rows)
         mat = np.asarray(corr.pearson_corr(M), dtype=float)
-        return _meta_payload({"kind": "image", "title": "Pearson Corr (train-binned)", "mat": mat}, requested_dp, dp)
+        return _meta_payload({"kind": "image", "title": "Pearson Corr (train-binned)", "mat": mat,
+                              "x_label": "Unit #", "y_label": "Unit #", "cbar_label": "Pearson r"}, requested_dp, dp)
 
     if method_key == "correlation_index":
         trains = _train_list(corr, dp, units)
         if len(trains) < 2:
             return _meta_payload({"kind": "text", "title": "Correlation index matrix", "text": "Need at least two selected units."}, requested_dp, dp)
-        mat = np.asarray(corr.correlation_index(trains, dt=float(_p("dt_ms", max(1.0, cbin))), dp=dp), dtype=float)
-        return _meta_payload({"kind": "image", "title": "Correlation index matrix", "mat": mat}, requested_dp, dp)
+        out = corr.correlation_index(trains, dt=float(_p("dt_ms", max(1.0, cbin))), dp=dp)
+        arr = np.asarray(out, dtype=float)
+        if arr.ndim < 2:
+            return _meta_payload({"kind": "scalar", "title": "Correlation index", "value": float(arr.reshape(-1)[0])}, requested_dp, dp)
+        return _meta_payload({"kind": "image", "title": "Correlation index matrix", "mat": arr,
+                              "x_label": "Unit #", "y_label": "Unit #", "cbar_label": "Correlation index"}, requested_dp, dp)
 
     if method_key == "covariance":
         ccg_rate = np.asarray(corr.ccg_hz(dp, u0, u1, cbin, cwin, rate_corrected=True), dtype=float)
@@ -854,7 +839,7 @@ def run_method(method_key: str, dp: str, units: List[int], bin_ms: float, win_ms
     if method_key == "spike_time_tiling_coefficient":
         t1 = _train(corr, dp, u0)
         t2 = _train(corr, dp, u1)
-        L = float(max(t1[-1] if t1.size else 0, t2[-1] if t2.size else 0) / 30000.0)
+        L = float(max(t1[-1] if t1.size else 0, t2[-1] if t2.size else 0) / float(fs))
         sttc = float(corr.spike_time_tiling_coefficient(t1, t2, L=max(L, 1e-6), dt=max(1.0, cbin), dp=dp))
         return _meta_payload({"kind": "scalar", "title": "Spike Time Tiling Coefficient", "value": sttc}, requested_dp, dp)
 

@@ -28,6 +28,7 @@ neuropyguin_json/
 
 # Histology verification scratch screenshots
 tools/_verify_shots/
+tools/_postproc_shots/
 
 # Large binary/runtime artifacts
 *.npy
