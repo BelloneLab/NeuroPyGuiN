@@ -54,11 +54,6 @@ histograms, and label good / noise / MUA in a couple of clicks. Sorted a
 concatenated recording? One button splits the result back into per-session
 spike trains, with each session's events attached.
 
-![Curation tab](./neuropyguin/assets/screenshots/02_curation.png)
-
-The label buckets and unit inspector stay live while you audit each cluster.
-This capture uses the preloaded Phy labels and selects unit `243` so the metrics
-table and plot overlays are visible.
 
 ![Curation unit labels](./neuropyguin/assets/screenshots/04_curation_units.png)
 
