@@ -30,6 +30,9 @@ neuropyguin_json/
 tools/_verify_shots/
 tools/_postproc_shots/
 
+# Local development notes
+/postprocessing.md
+
 # Large binary/runtime artifacts
 *.npy
 *.npz
