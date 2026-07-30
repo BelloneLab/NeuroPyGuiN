@@ -127,6 +127,21 @@ def call_TPrime(args):
     print('output files')
     for op in out_list:
         print(op)
+
+    # A reference stream by itself gives TPrime nothing to align. This happens
+    # legitimately when CatGT ran without NI/OBX event extractors. Invoking the
+    # native executable with only -tostream returns code 42, even though no
+    # requested pipeline output is missing. Treat that configuration as a
+    # successful no-op so Kilosort and independent downstream stages remain
+    # usable.
+    if not events_list:
+        execution_time = time.time() - start
+        print('TPrime skipped: no event streams were extracted for alignment.')
+        return {
+            "execution_time": execution_time,
+            "skipped": True,
+            "skip_reason": "no event streams were extracted for alignment",
+        }
         
     # path to the 'runit.bat' executable that calls TPrime.
     # Essential in linux where TPrime executable is only callable through runit
@@ -452,7 +467,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-

@@ -1263,19 +1263,29 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 module_steps.append(("quality_metrics", "Quality Metrics", "quality_metrics"))
 
             done = 0
+            step_warnings: List[Dict[str, str]] = []
             total = max(len(module_steps) + int(run_catgt_effective or run_catgt_extract_only) + int(run_tprime_effective) + int(self.cfg.run_pybombcell), 1)
 
-            def execute_step(step_key: str, step_label: str, fn) -> None:
+            def execute_step(step_key: str, step_label: str, fn, *, required: bool = True) -> bool:
                 nonlocal done
                 self._begin_step(step_key, step_label)
                 try:
                     fn()
-                except Exception:
+                except Exception as exc:
                     self._finish_step(step_key, False)
-                    raise
-                self._finish_step(step_key, True)
-                done += 1
-                _safe_emit(self.signals.progress, int(done * 100 / total))
+                    if required:
+                        raise
+                    warning = f"{step_label} failed and was skipped: {exc}"
+                    step_warnings.append({"step": step_key, "message": str(exc)})
+                    _safe_emit(self.signals.log, f"[{self.job['name']}] Warning: {warning}")
+                    _safe_emit(self.signals.log, traceback.format_exc())
+                    return False
+                else:
+                    self._finish_step(step_key, True)
+                    return True
+                finally:
+                    done += 1
+                    _safe_emit(self.signals.progress, int(done * 100 / total))
 
             module_in = json_root / f"{run_name}_modules-input.json"
             module_out = json_root / f"{run_name}_modules-output.json"
@@ -1561,6 +1571,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     step_key,
                     step_label,
                     lambda module_name=module_name: self._run_module(module_name, module_in, module_out, self.job["workdir"]),
+                    required=(step_key == "kilosort"),
                 )
 
             if run_tprime_effective:
@@ -1596,7 +1607,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                             ni_extract_string=effective_ni_extract_string,
                         )
 
-                execute_step("tprime", "TPrime", _run_tprime_step)
+                execute_step("tprime", "TPrime", _run_tprime_step, required=False)
 
             if self.cfg.run_pybombcell:
                 from .pybombcell_integration import run_pybombcell_on_folder
@@ -1611,9 +1622,17 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         f"metrics={payload.get('metrics_csv', '')}"
                     )
 
-                execute_step("pybombcell", "py_bombcell", _run_pybombcell_step)
+                execute_step("pybombcell", "py_bombcell", _run_pybombcell_step, required=False)
 
-            _safe_emit(self.signals.finished, {"job": self.job["name"], "ok": True, "ks_folder": str(ks_folder.resolve())})
+            _safe_emit(
+                self.signals.finished,
+                {
+                    "job": self.job["name"],
+                    "ok": True,
+                    "ks_folder": str(ks_folder.resolve()),
+                    "warnings": step_warnings,
+                },
+            )
         except Exception as exc:
             tb = traceback.format_exc()
             if self._active_step_key:

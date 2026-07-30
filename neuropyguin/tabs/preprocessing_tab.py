@@ -2775,7 +2775,11 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.pool.start(worker)
 
     def _on_job_finished(self, result: Dict) -> None:
-        status = "OK" if result.get("ok") else "FAILED"
+        warnings = result.get("warnings") or []
+        if result.get("ok") and warnings:
+            status = "OK WITH WARNINGS"
+        else:
+            status = "OK" if result.get("ok") else "FAILED"
         self._append_log(f"Job {result.get('job')} finished: {status}")
         run_name = str(result.get("job", ""))
         if not result.get("ok"):
@@ -2783,7 +2787,11 @@ class PreprocessingTab(QtWidgets.QWidget):
                 first_widget = next(iter(self._step_widgets.values()))
                 if first_widget.percent_label.text() == "Pending":
                     first_widget.set_failed()
-        self.lbl_active_run_name.setText(f"{run_name} ({'completed' if result.get('ok') else 'failed'})")
+        if result.get("ok") and warnings:
+            final_label = "completed with warnings"
+        else:
+            final_label = "completed" if result.get("ok") else "failed"
+        self.lbl_active_run_name.setText(f"{run_name} ({final_label})")
         if result.get("ok"):
             ks_folder = str(result.get("ks_folder") or "")
             if not ks_folder:
