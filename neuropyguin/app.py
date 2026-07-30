@@ -134,6 +134,21 @@ else:
     from .styles import build_app_palette, build_app_qss
 
 
+def _import_diagnostics():
+    """Import the doctor modules, working both as a package and as a script.
+
+    Kept lazy so the (slow) dependency probing is only pulled in when the
+    diagnostics are actually requested.
+    """
+    if __package__ in (None, ""):
+        from neuropyguin import doctor as doctor_module
+        from neuropyguin.doctor_dialog import DiagnosticsWorker, DoctorDialog
+    else:
+        from . import doctor as doctor_module
+        from .doctor_dialog import DiagnosticsWorker, DoctorDialog
+    return doctor_module, DoctorDialog, DiagnosticsWorker
+
+
 TAB_TITLES = ["Preprocessing", "Curation", "Post Processing", "Histology"]
 STARTUP_TAB_OPTIONS = ["Last Used", *TAB_TITLES]
 PLOT_THEME_OPTIONS = ["Light", "Dark"]
@@ -317,6 +332,17 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self._plot_grid = True
         self._apply_application_theme(str(self.settings.value("plot/theme", "Light")))
 
+        # First-launch dependency self-check. The "pending" flag is written before
+        # the tabs exist so the Preprocessing tab can skip its own missing-tool
+        # prompt and let the diagnostics dialog, which covers the same tools plus
+        # everything else, speak first instead of stacking two dialogs.
+        self._doctor_first_run = not bool(
+            self.settings.value("doctor/first_run_done", False, type=bool)
+        )
+        if self._doctor_first_run:
+            self.settings.setValue("doctor/first_run_pending", True)
+            self.settings.sync()
+
         tabs = QtWidgets.QTabWidget()
         tabs.setDocumentMode(True)
         self.pre_tab = PreprocessingTab(thread_pool)
@@ -363,6 +389,8 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self._restore_window_state()
         self._apply_plot_preferences()
         self._update_action_states()
+        # Let the window paint before the (import-heavy) dependency probing starts.
+        QtCore.QTimer.singleShot(400, self._maybe_run_startup_doctor)
 
     def _build_actions(self) -> None:
         self.act_add_ap_files = QtGui.QAction("Add AP Files to Queue...", self)
@@ -445,6 +473,13 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_show_grid.setCheckable(True)
         self.act_show_grid.triggered.connect(self._set_plot_preferences)
 
+        self.act_doctor = QtGui.QAction("Run Diagnostics...", self)
+        self.act_doctor.setShortcut("Ctrl+Shift+D")
+        self.act_doctor.setStatusTip(
+            "Check every Python package, bundled toolbox, GPU runtime, and external tool the app needs."
+        )
+        self.act_doctor.triggered.connect(lambda checked=False: self._open_doctor())
+
         self.act_help_settings = QtGui.QAction("Settings Help", self)
         self.act_help_settings.setShortcut(QtGui.QKeySequence.HelpContents)
         self.act_help_settings.triggered.connect(self._show_settings_help)
@@ -484,6 +519,8 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         view_menu.addAction(self.act_show_grid)
 
         help_menu = self.menuBar().addMenu("&Help")
+        help_menu.addAction(self.act_doctor)
+        help_menu.addSeparator()
         help_menu.addAction(self.act_help_settings)
         help_menu.addAction(self.act_about)
 
@@ -815,6 +852,83 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
                 self.bottom_busy.setRange(0, 100)
             self.bottom_busy.setValue(0)
             self.bottom_busy.hide()
+
+    # --- dependency self-check ("doctor") --------------------------------- #
+
+    def _clear_doctor_pending(self) -> None:
+        self.settings.remove("doctor/first_run_pending")
+        self.settings.sync()
+
+    def _maybe_run_startup_doctor(self) -> None:
+        """Open the diagnostics on the first launch, re-check quietly afterwards."""
+        app = QtWidgets.QApplication.instance()
+        if app is not None and app.platformName().lower() == "offscreen":
+            self._clear_doctor_pending()
+            return
+        if self._doctor_first_run:
+            self._open_doctor(first_run=True)
+            return
+        if bool(self.settings.value("doctor/check_on_startup", False, type=bool)):
+            self._start_silent_doctor()
+
+    def _open_doctor(self, first_run: bool = False) -> None:
+        """Show the diagnostics dialog and run the checks in the background."""
+        try:
+            _doctor, DoctorDialog, _worker = _import_diagnostics()
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, "Diagnostics", f"The self-check could not be loaded: {exc}"
+            )
+            return
+        dlg = DoctorDialog(
+            settings=self.settings,
+            pool=QtCore.QThreadPool.globalInstance(),
+            theme=self._plot_theme,
+            first_run=bool(first_run),
+            parent=self,
+        )
+        dlg.installToolsRequested.connect(self._install_missing_tools_from_doctor)
+        dlg.start()
+        dlg.exec()
+        self._doctor_first_run = False
+        self.settings.setValue("doctor/first_run_done", True)
+        self._clear_doctor_pending()
+
+    def _start_silent_doctor(self) -> None:
+        """Re-check in the background; only surface the dialog on a hard failure."""
+        try:
+            doctor_module, _dialog, DiagnosticsWorker = _import_diagnostics()
+        except Exception:
+            return
+        worker = DiagnosticsWorker(lambda key, default: self.settings.value(key, default))
+        worker.signals.finished.connect(
+            lambda results: self._on_silent_doctor_finished(doctor_module, results)
+        )
+        QtCore.QThreadPool.globalInstance().start(worker)
+
+    def _on_silent_doctor_finished(self, doctor_module, results: object) -> None:
+        rows = list(results) if isinstance(results, (list, tuple)) else []
+        if not rows:
+            return
+        if doctor_module.has_blocking_failures(rows):
+            self.statusBar().showMessage(doctor_module.headline(rows), 8000)
+            self._open_doctor()
+            return
+        self.statusBar().showMessage(doctor_module.headline(rows), 5000)
+
+    def _install_missing_tools_from_doctor(self) -> None:
+        """Hand off to the Preprocessing tab's installer for the tools it manages."""
+        self.tabs.setCurrentWidget(self.pre_tab)
+        installer = getattr(self.pre_tab, "_install_missing_tools", None)
+        if callable(installer):
+            installer()
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "Install missing tools",
+            "Open Preprocessing > Settings > Tool and outputs and use "
+            "\"Install missing tools\".",
+        )
 
     def _show_settings_help(self) -> None:
         txt = (

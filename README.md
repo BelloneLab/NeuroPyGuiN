@@ -172,41 +172,94 @@ with the original toolchain.
 - **Anatomy, finally easy.** AP_histology and IBL alignment, reimagined as one elegant tab, with the per-channel region map a click away.
 - **Looks good doing it.** Light and dark themes across every view.
 
-## 🚀 Get started in 3 steps
+## 🚀 Get started in 2 steps
+
+One environment file per platform installs the whole app: GUI, Kilosort 4 with a
+CUDA PyTorch, the bundled ecephys pipeline, Bombcell, phy, and the histology
+stack. Pick the file for your OS.
 
 ```powershell
-# 1) Make the environment (one env runs the whole app, numpy pinned for Kilosort)
-conda env create -f environment.yml
+# Windows
+conda env create -f environment-windows.yml
 conda activate neuropygui
-
-# 2) Install the app extras
-pip install -r requirements.txt
-pip install phy            # optional, for manual curation
-
-# 3) Launch it
 python main.py
 ```
 
-That is it. `ecephys_spike_sorting` and `py_bombcell` are bundled inside the app
-folder, so there is nothing else to clone.
+```bash
+# Linux
+conda env create -f environment-linux.yml
+conda activate neuropygui
+python main.py
+```
 
-> On NVIDIA machines, GPU filtering/whitening uses CuPy. With a CUDA 12 driver:
-> `conda install -c conda-forge cupy cuda-version=12` (or `pip install cupy-cuda12x`).
+That is it. `ecephys_spike_sorting`, `py_bombcell`, and `npyx` are bundled inside
+the app folder, so there is nothing else to clone. To refresh an existing env,
+swap `create` for `update -n neuropygui` and add `--prune`.
+
+**On the very first launch a self-check runs automatically** and reports anything
+missing: Python packages, the CUDA device, the bundled toolboxes, the Allen
+atlas, and the external SpikeGLX tools. Every row carries a copy-pasteable fix.
+Re-open it any time with **Help > Run Diagnostics** (`Ctrl+Shift+D`), or from a
+terminal:
+
+```bash
+python -m neuropyguin.doctor      # prints the report, exits non-zero if broken
+```
+
+> GPU: the environment files install `torch==2.8.0+cu126` from the official
+> PyTorch index (never the CPU-only PyPI wheel) plus CuPy for filtering and
+> whitening. For a different CUDA runtime, change `cu126` in the pip block.
 
 ### Light up the Histology tab
 
 The atlas matching and tracing need the Allen Mouse Brain CCF 10um volumes.
 Download them once from **https://osf.io/fv7ed/overview**, then point the
 *Atlas folder* on the Histology > Setup page at that directory (or set
-`NPG_ATLAS_PATH`). The channel map and the IBL GUI use the IBL stack; see
-[`requirements-histology.txt`](./requirements-histology.txt) for the
-Kilosort-friendly (numpy < 2) install.
+`NPG_ATLAS_PATH`). The channel map and the optional IBL GUI use the IBL stack
+(`ibllib`, `iblatlas`, `SimpleITK`), which the environment files already install.
 
-### Bring your own tools
+### Preprocessing tools
 
-A few external programs do the actual sorting heavy-lifting and are installed
-separately, then pointed to from the Preprocessing tab:
-`CatGT`, `TPrime`, `C_Waves`, and `Kilosort4`.
+Open **Preprocessing > Settings > Tool and outputs** and click **Install missing
+tools**. NeuroPyGuiN detects Windows or Linux, downloads the matching official
+CatGT, TPrime, and C_Waves packages, configures their launchers, installs
+Kilosort4 into the active Python environment, and saves all four paths. The app
+also offers this installation automatically at startup when a tool is missing.
+
+A progress window opens while it works: a percentage bar per download (megabytes
+received out of total), an indeterminate bar while pip runs, the current step, and
+the full installer log. Close it and the installation keeps going in the
+background; the button turns into **Show progress** to bring it back.
+
+Once everything is installed the button stays live and reads **Check tools...**.
+It opens a review window listing each tool with its status, location, and Kilosort
+version, where you can **Re-check** the install, or tick any tool to download and
+verify it again. A reinstall of Kilosort uses `pip --no-deps`, so refreshing it can
+never pull a different PyTorch over your CUDA build.
+
+The native SpikeGLX tools currently publish prebuilt packages for Windows and
+Linux, not macOS. The automatic installer refuses unsupported platforms instead
+of downloading an incompatible executable.
+
+For manual installation or auditing, these are the exact upstream sources used
+by the app:
+
+| Tool | Windows package | Linux package | Source |
+|---|---|---|---|
+| CatGT | [Download ZIP](https://billkarsh.github.io/SpikeGLX/Support/CatGTWinApp.zip) | [Download ZIP](https://billkarsh.github.io/SpikeGLX/Support/CatGTLnxApp.zip) | [billkarsh/CatGT](https://github.com/billkarsh/CatGT) |
+| TPrime | [Download ZIP](https://billkarsh.github.io/SpikeGLX/Support/TPrimeWinApp.zip) | [Download ZIP](https://billkarsh.github.io/SpikeGLX/Support/TPrimeLnxApp.zip) | [billkarsh/TPrime](https://github.com/billkarsh/TPrime) |
+| C_Waves | [Download ZIP](https://billkarsh.github.io/SpikeGLX/Support/C_WavesWinApp.zip) | [Download ZIP](https://billkarsh.github.io/SpikeGLX/Support/C_WavesLnxApp.zip) | [billkarsh/C_Waves](https://github.com/billkarsh/C_Waves) |
+| Kilosort4 | Python package | Python package | [MouseLand/Kilosort](https://github.com/MouseLand/Kilosort) |
+
+All native downloads come from the official [SpikeGLX download
+page](https://billkarsh.github.io/SpikeGLX/). Kilosort4 is installed with
+`python -m pip install "torch==2.5.1" "kilosort>=4.1,<4.2"` using the same
+interpreter that is running NeuroPyGuiN. The PyTorch pin prevents current pip
+releases from silently replacing the project's CUDA 12 runtime with CUDA 13.
+
+If you built the environment from `environment-windows.yml` or
+`environment-linux.yml`, Kilosort 4 and its CUDA PyTorch are already installed,
+so the installer skips that step and only fetches the three native binaries.
 
 <details>
 <summary>Full dependency list</summary>

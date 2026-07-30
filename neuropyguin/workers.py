@@ -22,6 +22,7 @@ from typing import Dict, List, Sequence, Tuple
 from PySide6 import QtCore
 from .ecephys_runtime import ecephys_subprocess_env, ensure_ecephys_on_sys_path
 from .ks_output_resolver import archive_output_dir, find_kilosort_output_dir, has_kilosort_output
+from .preprocessing import catgt_command_for_input_layout, catgt_input_layout
 from .processes import tracked_popen, unregister_process
 
 
@@ -431,15 +432,41 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         return out
 
     @staticmethod
-    def _meta_exists_for_trial(npx_directory: str, run_name: str, gate_string: str, trigger_string: str, probe_string: str) -> bool:
-        g = str(gate_string).strip()
-        t = str(trigger_string).strip().split(",", 1)[0].strip()
-        p = str(probe_string).strip()
-        if not g or not t or not p or not run_name:
-            return False
-        base = Path(npx_directory)
-        meta = base / f"{run_name}_g{g}" / f"{run_name}_g{g}_imec{p}" / f"{run_name}_g{g}_t{t}.imec{p}.ap.meta"
-        return meta.exists()
+    def _meta_layout_for_trial(
+        npx_directory: str,
+        run_name: str,
+        gate_string: str,
+        trigger_string: str,
+        probe_string: str,
+    ) -> str:
+        """Return ``probe_folders`` or ``flat`` when a CatGT input meta exists.
+
+        SpikeGLX can save probe data either below ``<run>_gN_imecP`` or directly
+        in ``<run>_gN``. CatGT's ``-prb_fld`` flag is valid only for the former.
+        """
+        return catgt_input_layout(
+            npx_directory, run_name, gate_string, trigger_string, probe_string
+        )
+
+    @classmethod
+    def _meta_exists_for_trial(
+        cls,
+        npx_directory: str,
+        run_name: str,
+        gate_string: str,
+        trigger_string: str,
+        probe_string: str,
+    ) -> bool:
+        return bool(
+            cls._meta_layout_for_trial(
+                npx_directory, run_name, gate_string, trigger_string, probe_string
+            )
+        )
+
+    @staticmethod
+    def _catgt_command_for_layout(command: str, input_layout: str) -> str:
+        """Remove only CatGT's input probe-folder flag for flat recordings."""
+        return catgt_command_for_input_layout(command, input_layout)
 
     def _build_catgt_trials(self, run_name: str, bin_file: Path, gate_string: str, trigger_string: str, probe_string: str) -> List[Dict[str, str]]:
         """Enumerate up to 10 candidate (directory, run, gate, trigger, probe) combos to try with CatGT.
@@ -494,7 +521,9 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                                 "trigger_string": tr,
                                 "probe_string": pp,
                             }
-                            if self._meta_exists_for_trial(str(d), rn, gg, tr, pp):
+                            layout = self._meta_layout_for_trial(str(d), rn, gg, tr, pp)
+                            if layout:
+                                trial["input_layout"] = layout
                                 existing_trials.append(trial)
                             else:
                                 fallback_trials.append(trial)
@@ -575,6 +604,15 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 f"[{self.job['name']}] CatGT extract-only trial {idx}/10 "
                 f"dir={trial['npx_directory']} run={trial['catgt_run_name']} g={trial['gate_string']} t={trial['trigger_string']}",
             )
+            trial_cmd_string = self._catgt_command_for_layout(
+                catgt_cmd_string, trial.get("input_layout", "")
+            )
+            if trial_cmd_string != catgt_cmd_string:
+                _safe_emit(
+                    self.signals.log,
+                    f"[{self.job['name']}] Detected flat SpikeGLX probe layout; "
+                    "omitting CatGT input flag -prb_fld.",
+                )
             create_input_json_fn(
                 str(trial_in),
                 npx_directory=trial["npx_directory"],
@@ -589,7 +627,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 trigger_string=trial["trigger_string"],
                 probe_string=trial["probe_string"],
                 catGT_stream_string=catgt_stream_string,
-                catGT_cmd_string=catgt_cmd_string,
+                catGT_cmd_string=trial_cmd_string,
                 catGT_car_mode="none",
                 catGT_loccar_min_um=self.cfg.catgt_loccar_min_um,
                 catGT_loccar_max_um=self.cfg.catgt_loccar_max_um,
@@ -605,14 +643,19 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 external_kilosort_output_tmp=self.cfg.kilosort_output_tmp,
             )
             trial_start = time.time()
-            lines = self._run_module("catGT_helper", trial_in, trial_out, self.job["workdir"])
+            module_failed = False
+            try:
+                lines = self._run_module("catGT_helper", trial_in, trial_out, self.job["workdir"])
+            except RuntimeError as exc:
+                module_failed = True
+                lines = [str(exc)]
             catgt_run_dir = self._catgt_run_dir(
                 job_out,
                 trial["catgt_run_name"],
                 trial["gate_string"],
                 trial["trigger_string"],
             )
-            if catgt_run_dir.is_dir():
+            if not module_failed and catgt_run_dir.is_dir():
                 fresh_txt = self._find_recent_text_outputs(catgt_run_dir, trial_start)
                 if fresh_txt:
                     preview = ", ".join(p.name for p in fresh_txt[:4])
@@ -782,6 +825,15 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 f"[{self.job['name']}] CatGT trial {idx}/10 "
                 f"dir={trial['npx_directory']} run={trial['catgt_run_name']} g={trial['gate_string']} t={trial['trigger_string']}"
             )
+            trial_cmd_string = self._catgt_command_for_layout(
+                catgt_cmd_string, trial.get("input_layout", "")
+            )
+            if trial_cmd_string != catgt_cmd_string:
+                _safe_emit(
+                    self.signals.log,
+                    f"[{self.job['name']}] Detected flat SpikeGLX probe layout; "
+                    "omitting CatGT input flag -prb_fld.",
+                )
             create_input_json_fn(
                 str(trial_in),
                 npx_directory=trial["npx_directory"],
@@ -796,7 +848,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 trigger_string=trial["trigger_string"],
                 probe_string=trial["probe_string"],
                 catGT_stream_string=catgt_stream_string,
-                catGT_cmd_string=catgt_cmd_string,
+                catGT_cmd_string=trial_cmd_string,
                 catGT_car_mode=self.cfg.catgt_car_mode,
                 catGT_loccar_min_um=self.cfg.catgt_loccar_min_um,
                 catGT_loccar_max_um=self.cfg.catgt_loccar_max_um,
@@ -812,7 +864,10 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 external_kilosort_output_tmp=self.cfg.kilosort_output_tmp,
             )
             trial_start = time.time()
-            lines = self._run_module("catGT_helper", trial_in, trial_out, self.job["workdir"])
+            try:
+                lines = self._run_module("catGT_helper", trial_in, trial_out, self.job["workdir"])
+            except RuntimeError as exc:
+                lines = [str(exc)]
             catgt_ap = self._find_recent_catgt_ap(job_out, trial_start, probe_string)
             if catgt_ap is not None and catgt_ap.exists():
                 meta_path = self._meta_for_bin(catgt_ap)

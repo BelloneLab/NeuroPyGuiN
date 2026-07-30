@@ -1,0 +1,14 @@
+{
+  "platform": "linux",
+  "installed_at": "2026-07-30T08:34:21.155347+00:00",
+  "paths": {
+    "catgt": "/home/andry/NeuroPyGuiN/tools/CatGT-linux",
+    "tprime": "/home/andry/NeuroPyGuiN/tools/TPrime-linux",
+    "cwaves": "/home/andry/NeuroPyGuiN/tools/C_Waves-linux",
+    "kilosort": "/home/andry/anaconda3/envs/neuropygui/lib/python3.10/site-packages/kilosort"
+  },
+  "sources": {
+    "spikeglx": "https://billkarsh.github.io/SpikeGLX/",
+    "kilosort": "https://github.com/MouseLand/Kilosort"
+  }
+}

@@ -1,0 +1,155 @@
+# NeuroPyGuiN - complete Windows environment (x64, NVIDIA CUDA 12).
+#
+# This single file installs EVERYTHING the app needs: the GUI, the bundled
+# ecephys_spike_sorting pipeline, Kilosort 4 (+ PyTorch/CUDA), py_bombcell,
+# NeuroPyxels post-processing, phy curation, and the histology stack.
+#
+# Fresh install (Anaconda Prompt):
+#   conda env create -f environment-windows.yml
+#   conda activate neuropygui
+#   python main.py
+#
+# Update an existing env:
+#   conda env update -n neuropygui -f environment-windows.yml --prune
+#   conda deactivate && conda activate neuropygui
+#
+# After launching, Help > Run Diagnostics re-checks every dependency below and
+# reports anything missing (it runs automatically on the very first launch).
+name: neuropygui
+variables:
+  # Prevent packages installed with `pip --user` (%APPDATA%\Python) from
+  # shadowing this environment - a GUI-enabled OpenCV there can hijack Qt's
+  # plugin path and break PySide6.
+  PYTHONNOUSERSITE: "1"
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  # Build tooling: needed for the direct-URL pip requirement (cachecache) below.
+  - pip>=23
+  - setuptools
+  - wheel
+  # tkinter: ecephys_spike_sorting/common/SGLXMetaToCoords.py imports it at module
+  # level, so every Kilosort/CatGT module needs it. conda's python ships it via tk.
+  - tk
+
+  # --- Scientific core -----------------------------------------------------
+  # numpy: Kilosort 4.1 and ibllib 4.x both support numpy 2, so the old "< 2"
+  # pin is gone. The ceiling comes from numba (< 2.5) and cupy (< 2.6), and from
+  # bundled code that still uses numpy-1 aliases (np.trapz, np.in1d) which are
+  # deprecated but present up to 2.4.
+  - numpy>=1.26,<2.5
+  - scipy
+  - pandas
+  - matplotlib
+  - numba
+  - scikit-learn
+  - imbalanced-learn
+  - statsmodels
+  - networkx
+  - h5py
+  - joblib
+  - psutil
+  - tqdm
+  - seaborn
+  - pyarrow
+  - pillow
+  - cmcrameri
+  # xarray: ecephys_spike_sorting mean_waveforms writes its output as xarray.
+  - xarray
+  # The py_bombcell unit-quality GUI runs as a Jupyter notebook with ipywidgets,
+  # launched from the curation tab. Without these the GUI silently never opens.
+  - ipython
+  - ipywidgets
+  - jupyterlab
+  # umap-learn: used by the UMAP / recluster phy plugins NeuroPyGuiN deploys into
+  # %USERPROFILE%\.phy\plugins. Missing it makes phy's plugin discovery fail.
+  - umap-learn
+
+  # --- GPU: CuPy for CatGT-style filtering/whitening ------------------------
+  #     (Kilosort itself uses PyTorch, installed in the pip section below.)
+  - cupy
+  - cuda-version=12
+
+  - pip:
+      # --- Kilosort 4 + PyTorch (CUDA 12.6) --------------------------------
+      # On Windows, plain `pip install torch` from PyPI gives a CPU-ONLY build,
+      # which makes Kilosort 4 unusably slow. The "+cu126" local version exists
+      # only on the PyTorch index, so this is explicit and cannot be substituted.
+      # For a different CUDA runtime, swap cu126 -> cu121 / cu128 in all lines.
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.8.0+cu126
+      # torchvision: imported by npyx's C4 feature helpers (waveform/ACG
+      # transforms). Kept on the same index so it matches the torch build.
+      - torchvision==0.23.0+cu126
+      # Kilosort 4. 4.1.x is the tested series: the bundled ks4_helper calls
+      # run_kilosort(..., clear_cache=, save_preprocessed_copy=, verbose_console=),
+      # which those releases accept. It pulls faiss-cpu automatically.
+      - kilosort>=4.1,<4.2
+
+      # --- GUI -------------------------------------------------------------
+      # Pin below 6.8: pyqtgraph 0.13.x/0.14.x crash (native Qt paint access
+      # violation) on the Qt 6.10 that PySide6 6.10 ships; 6.7.x (Qt 6.7) is the
+      # tested baseline.
+      - PySide6>=6.5,<6.8
+      - pyqtgraph>=0.14.0,<0.15
+
+      # --- Bundled ecephys_spike_sorting pipeline ---------------------------
+      # argschema: every module's CLI entry point (`from argschema import
+      # ArgSchemaParser`). GitPython: common/utils.py does `from git import Repo`
+      # and is imported by every module. Without either, CatGT / Kilosort /
+      # quality-metrics steps die at import time.
+      # This legacy pipeline passes one combined JSON document to each module.
+      # argschema 1.17.5 (Marshmallow 2) ignores sections owned by other modules;
+      # argschema 3 rejects them as unknown fields before the module can run.
+      - argschema==1.17.5
+      - marshmallow>=2.15,<3
+      - GitPython
+
+      # --- Bundled py_bombcell ---------------------------------------------
+      - upsetplot
+      - mtscomp
+      # cachecache is not reliably installable from PyPI. Install the upstream
+      # v0.2.2 source at an immutable commit, without requiring Git locally.
+      - "cachecache @ https://github.com/m-beau/cachecache/archive/aa96d4916618941868625a63575337f1e67b4635.zip"
+
+      # --- phy manual curation ---------------------------------------------
+      # phy 2.1 installs cleanly next to PySide6 (it is a PyQt5 app and
+      # NeuroPyGuiN launches it as a separate process with QT_API=pyqt5), so it
+      # no longer needs its own conda env. Pulls phylib, PyQt5, pyopengl,
+      # qtconsole. seaborn (above) is needed by the mahalanobis plugin.
+      - phy>=2.1,<3
+
+      # --- Histology tab: native AP_histology workflow ----------------------
+      #     (slice prep, atlas matching, alignment, probe tracing, MAT/CSV export)
+      - tifffile
+      - imagecodecs
+      - opencv-python-headless
+      # Channel map + optional IBL ephys-alignment GUI.
+      - ibllib
+      - iblatlas
+      - SimpleITK
+
+# --- Things conda cannot install for you -------------------------------------
+#
+# 1) SpikeGLX helper binaries (Windows builds), then point the Preprocessing tab
+#    at the folders that contain them: CatGT-win, TPrime-win, C_Waves-win.
+#      https://billkarsh.github.io/SpikeGLX/
+#    A Visual C++ redistributable is required by those binaries.
+#
+# 2) Allen Mouse Brain CCF 10um volumes for the Histology tab (download once,
+#    then set Histology > Setup > Atlas folder, or NPG_ATLAS_PATH):
+#      https://osf.io/fv7ed/overview
+#
+# 3) OPTIONAL - the C4 cerebellar cell-type classifier still runs in its own env,
+#    because its `laplace-torch` dependency resolves a different torch build and
+#    would break Kilosort's CUDA torch in this env:
+#      conda create -n npyx_c4 python=3.10 -y
+#      conda run -n npyx_c4 python -m pip install "npyx[c4]"
+#      conda run -n npyx_c4 python -m pip install "setuptools<80" "scikit-learn<1.6"
+#    The app finds %USERPROFILE%\.conda\envs\npyx_c4\python.exe automatically;
+#    anywhere else, set NPYX_C4_PYTHON to that python.exe.
+#
+# 4) OPTIONAL - the IBL apps repo, for the ephys-alignment GUI. Clone it and set
+#    Histology > Setup > iblapps folder:
+#      git clone https://github.com/int-brain-lab/iblapps

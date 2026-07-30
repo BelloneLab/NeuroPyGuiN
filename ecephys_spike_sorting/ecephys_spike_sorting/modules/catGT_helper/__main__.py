@@ -1,5 +1,6 @@
-﻿from argschema import ArgSchemaParser
+from argschema import ArgSchemaParser
 import os
+import shlex
 import sys
 import subprocess
 import time
@@ -71,22 +72,33 @@ def run_CatGT(args):
 
     # print('cmd_parts')
 
-    catGT_cmd = ' '        # use space as the separator for the command parts
-    catGT_cmd = catGT_cmd.join(cmd_parts[1:len(cmd_parts)]) # these are the parameters
+    catGT_params = ' '.join(cmd_parts[1:])
     if os_str=='linux':
-        # enclose the params in single quotes, so curly braces will not be interpreted by Linux
-        catGT_cmd = f"{cmd_parts[0]} '{catGT_cmd}'"
+        # The official wrapper requires the complete parameter string as one
+        # argument. A list invocation avoids an extra shell and preserves paths.
+        catGT_cmd = [cmd_parts[0], catGT_params]
     else:
-        catGT_cmd = f"{cmd_parts[0]} {catGT_cmd}"
+        catGT_cmd = [cmd_parts[0], *shlex.split(catGT_params, posix=False)]
 
-
-
-    print('CatGT command line:' + catGT_cmd)
+    print('CatGT command line: ' + subprocess.list2cmdline(catGT_cmd))
 
     start = time.time()
-    subprocess.Popen(catGT_cmd,shell='False').wait()
+    return_code = subprocess.Popen(catGT_cmd, shell=False).wait()
 
     execution_time = time.time() - start
+
+    if return_code != 0:
+        log_file = Path.cwd() / 'CatGT.log'
+        detail = ''
+        if log_file.is_file():
+            lines = log_file.read_text(encoding='utf-8', errors='ignore').splitlines()
+            for line in reversed(lines):
+                message = line.split('] ', 1)[-1].strip()
+                if message:
+                    detail = message
+                    break
+        suffix = f': {detail}' if detail else ''
+        raise RuntimeError(f'CatGT exited with code {return_code}{suffix}')
 
     # copy CatGT log file, which will be in the directory with the calling
     # python scripte, to the destination directory
@@ -183,7 +195,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 

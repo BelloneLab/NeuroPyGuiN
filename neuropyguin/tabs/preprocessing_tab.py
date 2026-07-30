@@ -42,12 +42,69 @@ from ..string_builders import (
     merge_bitfields_into_catgt_command,
     merge_extractors_into_catgt_command,
 )
+from ..tool_install_dialog import ToolInstallProgressDialog, ToolMaintenanceDialog, ToolStatus
+from ..tool_installer import (
+    NATIVE_TOOLS,
+    default_tool_paths,
+    detected_os,
+    install_missing_tools as install_missing_preprocessing_tools,
+    installed_kilosort_path,
+    installed_kilosort_version,
+    missing_tools,
+    native_tool_is_installed,
+    tool_display_name,
+)
 from ..workers import (
     ConcatenationConfig,
     ConcatenationWorker,
     EcephysPipelineConfig,
     EcephysPipelineWorker,
 )
+
+
+class ToolInstallSignals(QtCore.QObject):
+    """Signals emitted by the background external-tool installer."""
+
+    log = QtCore.Signal(str)
+    # (label, fraction): overall completion in [0, 1], or a negative value while a
+    # step (a pip install) has no measurable progress.
+    progress = QtCore.Signal(str, float)
+    finished = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+
+
+class ToolInstallWorker(QtCore.QRunnable):
+    """Download and configure missing preprocessing tools without blocking Qt."""
+
+    def __init__(
+        self,
+        project_root: Path,
+        paths: Dict[str, str],
+        requested: List[str],
+        force: bool = False,
+    ) -> None:
+        super().__init__()
+        self.project_root = project_root
+        self.paths = dict(paths)
+        self.requested = list(requested)
+        self.force = bool(force)
+        self.signals = ToolInstallSignals()
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            installed = install_missing_preprocessing_tools(
+                self.project_root,
+                self.paths,
+                requested=self.requested,
+                report=self.signals.log.emit,
+                progress=lambda label, fraction: self.signals.progress.emit(str(label), float(fraction)),
+                force=self.force,
+            )
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+            return
+        self.signals.finished.emit(installed)
 
 
 class BinDropList(QtWidgets.QListWidget):
@@ -527,9 +584,13 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._pending_concat_ni_extract: List[str] = []
         self._ks4_adv_params: Dict[str, object] = {}
         self._active_run_context: Dict[str, object] | None = None
+        self._tool_install_worker: ToolInstallWorker | None = None
+        self._tool_install_dialog: ToolInstallProgressDialog | None = None
 
         self._build_ui()
         self._restore_settings()
+        self._refresh_tool_status()
+        QtCore.QTimer.singleShot(900, self._offer_missing_tools)
 
     def _build_ui(self) -> None:
         main = QtWidgets.QVBoxLayout(self)
@@ -728,10 +789,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.sp_cwaves_um.setRange(10.0, 400.0)
         self.sp_cwaves_um.setValue(160.0)
 
-        self.ed_catgt_path = QtWidgets.QLineEdit(str((Path.cwd() / "tools" / "CatGT-win").resolve()))
-        self.ed_tprime_path = QtWidgets.QLineEdit(str((Path.cwd() / "tools" / "TPrime-win").resolve()))
-        self.ed_cwaves_path = QtWidgets.QLineEdit(str((Path.cwd() / "tools" / "C_Waves-win").resolve()))
-        self.ed_ks4_repo = QtWidgets.QLineEdit(str((Path.cwd() / "tools" / "Kilosort" / "kilosort").resolve()))
+        project_root = Path(__file__).resolve().parents[2]
+        platform_tool_paths = default_tool_paths(project_root)
+        self.ed_catgt_path = QtWidgets.QLineEdit(platform_tool_paths.get("catgt", ""))
+        self.ed_tprime_path = QtWidgets.QLineEdit(platform_tool_paths.get("tprime", ""))
+        self.ed_cwaves_path = QtWidgets.QLineEdit(platform_tool_paths.get("cwaves", ""))
+        self.ed_ks4_repo = QtWidgets.QLineEdit(platform_tool_paths["kilosort"])
         self.ed_ks_tmp = QtWidgets.QLineEdit(str((Path.cwd() / "kilosort_datatemp").resolve()))
 
         btn_catgt_path = QtWidgets.QPushButton("Browse")
@@ -1005,25 +1068,44 @@ class PreprocessingTab(QtWidgets.QWidget):
             make_field(
                 "KS4 repository dir",
                 wrap_ks4_repo,
-                "Path to the Kilosort repository used by the helper metadata.",
+                "Path to the installed Kilosort Python package used by the Kilosort4 helper.",
             ),
             1,
             1,
         )
+        self.lbl_tool_status = QtWidgets.QLabel()
+        self.lbl_tool_status.setObjectName("SectionHint")
+        self.lbl_tool_status.setWordWrap(True)
+        self.btn_install_tools = QtWidgets.QPushButton("Install missing tools")
+        self.btn_install_tools.setProperty("role", "secondary")
+        self.btn_install_tools.setToolTip(
+            "Review CatGT, TPrime, C_Waves, and Kilosort4: see what is installed and where, "
+            "re-check it, install what is missing, or reinstall a tool that misbehaves. Native "
+            "packages come from the official SpikeGLX site for Windows or Linux; Kilosort4 goes "
+            "into the active Python environment."
+        )
+        tool_install_row = QtWidgets.QHBoxLayout()
+        tool_install_row.setContentsMargins(0, 0, 0, 0)
+        tool_install_row.setSpacing(10)
+        tool_install_row.addWidget(self.lbl_tool_status, 1)
+        tool_install_row.addWidget(self.btn_install_tools, 0)
+        tool_install_wrap = QtWidgets.QWidget()
+        tool_install_wrap.setLayout(tool_install_row)
+        paths_grid.addWidget(tool_install_wrap, 2, 0, 1, 2)
         paths_grid.addWidget(
             make_field(
                 "Kilosort temp dir",
                 wrap_ks_tmp,
                 "Temporary fast directory used by sorting helpers.",
             ),
-            2,
+            3,
             0,
             1,
             2,
         )
         paths_grid.addWidget(
             make_field("Output root", out_wrap, "Root folder where per-run outputs are saved."),
-            3,
+            4,
             0,
             1,
             2,
@@ -1036,7 +1118,7 @@ class PreprocessingTab(QtWidgets.QWidget):
                 "written under <Output root>/.../<session>/spike_sorting/. The CatGT run folder then lives inside "
                 "that spike_sorting folder.",
             ),
-            4,
+            5,
             0,
         )
         paths_grid.addWidget(
@@ -1047,14 +1129,14 @@ class PreprocessingTab(QtWidgets.QWidget):
                 "is used on raw AP input. This reruns the full CatGT AP processing instead of generating only text "
                 "extractor outputs.",
             ),
-            4,
+            5,
             1,
             1,
             1,
         )
         paths_grid.addWidget(
             make_field("JSON root", json_wrap, "Folder where generated pipeline JSON files are stored."),
-            5,
+            6,
             0,
             1,
             2,
@@ -1275,6 +1357,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         btn_cwaves_path.clicked.connect(lambda: self._pick_folder(self.ed_cwaves_path))
         btn_ks4_repo.clicked.connect(lambda: self._pick_folder(self.ed_ks4_repo))
         btn_ks_tmp.clicked.connect(lambda: self._pick_folder(self.ed_ks_tmp))
+        self.btn_install_tools.clicked.connect(self._install_missing_tools)
         self.ed_output.editingFinished.connect(self._persist_settings)
         self.ck_mirror_raw_hierarchy_output.toggled.connect(lambda _checked: self._persist_settings())
         self.cb_queue_filter.currentIndexChanged.connect(lambda _idx: self._persist_settings())
@@ -1313,6 +1396,10 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.ed_tprime_path.editingFinished.connect(self._persist_settings)
         self.ed_cwaves_path.editingFinished.connect(self._persist_settings)
         self.ed_ks4_repo.editingFinished.connect(self._persist_settings)
+        self.ed_catgt_path.editingFinished.connect(self._refresh_tool_status)
+        self.ed_tprime_path.editingFinished.connect(self._refresh_tool_status)
+        self.ed_cwaves_path.editingFinished.connect(self._refresh_tool_status)
+        self.ed_ks4_repo.editingFinished.connect(self._refresh_tool_status)
         self.ed_ks_tmp.editingFinished.connect(self._persist_settings)
         self.btn_build_catgt.clicked.connect(self._open_catgt_builder)
         self.btn_build_bitfield.clicked.connect(self._open_bitfield_builder)
@@ -1322,6 +1409,246 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_adv_ks4.clicked.connect(self._open_ks4_advanced)
         self.btn_save_settings_file.clicked.connect(self.saveSettingsFileRequested.emit)
         self.btn_load_settings_file.clicked.connect(self.loadSettingsFileRequested.emit)
+
+    def _configured_tool_paths(self) -> Dict[str, str]:
+        return {
+            "catgt": self.ed_catgt_path.text().strip(),
+            "tprime": self.ed_tprime_path.text().strip(),
+            "cwaves": self.ed_cwaves_path.text().strip(),
+            "kilosort": self.ed_ks4_repo.text().strip(),
+        }
+
+    def _refresh_tool_status(self) -> List[str]:
+        ks_path = installed_kilosort_path()
+        configured_ks = self.ed_ks4_repo.text().strip()
+        if ks_path is not None and (not configured_ks or not Path(configured_ks).expanduser().is_dir()):
+            self.ed_ks4_repo.setText(str(ks_path))
+        missing = missing_tools(self._configured_tool_paths())
+        os_label = detected_os().title()
+        if self._tool_install_worker is not None:
+            # An install is in flight: leave the live label alone and keep the button
+            # as the way back to its progress window.
+            self.btn_install_tools.setEnabled(True)
+            self.btn_install_tools.setText("Show progress")
+            return missing
+        if missing:
+            names = ", ".join(tool_display_name(key) for key in missing)
+            self.lbl_tool_status.setText(f"Detected {os_label}. Missing or incompatible: {names}.")
+            self.btn_install_tools.setText("Install missing tools")
+        else:
+            self.lbl_tool_status.setText(f"Detected {os_label}. All preprocessing tools are ready.")
+            # Still clickable: the review dialog is how the user re-checks a healthy
+            # install, or reinstalls a tool that misbehaves.
+            self.btn_install_tools.setText("Check tools...")
+        self.btn_install_tools.setEnabled(True)
+        return missing
+
+    def _offer_missing_tools(self) -> None:
+        app = QtWidgets.QApplication.instance()
+        if app is not None and app.platformName().lower() == "offscreen":
+            return
+        if detected_os() not in {"windows", "linux"}:
+            return
+        # On the very first launch the diagnostics dialog reports these same tools
+        # (plus every Python dependency) and offers to install them, so skip this
+        # prompt instead of stacking two dialogs on top of each other.
+        if bool(self.settings.value("doctor/first_run_pending", False, type=bool)):
+            self._refresh_tool_status()
+            return
+        missing = self._refresh_tool_status()
+        if not missing or self._tool_install_worker is not None:
+            return
+        self._confirm_and_install_tools(missing)
+
+    def _install_missing_tools(self) -> None:
+        # An install already in flight: bring its progress window back instead of
+        # starting a second run or claiming everything is ready.
+        if self._tool_install_worker is not None:
+            self._show_tool_install_dialog()
+            return
+        self._refresh_tool_status()
+        self._open_tool_review()
+
+    def _tool_status_rows(self) -> List[ToolStatus]:
+        """Build the current status of every external tool for the review dialog."""
+        os_name = detected_os()
+        native_supported = os_name in {"windows", "linux"}
+        paths = self._configured_tool_paths()
+        rows: List[ToolStatus] = []
+        for tool in NATIVE_TOOLS:
+            configured = paths.get(tool.key, "")
+            rows.append(
+                ToolStatus(
+                    key=tool.key,
+                    name=tool.name,
+                    ready=bool(configured) and native_tool_is_installed(tool, configured, os_name),
+                    location=configured,
+                    installable=native_supported,
+                    note="" if native_supported else f"no prebuilt package for {os_name}",
+                )
+            )
+        ks_path = installed_kilosort_path()
+        version = installed_kilosort_version()
+        rows.append(
+            ToolStatus(
+                key="kilosort",
+                name="Kilosort4",
+                ready=ks_path is not None,
+                location=str(ks_path or ""),
+                installable=True,
+                note=f"kilosort {version}" if version else "",
+            )
+        )
+        return rows
+
+    def _open_tool_review(self) -> None:
+        """Show the tool review dialog: status per tool, re-check, install/reinstall."""
+        os_name = detected_os()
+        dialog = ToolMaintenanceDialog(
+            theme=str(self.settings.value("plot/theme", "Light")),
+            platform_label=f"Detected {os_name.title()}. ",
+            parent=self,
+        )
+        dialog.set_rows(self._tool_status_rows())
+        dialog.recheckRequested.connect(
+            lambda: (self._refresh_tool_status(), dialog.set_rows(self._tool_status_rows()))
+        )
+        # force=True: a ticked tool that is already present is an explicit refresh.
+        # It is a no-op for a tool that is simply absent.
+        dialog.installRequested.connect(lambda keys: self._start_tool_install(list(keys), force=True))
+        dialog.exec()
+
+    def _show_tool_install_dialog(self) -> None:
+        """Show (or re-show) the installer progress window if there is one."""
+        dialog = self._tool_install_dialog
+        if dialog is None:
+            return
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _confirm_and_install_tools(self, missing: List[str]) -> None:
+        names = ", ".join(tool_display_name(key) for key in missing)
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setWindowTitle("Install missing preprocessing tools")
+        box.setText(f"Install the {detected_os().title()} versions of: {names}?")
+        box.setInformativeText(
+            "CatGT, TPrime, and C_Waves will be downloaded from the official SpikeGLX site into "
+            "this project's tools folder. Kilosort4 will be installed with pip into the Python "
+            "environment currently running NeuroPyGuiN. This requires internet access."
+        )
+        install_button = box.addButton("Install", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("Later", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(install_button)
+        box.exec()
+        if box.clickedButton() is not install_button:
+            return
+        self._start_tool_install(missing)
+
+    def _start_tool_install(self, requested: List[str], force: bool = False) -> None:
+        if self._tool_install_worker is not None:
+            self._show_tool_install_dialog()
+            return
+        requested = [str(key) for key in requested]
+        names = [tool_display_name(key) for key in requested]
+        project_root = Path(__file__).resolve().parents[2]
+        worker = ToolInstallWorker(project_root, self._configured_tool_paths(), requested, force=force)
+
+        # A live progress window: downloads report bytes, pip runs indeterminate, and
+        # every log line is mirrored there as well as into the run log.
+        dialog: ToolInstallProgressDialog | None = None
+        app = QtWidgets.QApplication.instance()
+        if app is None or app.platformName().lower() != "offscreen":
+            dialog = ToolInstallProgressDialog(
+                names, theme=str(self.settings.value("plot/theme", "Light")), parent=self
+            )
+            worker.signals.log.connect(dialog.append_log)
+            worker.signals.progress.connect(dialog.set_progress)
+        self._tool_install_dialog = dialog
+
+        worker.signals.log.connect(lambda message: self._append_log(f"[Tool installer] {message}"))
+        worker.signals.progress.connect(self._on_tool_install_progress)
+        worker.signals.finished.connect(self._tool_install_finished)
+        worker.signals.failed.connect(self._tool_install_failed)
+        self._tool_install_worker = worker
+        self.btn_install_tools.setEnabled(True)
+        self.btn_install_tools.setText("Show progress")
+        self.lbl_tool_status.setText(f"Installing {', '.join(names)}...")
+        self._append_log(
+            f"[Tool installer] Detected {detected_os().title()}; installing: " + ", ".join(names)
+        )
+        if dialog is not None:
+            dialog.show()
+        self.pool.start(worker)
+
+    @QtCore.Slot(str, float)
+    def _on_tool_install_progress(self, label: str, fraction: float) -> None:
+        """Mirror installer progress into the always-visible settings row."""
+        if fraction < 0:
+            self.lbl_tool_status.setText(str(label))
+            return
+        self.lbl_tool_status.setText(f"{label}  ({fraction * 100:.0f}%)")
+
+    def _apply_installed_tool_paths(self, installed: Dict[str, str]) -> None:
+        fields = {
+            "catgt": self.ed_catgt_path,
+            "tprime": self.ed_tprime_path,
+            "cwaves": self.ed_cwaves_path,
+            "kilosort": self.ed_ks4_repo,
+        }
+        for key, path in installed.items():
+            field = fields.get(key)
+            if field is not None and path:
+                field.setText(str(path))
+
+    def _end_tool_install(self, ok: bool, message: str) -> None:
+        """Close out an install run: settle the progress window and the button.
+
+        The outcome is shown in the progress window when it is still open, and as a
+        message box only when the user sent the install to the background.
+        """
+        dialog = self._tool_install_dialog
+        self._tool_install_worker = None
+        self.btn_install_tools.setText("Install missing tools")
+        # Recompute the row now that the worker is gone, so a retry stays clickable.
+        self._refresh_tool_status()
+        if dialog is not None:
+            dialog.finish(ok, message)
+            if dialog.isVisible():
+                return
+        icon = QtWidgets.QMessageBox.Information if ok else QtWidgets.QMessageBox.Critical
+        QtWidgets.QMessageBox(icon, "Preprocessing tools", message, parent=self).exec()
+
+    @QtCore.Slot(object)
+    def _tool_install_finished(self, installed: object) -> None:
+        result = dict(installed) if isinstance(installed, dict) else {}
+        self._apply_installed_tool_paths(result)
+        self._persist_settings()
+        self.settings.sync()
+        remaining = self._refresh_tool_status()
+        if remaining:
+            names = ", ".join(tool_display_name(key) for key in remaining)
+            self._end_tool_install(
+                False, f"Installation finished, but these tools still failed verification: {names}"
+            )
+            return
+        self._end_tool_install(
+            True, "All preprocessing tools are installed and their paths have been saved."
+        )
+
+    @QtCore.Slot(str)
+    def _tool_install_failed(self, message: str) -> None:
+        # Adopt any tools that completed before a later download failed.
+        defaults = default_tool_paths(Path(__file__).resolve().parents[2])
+        ready_defaults = [key for key in defaults if key not in missing_tools(defaults)]
+        self._apply_installed_tool_paths({key: defaults[key] for key in ready_defaults})
+        self._persist_settings()
+        self._refresh_tool_status()
+        self._append_log(f"[Tool installer] Failed: {message}")
+        self._end_tool_install(
+            False, f"The installer stopped safely. Completed tools were kept.\n\n{message}"
+        )
 
     def _open_parameters_window(self) -> None:
         if hasattr(self, "work_sections") and hasattr(self, "settings_section_index"):

@@ -90,6 +90,36 @@ def _split_catgt_flags(raw: str) -> List[str]:
     return [part for part in re.split(r"\s+", str(raw).strip()) if part]
 
 
+def catgt_input_layout(
+    npx_directory: str | Path,
+    run_name: str,
+    gate_string: str,
+    trigger_string: str,
+    probe_string: str,
+) -> str:
+    """Detect whether a CatGT input uses probe subfolders or a flat gate folder."""
+    gate = str(gate_string).strip()
+    trigger = str(trigger_string).strip().split(",", 1)[0].strip()
+    probe = str(probe_string).strip()
+    if not gate or not trigger or not probe or not run_name:
+        return ""
+    base = Path(npx_directory)
+    gate_dir = base / f"{run_name}_g{gate}"
+    filename = f"{run_name}_g{gate}_t{trigger}.imec{probe}.ap.meta"
+    if (gate_dir / f"{run_name}_g{gate}_imec{probe}" / filename).is_file():
+        return "probe_folders"
+    if (gate_dir / filename).is_file():
+        return "flat"
+    return ""
+
+
+def catgt_command_for_input_layout(command: str, input_layout: str) -> str:
+    """Remove only ``-prb_fld`` when CatGT input files are in a flat gate folder."""
+    if input_layout != "flat":
+        return str(command).strip()
+    return re.sub(r"(?<!\S)-prb_fld(?!\S)", "", str(command)).strip()
+
+
 def _is_catgt_extractor_flag(token: str) -> bool:
     clean = re.sub(r"\[[^\]]*\]$", "", str(token).strip())
     return bool(re.fullmatch(r"-(xd|xid|xa|xia|bf)=(.+)", clean, flags=re.IGNORECASE))

@@ -40,7 +40,7 @@ dependencies = [
     "numba>=0.58.1",
     "upsetplot-bombcell",
     "mtscomp",
-    "cachecache",
+    "cachecache @ https://github.com/m-beau/cachecache/archive/aa96d4916618941868625a63575337f1e67b4635.zip",
 ]
 
 [project.urls]
