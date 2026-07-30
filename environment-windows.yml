@@ -6,16 +6,16 @@
 #
 # Fresh install (Anaconda Prompt):
 #   conda env create -f environment-windows.yml
-#   conda activate neuropygui
+#   conda activate neuropyguin
 #   python main.py
 #
 # Update an existing env:
-#   conda env update -n neuropygui -f environment-windows.yml --prune
-#   conda deactivate && conda activate neuropygui
+#   conda env update -n neuropyguin -f environment-windows.yml --prune
+#   conda deactivate && conda activate neuropyguin
 #
 # After launching, Help > Run Diagnostics re-checks every dependency below and
 # reports anything missing (it runs automatically on the very first launch).
-name: neuropygui
+name: neuropyguin
 variables:
   # Prevent packages installed with `pip --user` (%APPDATA%\Python) from
   # shadowing this environment - a GUI-enabled OpenCV there can hijack Qt's

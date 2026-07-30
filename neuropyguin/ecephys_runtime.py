@@ -64,6 +64,12 @@ def ecephys_subprocess_env() -> Dict[str, str]:
     py_path = env.get("PYTHONPATH", "")
     repo_s = str(_repo_pythonpath_root(repo))
     env["PYTHONPATH"] = f"{repo_s}{os.pathsep}{py_path}" if py_path else repo_s
+    # Ecephys modules run without an interactive display. Kilosort imports
+    # matplotlib and generates diagnostic PNGs; when Qt is installed,
+    # matplotlib otherwise selects QtAgg and connects this child process to the
+    # desktop X11/ICE session. A broken session-manager pipe can then make the
+    # interpreter exit with code 1 after Kilosort has successfully saved every
+    # result. Agg renders the same files without creating a GUI connection.
+    env["MPLBACKEND"] = "Agg"
     return env
-
 

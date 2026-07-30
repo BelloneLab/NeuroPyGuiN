@@ -103,18 +103,17 @@ NeuroPyxels-style figures:
 once:
 
 ```bash
-conda create -p <...>/.conda/envs/npyx_c4 python=3.10 -y
-<npyx_c4>/python -m pip install "npyx[c4]"
-# two post-install pins are required:
-<npyx_c4>/python -m pip install "setuptools<80"     # setuptools 81+ dropped pkg_resources (backpack needs it)
-<npyx_c4>/python -m pip install "scikit-learn<1.6"  # 1.6 removed _safe_tags (imbalanced-learn needs it)
+conda create -n npyx_c4 python=3.10 -y
+conda run -n npyx_c4 python -m pip install "npyx[c4]"
+# Two post-install pins are required:
+conda run -n npyx_c4 python -m pip install "setuptools<80" "scikit-learn<1.6"
 ```
 
 The pretrained ensemble (~2.7 GB) downloads to `~/.npyx_c4_resources` on first use.
 Point the app at a non-default interpreter with the `NPYX_C4_PYTHON` environment
-variable. Never `pip install laplace-torch` into the main app env: it silently
-swaps in a CPU torch and breaks Kilosort's CUDA (restore with
-`pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124`).
+variable. Never `pip install laplace-torch` into the main app env: it can replace
+the CUDA-enabled PyTorch build and break Kilosort. If that happens, rebuilding
+the main environment from the appropriate platform file is the safest repair.
 
 ### 4. Histology: put every channel on the map 🧠
 
@@ -172,29 +171,82 @@ with the original toolchain.
 - **Anatomy, finally easy.** AP_histology and IBL alignment, reimagined as one elegant tab, with the per-channel region map a click away.
 - **Looks good doing it.** Light and dark themes across every view.
 
-## 🚀 Get started in 2 steps
+## 🚀 Installation
 
-One environment file per platform installs the whole app: GUI, Kilosort 4 with a
-CUDA PyTorch, the bundled ecephys pipeline, Bombcell, phy, and the histology
-stack. Pick the file for your OS.
+NeuroPyGuiN has a separate Conda environment file for each supported operating
+system: [`environment-windows.yml`](./environment-windows.yml) and
+[`environment-linux.yml`](./environment-linux.yml). Both install Python 3.10,
+the GUI, Kilosort 4 with CUDA-enabled PyTorch, the scientific stack, phy, and the
+histology dependencies. Use the file that matches the machine on which the app
+will run. Do not use the Windows file from WSL or the Linux file from Windows.
+
+### Windows 10 or 11
+
+Requirements: 64-bit Windows, an NVIDIA GPU with a driver compatible with CUDA
+12.6, and [Miniconda](https://docs.conda.io/projects/miniconda/en/latest/) or
+Anaconda. Open **Anaconda Prompt**, change to the cloned repository, and run:
 
 ```powershell
-# Windows
 conda env create -f environment-windows.yml
-conda activate neuropygui
+conda activate neuropyguin
 python main.py
+```
+
+The Windows environment uses Windows builds of CatGT, TPrime, and C_Waves. Their
+installer may also require the Microsoft Visual C++ Redistributable.
+
+### Linux x86_64
+
+Requirements: 64-bit Linux, an NVIDIA GPU with a driver compatible with CUDA
+12.6, and Miniconda or Anaconda. The PySide6 GUI also needs the following system
+libraries on Ubuntu or Debian:
+
+```bash
+sudo apt update
+sudo apt install libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
+  libxcb-shape0 libxcb-xinerama0 libxkbcommon-x11-0
+```
+
+Then create the Linux environment and launch the app:
+
+```bash
+conda env create -f environment-linux.yml
+conda activate neuropyguin
+python main.py
+```
+
+The Linux environment uses native Linux builds of CatGT, TPrime, and C_Waves.
+WSL is not a tested or supported GUI configuration.
+
+### Update or rebuild the environment
+
+To update an existing installation while removing dependencies that are no
+longer declared, use the matching file for your operating system:
+
+```powershell
+# Windows, in Anaconda Prompt
+conda env update -n neuropyguin -f environment-windows.yml --prune
+conda deactivate
+conda activate neuropyguin
 ```
 
 ```bash
 # Linux
-conda env create -f environment-linux.yml
-conda activate neuropygui
-python main.py
+conda env update -n neuropyguin -f environment-linux.yml --prune
+conda deactivate
+conda activate neuropyguin
 ```
 
-That is it. `ecephys_spike_sorting`, `py_bombcell`, and `npyx` are bundled inside
-the app folder, so there is nothing else to clone. To refresh an existing env,
-swap `create` for `update -n neuropygui` and add `--prune`.
+For a clean rebuild, remove the environment and repeat the appropriate creation
+command above:
+
+```bash
+conda deactivate
+conda env remove -n neuropyguin
+```
+
+`ecephys_spike_sorting`, `py_bombcell`, and `npyx` are bundled in the repository,
+so there is nothing else to clone.
 
 **On the very first launch a self-check runs automatically** and reports anything
 missing: Python packages, the CUDA device, the bundled toolboxes, the Allen
@@ -206,9 +258,11 @@ terminal:
 python -m neuropyguin.doctor      # prints the report, exits non-zero if broken
 ```
 
-> GPU: the environment files install `torch==2.8.0+cu126` from the official
-> PyTorch index (never the CPU-only PyPI wheel) plus CuPy for filtering and
-> whitening. For a different CUDA runtime, change `cu126` in the pip block.
+> **GPU:** Both environment files install `torch==2.8.0+cu126` and
+> `torchvision==0.23.0+cu126` from the official PyTorch index, plus CuPy for
+> filtering and whitening. The NVIDIA driver must support CUDA 12.6. Installing
+> `torch` from plain PyPI afterward may replace this build with a CPU-only or
+> incompatible wheel.
 
 ### Light up the Histology tab
 
@@ -252,10 +306,10 @@ by the app:
 | Kilosort4 | Python package | Python package | [MouseLand/Kilosort](https://github.com/MouseLand/Kilosort) |
 
 All native downloads come from the official [SpikeGLX download
-page](https://billkarsh.github.io/SpikeGLX/). Kilosort4 is installed with
-`python -m pip install "torch==2.5.1" "kilosort>=4.1,<4.2"` using the same
-interpreter that is running NeuroPyGuiN. The PyTorch pin prevents current pip
-releases from silently replacing the project's CUDA 12 runtime with CUDA 13.
+page](https://billkarsh.github.io/SpikeGLX/). Kilosort4 is installed into the
+same Python environment that runs NeuroPyGuiN. The automatic installer uses
+`--no-deps` when Kilosort is reinstalled so it cannot replace the CUDA-enabled
+PyTorch version declared by the platform environment file.
 
 If you built the environment from `environment-windows.yml` or
 `environment-linux.yml`, Kilosort 4 and its CUDA PyTorch are already installed,
