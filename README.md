@@ -264,15 +264,14 @@ so the installer skips that step and only fetches the three native binaries.
 <details>
 <summary>Full dependency list</summary>
 
-Core Python packages live in [`requirements.txt`](./requirements.txt): `PySide6`,
-`pyqtgraph`, `numpy`, `pandas`, `scipy`, `matplotlib`, `tqdm`, `numba`,
-`scikit-learn`, `imbalanced-learn`, `statsmodels`, `networkx`, `psutil`,
-`joblib`, `h5py`, `seaborn`, `cachecache`, `upsetplot`, `pyarrow`, `ipython`,
-`cmcrameri`, `pillow`. Histology extras live in
-[`requirements-histology.txt`](./requirements-histology.txt): `tifffile`,
-`imagecodecs`, `opencv-python-headless`, and (for the channel map + IBL GUI) `ibllib`,
-`iblatlas`, `SimpleITK`. The bundled `environment.yml` targets Python 3.10 and is
-the recommended path for rebuilding or packaging the app.
+The complete dependency lists live in
+[`environment-windows.yml`](./environment-windows.yml) and
+[`environment-linux.yml`](./environment-linux.yml). They include the GUI,
+scientific stack, CUDA packages, Kilosort, curation, post-processing, and
+histology dependencies. PySide6 is installed by conda so its Shiboken runtime
+stays under the same package manager; pip must not be used to replace either
+package. Both environments target Python 3.10 and are the recommended path for
+rebuilding or packaging the app.
 
 </details>
 

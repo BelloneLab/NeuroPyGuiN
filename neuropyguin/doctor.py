@@ -227,7 +227,7 @@ def _check_qt() -> CheckResult:
             f"PySide6 {version} ships Qt 6.10, where pyqtgraph can crash the paint thread. "
             "6.7.x is the tested baseline.",
             RECOMMENDED,
-            fix=f'{sys.executable} -m pip install "PySide6>=6.5,<6.8"',
+            fix=ENV_UPDATE_CMD,
         )
     return CheckResult(
         "pyside6", "Application core", "PySide6 (Qt runtime)", OK,

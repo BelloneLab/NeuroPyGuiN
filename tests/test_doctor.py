@@ -129,7 +129,22 @@ def test_qt_above_the_tested_ceiling_warns(monkeypatch) -> None:
     monkeypatch.setattr(doctor, "_module_version", lambda name: "6.10.0")
     result = doctor._check_qt()
     assert result.status == doctor.WARN
-    assert "PySide6>=6.5,<6.8" in result.fix
+    assert result.fix == doctor.ENV_UPDATE_CMD
+    assert "pip install" not in result.fix
+
+
+@pytest.mark.parametrize("filename", ["environment-linux.yml", "environment-windows.yml"])
+def test_environment_keeps_pyside_and_shiboken_out_of_pip(filename: str) -> None:
+    import yaml
+
+    document = yaml.safe_load((doctor.REPO_ROOT / filename).read_text(encoding="utf-8"))
+    dependencies = document["dependencies"]
+    conda_packages = [item.lower() for item in dependencies if isinstance(item, str)]
+    pip_packages = next(item["pip"] for item in dependencies if isinstance(item, dict) and "pip" in item)
+    pip_names = [str(item).lower() for item in pip_packages]
+
+    assert any(item.startswith("pyside6>=6.5,<6.8") for item in conda_packages)
+    assert not any(item.startswith(("pyside6", "shiboken6")) for item in pip_names)
 
 
 def test_numpy_above_numba_ceiling_warns(monkeypatch) -> None:

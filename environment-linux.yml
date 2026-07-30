@@ -66,6 +66,12 @@ dependencies:
   # ~/.phy/plugins. Missing it makes phy's plugin discovery fail on startup.
   - umap-learn
 
+  # --- GUI runtime ---------------------------------------------------------
+  # Keep PySide6 and its exact-version Shiboken companion under conda ownership.
+  # Installing PySide6 with pip can make pip try to uninstall a conda-provided
+  # shiboken6, which has no pip RECORD file and aborts environment creation.
+  - pyside6>=6.5,<6.8
+
   # --- GPU: CuPy for CatGT-style filtering/whitening ------------------------
   #     (Kilosort itself uses PyTorch, installed in the pip section below.)
   - cupy
@@ -88,10 +94,8 @@ dependencies:
       - kilosort>=4.1,<4.2
 
       # --- GUI -------------------------------------------------------------
-      # Pin below 6.8: pyqtgraph 0.13.x/0.14.x crash (native Qt paint access
-      # violation) on the Qt 6.10 that PySide6 6.10 ships; 6.7.x (Qt 6.7) is the
-      # tested baseline.
-      - PySide6>=6.5,<6.8
+      # PySide6 is deliberately installed by conda above. Do not add PySide6 or
+      # shiboken6 here: pip cannot safely replace their conda-owned files.
       - pyqtgraph>=0.14.0,<0.15
 
       # --- Bundled ecephys_spike_sorting pipeline ---------------------------
