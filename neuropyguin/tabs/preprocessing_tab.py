@@ -19,15 +19,20 @@ import math
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..preprocessing import (
+    OUTPUT_LAYOUT_EXACT,
+    OUTPUT_LAYOUT_MIRROR,
+    OUTPUT_LAYOUT_RUN_FOLDER,
     build_concat_run_name,
     completed_run_target_folders,
     default_concat_run_layout,
     default_kilosort_output_name,
+    default_pipeline_raw_output_layout,
     discover_completed_runs,
     discover_bin_files,
     find_meta_for_bin,
     is_concatenated_run_bin,
     mirrored_concat_base_dir,
+    normalize_output_layout,
     parse_spikeglx_bin_name,
     validate_concat_inputs,
     validate_spikeglx_ap_bin,
@@ -59,6 +64,15 @@ from ..workers import (
     ConcatenationWorker,
     EcephysPipelineConfig,
     EcephysPipelineWorker,
+)
+
+
+# Output-layout choices offered in Settings > Tool and outputs, in display order.
+# The first entry is the historical (and still recommended) mirrored layout.
+OUTPUT_LAYOUT_CHOICES = (
+    ("Mirror rawData hierarchy (<session>/spike_sorting)", OUTPUT_LAYOUT_MIRROR),
+    ("One folder per run (<Output root>/<run name>)", OUTPUT_LAYOUT_RUN_FOLDER),
+    ("Output root itself (no extra folders)", OUTPUT_LAYOUT_EXACT),
 )
 
 
@@ -841,20 +855,32 @@ class PreprocessingTab(QtWidgets.QWidget):
         wrap_catgt_cmd.setLayout(row_catgt_cmd)
 
         self.ed_output = QtWidgets.QLineEdit(str((Path.cwd() / "NeuroPyGuiN_output").resolve()))
-        self.ck_mirror_raw_hierarchy_output = QtWidgets.QCheckBox(
-            "Mirror rawData hierarchy into Output root, under <session>/spike_sorting (always on)"
+
+        # Where a run is written under the Output root. Mirroring stays the default
+        # (it keeps batches organised like rawData), but it is a choice now: users
+        # who just want their results in the folder they picked can say so.
+        self.cb_output_layout = QtWidgets.QComboBox()
+        for label, mode in OUTPUT_LAYOUT_CHOICES:
+            self.cb_output_layout.addItem(label, mode)
+        self.cb_output_layout.setToolTip(
+            "Mirror rawData hierarchy: <Output root>/<project>/<animal>/[<experiment>]/<session>/"
+            "spike_sorting/, matching the raw tree (recommended for batches).\n"
+            "One folder per run: <Output root>/<run name>/.\n"
+            "Output root itself: results are written straight into the folder above, with no "
+            "extra levels. Queue more than one run and they share that folder."
         )
-        # The mirrored layout is the enforced output structure: every run lands at
-        # <Output root>/<project>/<animal>/[<experiment>]/<session>/spike_sorting/,
-        # matching the rawData hierarchy (histology stores under .../histology/
-        # instead). Locked on so CatGT, Kilosort, and the other modules always agree.
-        self.ck_mirror_raw_hierarchy_output.setChecked(True)
-        self.ck_mirror_raw_hierarchy_output.setEnabled(False)
-        self.ck_mirror_raw_hierarchy_output.setToolTip(
-            "Processed outputs always mirror the rawData folder tree under the Output root "
-            "and live in a 'spike_sorting' folder per session (histology uses 'histology'). "
-            "The experiment level is optional and preserved when present."
-        )
+        self.lbl_output_preview = QtWidgets.QLabel()
+        self.lbl_output_preview.setObjectName("SectionHint")
+        self.lbl_output_preview.setWordWrap(True)
+        layout_col = QtWidgets.QVBoxLayout()
+        layout_col.setContentsMargins(0, 0, 0, 0)
+        layout_col.setSpacing(4)
+        layout_col.addWidget(self.cb_output_layout)
+        layout_col.addWidget(self.lbl_output_preview)
+        output_layout_wrap = QtWidgets.QWidget()
+        output_layout_wrap.setLayout(layout_col)
+        self._output_layout_wrap = output_layout_wrap
+
         btn_output = QtWidgets.QPushButton("Browse")
         btn_output.setProperty("role", "ghost")
         out_row = QtWidgets.QHBoxLayout()
@@ -1113,10 +1139,11 @@ class PreprocessingTab(QtWidgets.QWidget):
         paths_grid.addWidget(
             make_field(
                 "Output layout",
-                self.ck_mirror_raw_hierarchy_output,
-                "When enabled, raw SpikeGLX inputs under a .../rawData/.../<session>/<run>/<probe>/ layout are "
-                "written under <Output root>/.../<session>/spike_sorting/. The CatGT run folder then lives inside "
-                "that spike_sorting folder.",
+                self._output_layout_wrap,
+                "Choose where each run is written under the Output root: mirror the rawData tree "
+                "into <session>/spike_sorting (the default), give every run its own folder "
+                "(<Output root>/<run name>), or write straight into the Output root you picked. "
+                "The CatGT run folder and the Kilosort output always live inside that folder.",
             ),
             5,
             0,
@@ -1359,7 +1386,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         btn_ks_tmp.clicked.connect(lambda: self._pick_folder(self.ed_ks_tmp))
         self.btn_install_tools.clicked.connect(self._install_missing_tools)
         self.ed_output.editingFinished.connect(self._persist_settings)
-        self.ck_mirror_raw_hierarchy_output.toggled.connect(lambda _checked: self._persist_settings())
+        self.ed_output.textChanged.connect(lambda _text: self._refresh_output_preview())
+        self.cb_output_layout.currentIndexChanged.connect(self._on_output_layout_changed)
         self.cb_queue_filter.currentIndexChanged.connect(lambda _idx: self._persist_settings())
         self.ed_json.editingFinished.connect(self._persist_settings)
         for checkbox in [
@@ -1409,6 +1437,49 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_adv_ks4.clicked.connect(self._open_ks4_advanced)
         self.btn_save_settings_file.clicked.connect(self.saveSettingsFileRequested.emit)
         self.btn_load_settings_file.clicked.connect(self.loadSettingsFileRequested.emit)
+
+    def output_layout(self) -> str:
+        """Return the selected output layout mode (see ``preprocessing.OUTPUT_LAYOUTS``)."""
+        value = self.cb_output_layout.currentData()
+        return normalize_output_layout(str(value or ""), mirror_raw_hierarchy=True)
+
+    def _set_output_layout(self, mode: str) -> None:
+        index = self.cb_output_layout.findData(normalize_output_layout(mode, mirror_raw_hierarchy=True))
+        self.cb_output_layout.setCurrentIndex(index if index >= 0 else 0)
+
+    def _on_output_layout_changed(self, _index: int) -> None:
+        self._refresh_output_preview()
+        self._persist_settings()
+
+    def _refresh_output_preview(self) -> None:
+        """Show the folder the first queued run would actually be written to."""
+        if not hasattr(self, "lbl_output_preview"):
+            return
+        mode = self.output_layout()
+        root = self.ed_output.text().strip()
+        if not root:
+            self.lbl_output_preview.setText("Set an Output root above.")
+            return
+        job = self.jobs[0] if self.jobs else None
+        ks_tag = f"ks{self.cb_ks_ver.currentText().strip() or '4'}".replace(".", "")
+        if job is not None:
+            extracted_root, ks_folder = default_pipeline_raw_output_layout(
+                str(job.get("bin_file", "")),
+                root,
+                ks_tag,
+                str(job.get("probe_string") or "0"),
+                run_name=str(job.get("name") or "run"),
+                layout=mode,
+            )
+            text = f"{job.get('name', 'run')} -> {ks_folder}"
+        else:
+            extracted_root, _ks = default_pipeline_raw_output_layout(
+                "", root, ks_tag, "0", run_name="<run name>", layout=mode
+            )
+            text = f"Example: {extracted_root}"
+        if mode == OUTPUT_LAYOUT_EXACT and len(self.jobs) > 1:
+            text += f"  -  warning: all {len(self.jobs)} queued runs share this folder."
+        self.lbl_output_preview.setText(text)
 
     def _configured_tool_paths(self) -> Dict[str, str]:
         return {
@@ -1848,6 +1919,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._refresh_queue_summary()
 
     def _refresh_queue_summary(self) -> None:
+        # The output preview names the first queued run, so it follows the queue.
+        self._refresh_output_preview()
         if not hasattr(self, "lbl_queue_summary"):
             return
         n_jobs = len(self.jobs)
@@ -1969,21 +2042,26 @@ class PreprocessingTab(QtWidgets.QWidget):
         combined_default = build_concat_run_name(run_names)
         first = Path(bin_files[0])
 
-        # The fused run always lands under the Output root from settings, mirrored
-        # into a new session folder named after the combined run, inside a
-        # 'spike_sorting' subfolder so it matches the layout of every other run
-        # (.../<session>/spike_sorting/). There is no manual output folder: this
-        # resolver maps a combined run name to its destination, and the dialog
+        # The fused run lands under the Output root, following the same Output layout
+        # choice as every other run: mirrored into a new session folder plus a
+        # 'spike_sorting' level, one folder per run, or straight into the Output root.
+        # This resolver maps a combined run name to its destination, and the dialog
         # shows it read-only and live as the run name is edited.
+        layout_mode = self.output_layout()
+
         def resolve_dest(run_name: str) -> str:
             name = str(run_name).strip() or combined_default
             base = mirrored_concat_base_dir(
                 first,
                 self.ed_output.text().strip(),
                 name,
-                mirror_raw_hierarchy=self.ck_mirror_raw_hierarchy_output.isChecked(),
+                layout=layout_mode,
             )
-            return str(base / "spike_sorting")
+            # Only the mirrored layout adds the per-session 'spike_sorting' level; the
+            # other layouts write where the user asked, with no extra nesting.
+            if layout_mode == OUTPUT_LAYOUT_MIRROR:
+                return str(base / "spike_sorting")
+            return str(base)
 
         defaults = {
             "svd_clean": self.settings.value("preproc/concat_svd_clean", True, type=bool),
@@ -2161,7 +2239,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         return EcephysPipelineConfig(
             output_root=self.ed_output.text().strip(),
             json_root=self.ed_json.text().strip(),
-            mirror_raw_hierarchy_output=self.ck_mirror_raw_hierarchy_output.isChecked(),
+            mirror_raw_hierarchy_output=self.output_layout() == OUTPUT_LAYOUT_MIRROR,
+            output_layout=self.output_layout(),
             save_catgt_ap_bin=self.ck_save_catgt_ap_bin.isChecked(),
             run_catgt=self.ck_catgt.isChecked(),
             run_catgt_extract_only=self.ck_catgt_extract_only.isChecked(),
@@ -2724,6 +2803,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         if not self.jobs:
             self._append_log("No jobs in queue.")
             return
+        if not self._confirm_shared_output_folder():
+            return
         self._persist_settings()
         self.settings.sync()
 
@@ -2734,6 +2815,25 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._update_concat_button_state()
         self._refresh_queue_summary()
         self._run_next()
+
+    def _confirm_shared_output_folder(self) -> bool:
+        """Warn before several runs are written into one folder, and overwrite each other.
+
+        Only the "Output root itself" layout can do this: the other layouts give every
+        run its own destination. Returns False when the user cancels.
+        """
+        if self.output_layout() != OUTPUT_LAYOUT_EXACT or len(self.jobs) < 2:
+            return True
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Runs share one output folder",
+            f"The output layout is set to the Output root itself, so all {len(self.jobs)} queued "
+            f"runs write into:\n\n{self.ed_output.text().strip()}\n\n"
+            "Runs on the same probe will overwrite each other's Kilosort results. Continue?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        return answer == QtWidgets.QMessageBox.Yes
 
     def _run_next(self) -> None:
         if not self._queue:
@@ -2836,8 +2936,17 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self.ed_output.setText(str(output_root))
             if json_root:
                 self.ed_json.setText(str(json_root))
-            # Mirrored layout is enforced; never restore it to off from a stale setting.
-            self.ck_mirror_raw_hierarchy_output.setChecked(True)
+            # Output layout: prefer the explicit setting, and fall back to the older
+            # boolean key so an existing install keeps the layout it has been using.
+            legacy_mirror = bool(
+                self.settings.value("preproc/mirror_raw_hierarchy_output", True, type=bool)
+            )
+            self._set_output_layout(
+                normalize_output_layout(
+                    str(self.settings.value("preproc/output_layout", "")),
+                    mirror_raw_hierarchy=legacy_mirror,
+                )
+            )
             queue_filter = str(self.settings.value("preproc/raw_run_filter", "non_processed"))
             queue_filter_index = max(0, self.cb_queue_filter.findData(queue_filter))
             self.cb_queue_filter.setCurrentIndex(queue_filter_index)
@@ -2889,15 +2998,18 @@ class PreprocessingTab(QtWidgets.QWidget):
             self._restore_completed_history()
         finally:
             self._restoring_settings = False
+        self._refresh_output_preview()
 
     def _persist_settings(self) -> None:
         if self._restoring_settings:
             return
         self.settings.setValue("preproc/output_root", self.ed_output.text().strip())
         self.settings.setValue("preproc/json_root", self.ed_json.text().strip())
+        self.settings.setValue("preproc/output_layout", self.output_layout())
+        # Kept in sync for anything still reading the older boolean key.
         self.settings.setValue(
             "preproc/mirror_raw_hierarchy_output",
-            self.ck_mirror_raw_hierarchy_output.isChecked(),
+            self.output_layout() == OUTPUT_LAYOUT_MIRROR,
         )
         self.settings.setValue("preproc/raw_run_filter", self._queue_filter_mode())
         self.settings.setValue("preproc/save_catgt_ap_bin", self.ck_save_catgt_ap_bin.isChecked())

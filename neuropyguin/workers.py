@@ -252,6 +252,10 @@ class EcephysPipelineConfig:
     cwaves_path: str
     ks4_repo_path: str
     kilosort_output_tmp: str
+    # Where processed runs land under output_root: "mirror" (rawData tree),
+    # "run_folder" (<output_root>/<run name>) or "exact" (output_root itself).
+    # Defaulted so older callers that only set mirror_raw_hierarchy_output still work.
+    output_layout: str = "mirror"
 
 
 class EcephysPipelineWorker(QtCore.QRunnable):
@@ -1054,6 +1058,8 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 is_concatenated_run_bin,
                 has_ni_catgt_extractors,
                 merge_extractors_into_catgt_command,
+                normalize_output_layout,
+                OUTPUT_LAYOUT_MIRROR,
                 parse_catgt_processed_bin_context,
                 resolve_labelled_output_context,
                 parse_spikeglx_bin_name,
@@ -1202,6 +1208,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     output_root=output_root,
                     run_name=run_name,
                     mirror_raw_hierarchy=self.cfg.mirror_raw_hierarchy_output,
+                    layout=self.cfg.output_layout,
                 )
                 if not self.cfg.run_kilosort:
                     resolved_local_ks = self._resolve_existing_ks_folder(
@@ -1226,13 +1233,15 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     probe_string,
                     run_name=run_name,
                     mirror_raw_hierarchy=self.cfg.mirror_raw_hierarchy_output,
+                    layout=self.cfg.output_layout,
                 )
                 extracted_data_root.mkdir(parents=True, exist_ok=True)
-                if self.cfg.mirror_raw_hierarchy_output:
-                    _safe_emit(
-                        self.signals.log,
-                        f"[{self.job['name']}] Mirrored raw hierarchy output root: {extracted_data_root}",
-                    )
+                _safe_emit(
+                    self.signals.log,
+                    f"[{self.job['name']}] Output layout "
+                    f"({normalize_output_layout(self.cfg.output_layout, self.cfg.mirror_raw_hierarchy_output)}): "
+                    f"{extracted_data_root}",
+                )
 
             # Co-locate every per-run pipeline JSON inside the run's processed folder
             # instead of dumping them flat in the output/JSON root.
@@ -1488,9 +1497,15 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 # (output_root/run_name/ks_tag) is far from the real location
                 # inside extracted_data_root.  Use the mirrored root as the
                 # resolver hint so parent-walking starts in the right area.
+                mirrored_layout = (
+                    normalize_output_layout(
+                        self.cfg.output_layout, self.cfg.mirror_raw_hierarchy_output
+                    )
+                    == OUTPUT_LAYOUT_MIRROR
+                )
                 resolver_hint = (
                     extracted_data_root / default_kilosort_output_name(ks_tag, probe_string)
-                    if self.cfg.mirror_raw_hierarchy_output
+                    if mirrored_layout
                     else ks_folder
                 )
                 resolved_ks = self._resolve_existing_ks_folder(

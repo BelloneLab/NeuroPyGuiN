@@ -538,21 +538,60 @@ def _relative_session_parts_from_raw_hierarchy(
     return ()
 
 
+#: Mirror the rawData session tree under the output root, ending in ``spike_sorting``.
+OUTPUT_LAYOUT_MIRROR = "mirror"
+#: One folder per run directly under the output root: ``<output_root>/<run_name>``.
+OUTPUT_LAYOUT_RUN_FOLDER = "run_folder"
+#: The output root itself, exactly as the user typed it. Runs share the folder.
+OUTPUT_LAYOUT_EXACT = "exact"
+
+OUTPUT_LAYOUTS = (OUTPUT_LAYOUT_MIRROR, OUTPUT_LAYOUT_RUN_FOLDER, OUTPUT_LAYOUT_EXACT)
+
+
+def normalize_output_layout(layout: str | None, mirror_raw_hierarchy: bool = False) -> str:
+    """Return a known layout name.
+
+    An unrecognized (or missing) ``layout`` falls back to the legacy boolean flag,
+    so callers that still pass only ``mirror_raw_hierarchy`` keep their behaviour.
+    """
+    value = str(layout or "").strip().lower()
+    if value in OUTPUT_LAYOUTS:
+        return value
+    return OUTPUT_LAYOUT_MIRROR if mirror_raw_hierarchy else OUTPUT_LAYOUT_RUN_FOLDER
+
+
+def describe_output_layout(layout: str | None, mirror_raw_hierarchy: bool = False) -> str:
+    """Return a short human-readable description of where a run will be written."""
+    mode = normalize_output_layout(layout, mirror_raw_hierarchy)
+    if mode == OUTPUT_LAYOUT_EXACT:
+        return "<Output root>"
+    if mode == OUTPUT_LAYOUT_RUN_FOLDER:
+        return "<Output root>/<run name>"
+    return "<Output root>/<mirrored rawData session>/spike_sorting"
+
+
 def default_pipeline_output_dir(
     bin_file: str,
     output_root: str | Path,
     *,
     run_name: str,
     mirror_raw_hierarchy: bool = False,
+    layout: str | None = None,
 ) -> Path:
     """Choose the extracted-data folder for a run under the output root.
 
-    Defaults to ``<output_root>/<run_name>``; when ``mirror_raw_hierarchy`` is
-    set and the raw layout can be resolved, mirrors the rawData session tree and
-    appends a ``spike_sorting`` level instead.
+    ``layout`` selects the destination shape (see :data:`OUTPUT_LAYOUTS`):
+    :data:`OUTPUT_LAYOUT_MIRROR` mirrors the rawData session tree and appends a
+    ``spike_sorting`` level, :data:`OUTPUT_LAYOUT_RUN_FOLDER` uses
+    ``<output_root>/<run_name>``, and :data:`OUTPUT_LAYOUT_EXACT` writes straight
+    into ``output_root``. Mirroring falls back to the run folder when the raw
+    hierarchy cannot be resolved.
     """
     root = Path(output_root).expanduser()
-    if not mirror_raw_hierarchy:
+    mode = normalize_output_layout(layout, mirror_raw_hierarchy)
+    if mode == OUTPUT_LAYOUT_EXACT:
+        return root
+    if mode == OUTPUT_LAYOUT_RUN_FOLDER:
         return root / str(run_name).strip()
     relative_session = _relative_session_parts_from_raw_hierarchy(bin_file, output_root)
     if not relative_session:
@@ -568,6 +607,7 @@ def default_pipeline_raw_output_layout(
     *,
     run_name: str,
     mirror_raw_hierarchy: bool = False,
+    layout: str | None = None,
 ) -> Tuple[Path, Path]:
     """Return the ``(extracted_data_root, ks_folder)`` pair for a pipeline run."""
     extracted_data_root = default_pipeline_output_dir(
@@ -575,6 +615,7 @@ def default_pipeline_raw_output_layout(
         output_root,
         run_name=run_name,
         mirror_raw_hierarchy=mirror_raw_hierarchy,
+        layout=layout,
     )
     ks_folder = extracted_data_root / default_kilosort_output_name(ks_tag, probe_string)
     return extracted_data_root, ks_folder
@@ -629,6 +670,7 @@ def default_pipeline_ks_output_dir(
     run_name: str,
     store_next_to_bin: bool = False,
     mirror_raw_hierarchy: bool = False,
+    layout: str | None = None,
 ) -> Path:
     """Resolve the KS output folder for a pipeline run.
 
@@ -645,6 +687,7 @@ def default_pipeline_ks_output_dir(
         probe_string,
         run_name=run_name,
         mirror_raw_hierarchy=mirror_raw_hierarchy,
+        layout=layout,
     )
     return ks_folder
 
@@ -845,6 +888,7 @@ def mirrored_concat_base_dir(
     combined_run_name: str,
     *,
     mirror_raw_hierarchy: bool = True,
+    layout: str | None = None,
 ) -> Path:
     """Base directory for a concatenated run, mirrored under the output root.
 
@@ -864,7 +908,19 @@ def mirrored_concat_base_dir(
     """
     first = Path(first_source_bin)
     legacy = first.parents[2] if len(first.parents) >= 3 else first.parent
-    if not mirror_raw_hierarchy or not str(output_root).strip():
+    root = str(output_root).strip()
+    # An explicit non-mirror layout sends the fused run to the chosen output root
+    # instead of back next to the sources. A caller that passes no layout at all
+    # keeps the historical behaviour: mirror, or fall back to the source session.
+    explicit = str(layout or "").strip().lower()
+    if explicit in (OUTPUT_LAYOUT_RUN_FOLDER, OUTPUT_LAYOUT_EXACT) and root:
+        base = Path(output_root).expanduser()
+        if explicit == OUTPUT_LAYOUT_EXACT:
+            return base
+        return base / str(combined_run_name).strip()
+    if explicit == OUTPUT_LAYOUT_MIRROR:
+        mirror_raw_hierarchy = True
+    if not mirror_raw_hierarchy or not root:
         return legacy
     # output_root is intentionally NOT passed here: concat SOURCE bins are raw
     # (under rawData), so the rawData-token branch resolves them. The output_root

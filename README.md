@@ -332,6 +332,11 @@ rebuilding or packaging the app.
 ## Good to know
 
 - Preprocessing expects SpikeGLX-style AP files (`*.imecX.ap.bin`).
+- **Output layout is your choice** (Preprocessing > Settings > Tool and outputs). Mirroring the
+  rawData tree is still the default and stays the best option for batches, but you can also send
+  every run to its own folder under the Output root, or write straight into the Output root you
+  picked, with no extra levels. The panel previews the exact folder the first queued run will use,
+  and concatenated runs follow the same choice.
 - Quality labels are read from `bombcell_labels.csv` first, then `cluster_group.tsv`.
 - The Histology tab works without the IBL stack (AP_histology path is self-sufficient); the IBL GUI is optional refinement.
 - `probe_ccf.mat` is read by the IBL prep scripts, and the generated `channel_locations_all_shanks.json` reproduces the IBL GUI output exactly.
