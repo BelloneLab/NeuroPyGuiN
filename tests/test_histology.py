@@ -101,6 +101,44 @@ def test_load_image_reports_missing_imagecodecs(monkeypatch, tmp_path):
     assert "python -m pip install imagecodecs" in msg
 
 
+def test_png_raw_images_are_discovered_and_loaded(tmp_path):
+    from PIL import Image
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    png = raw / "slide_2.png"
+    tif = raw / "slide_10.tif"
+    Image.fromarray(np.full((4, 5, 3), 7, dtype=np.uint8)).save(png)
+    Image.fromarray(np.full((4, 5, 3), 11, dtype=np.uint8)).save(tif)
+
+    paths = slice_prep.list_raw_images(raw)
+
+    assert [p.name for p in paths] == ["slide_2.png", "slide_10.tif"]
+    loaded = slice_prep.load_image(png)
+    assert loaded.shape == (4, 5, 3)
+    assert loaded.dtype == np.uint8
+    assert int(loaded[0, 0, 0]) == 7
+
+
+def test_saved_slice_discovery_accepts_png_but_ignores_other_assets(tmp_path):
+    from PIL import Image
+
+    Image.fromarray(np.zeros((3, 3), dtype=np.uint8)).save(tmp_path / "slice_1.png")
+    Image.fromarray(np.zeros((3, 3), dtype=np.uint8)).save(tmp_path / "overview.png")
+    Image.fromarray(np.zeros((3, 3), dtype=np.uint8)).save(tmp_path / "slice_2.tif")
+
+    assert [p.name for p in slice_prep.list_saved_slices(tmp_path)] == ["slice_1.png", "slice_2.tif"]
+
+
+def test_png_alpha_channel_is_converted_to_rgb(tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "rgba.png"
+    Image.fromarray(np.zeros((3, 4, 4), dtype=np.uint8), mode="RGBA").save(path)
+
+    assert slice_prep.load_image(path).shape == (3, 4, 3)
+
+
 def test_probe_ccf_csv_schema(tmp_path):
     ta = pd.DataFrame({"acronym": ["VTA"], "name": ["v"], "id": [1],
                        "color_hex_triplet": ["ff0000"],

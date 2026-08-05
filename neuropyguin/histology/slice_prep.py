@@ -3,7 +3,7 @@
 Native port of ``create_slice_images.m`` plus the small reorientation helpers
 (``rotate_center_slices.m``, ``flip_slices.m``, ``reorder_slices.m``):
 
-* load multi-page / RGB TIFFs and downsample
+* load multi-page / RGB TIFFs or single-image PNGs and downsample
 * per-channel white balance and colourisation -> RGB
 * segment individual slices on a slide and crop them
 * rotate / centre / flip / reorder slices
@@ -35,11 +35,31 @@ from PIL import Image
 # Loading / saving
 # ---------------------------------------------------------------------------
 
+_TIFF_SUFFIXES = {".tif", ".tiff"}
+_RAW_IMAGE_SUFFIXES = _TIFF_SUFFIXES | {".png"}
+
+
+def _files_with_suffixes(folder: str | Path, suffixes: set[str]) -> List[Path]:
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in suffixes]
+    return _natsort(files)
+
+
 def list_tiffs(folder: str | Path) -> List[Path]:
     """Natural-sorted list of TIFFs in a folder."""
-    folder = Path(folder)
-    files = list(folder.glob("*.tif")) + list(folder.glob("*.tiff"))
-    return _natsort(files)
+    return _files_with_suffixes(folder, _TIFF_SUFFIXES)
+
+
+def list_raw_images(folder: str | Path) -> List[Path]:
+    """Natural-sorted TIFF/PNG raw histology images in a folder."""
+    return _files_with_suffixes(folder, _RAW_IMAGE_SUFFIXES)
+
+
+def list_saved_slices(folder: str | Path) -> List[Path]:
+    """Natural-sorted saved slice images produced or accepted by the app."""
+    return [p for p in list_raw_images(folder) if p.stem.lower().startswith("slice_")]
 
 
 def _natsort(paths: Sequence[Path]) -> List[Path]:
@@ -73,9 +93,14 @@ def _missing_imagecodecs_error(exc: Exception) -> bool:
 
 
 def load_image(path: str | Path) -> np.ndarray:
-    """Load a TIFF as an array. RGB -> (H, W, 3); multi-channel -> (H, W, C)."""
+    """Load a TIFF or PNG. RGB -> (H, W, 3); multi-channel -> (H, W, C)."""
     path = Path(path)
-    if _HAS_TIFFFILE:
+    if path.suffix.lower() == ".png":
+        image = Image.open(str(path))
+        if image.mode in {"RGBA", "LA", "P"}:
+            image = image.convert("RGB")
+        arr = np.asarray(image)
+    elif _HAS_TIFFFILE:
         try:
             arr = tifffile.imread(str(path))
         except ValueError as exc:
@@ -91,7 +116,7 @@ def load_image(path: str | Path) -> np.ndarray:
                     "'conda install -c conda-forge imagecodecs'. "
                     f"Pillow fallback also failed: {pil_exc}"
                 ) from exc
-    else:  # PIL fallback (handles RGB and multi-frame)
+    else:  # PIL fallback (handles RGB and multi-frame TIFFs)
         arr = _read_tiff_with_pillow(path)
     arr = np.asarray(arr)
     # Normalise channel axis to last for multi-channel stacks like (C, H, W).

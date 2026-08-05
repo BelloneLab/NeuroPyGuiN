@@ -87,6 +87,10 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         self.view.autoRange()
         _crumb("ImageCanvas.set_image done")
 
+    def image_item(self) -> pg.ImageItem:
+        """Return the underlying image item for linked controls such as histograms."""
+        return self.img
+
     def _on_click(self, ev) -> None:
         if ev.button() != QtCore.Qt.LeftButton:
             return
@@ -108,6 +112,19 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         ln = pg.PlotDataItem(x=list(xs), y=list(ys), pen=pg.mkPen(color, width=width))
         self.view.addItem(ln)
         self._overlays.append(ln)
+
+    def add_text(self, text: str, x: float, y: float, color="w") -> None:
+        item = pg.TextItem(
+            text=text,
+            color=color,
+            anchor=(0, 0),
+            fill=pg.mkBrush(21, 128, 61, 210),
+            border=pg.mkPen(255, 255, 255, 180),
+        )
+        item.setPos(float(x), float(y))
+        item.setZValue(30)
+        self.view.addItem(item)
+        self._overlays.append(item)
 
     def add_line_roi(self, pts: np.ndarray, color, width: int = 3) -> pg.LineSegmentROI:
         pen = pg.mkPen(color, width=width)
@@ -710,6 +727,8 @@ class HistologyTab(QtWidgets.QWidget):
         self.slice_specs: List[Optional[Dict[str, np.ndarray]]] = []
         self.probe_points: Dict[Tuple[int, int], np.ndarray] = {}
         self._cur_match_slice = 0
+        self._match_hist_levels_by_slice: Dict[int, Tuple[float, float]] = {}
+        self._updating_match_histogram = False
         self._cur_align_slice = 0
         self._cur_trace_slice = 0
         self._align_hist_pts: Dict[int, List[Tuple[float, float]]] = {}
@@ -739,13 +758,14 @@ class HistologyTab(QtWidgets.QWidget):
         )
         main.addWidget(self.nav, 1)
 
-        self.nav.add_page("Setup", self._build_setup_page())
-        self.nav.add_page("Preprocess", self._build_preprocess_page())
-        self.nav.add_page("Match atlas", self._build_match_page())
-        self.nav.add_page("Align", self._build_align_page())
-        self.nav.add_page("Trace probes", self._build_trace_page())
-        self.nav.add_page("Channel map", self._build_channels_page())
-        self.nav.add_page("IBL refine", self._build_ibl_page())
+        self._page_setup = self.nav.add_page("Setup", self._build_setup_page())
+        self._page_preprocess = self.nav.add_page("Preprocess", self._build_preprocess_page())
+        self._page_match = self.nav.add_page("Match atlas", self._build_match_page())
+        self._page_align = self.nav.add_page("Align", self._build_align_page())
+        self._page_trace = self.nav.add_page("Trace probes", self._build_trace_page())
+        self._page_channels = self.nav.add_page("Channel map", self._build_channels_page())
+        self._page_ibl = self.nav.add_page("IBL refine", self._build_ibl_page())
+        self.nav.currentChanged.connect(self._on_page_changed)
         self.nav.setCurrentIndex(0)
 
         # Shared log dock at the bottom.
@@ -755,6 +775,17 @@ class HistologyTab(QtWidgets.QWidget):
         self.log.setFixedHeight(120)
         self.log.setObjectName("HistologyLog")
         main.addWidget(self.log, 0)
+
+    def _on_page_changed(self, index: int) -> None:
+        """Refresh lazily-rendered pages whenever the user navigates to them."""
+        if index == getattr(self, "_page_preprocess", -1):
+            self._preproc_show()
+        elif index == getattr(self, "_page_match", -1):
+            self._match_show()
+        elif index == getattr(self, "_page_align", -1):
+            self._align_show()
+        elif index == getattr(self, "_page_trace", -1):
+            self._trace_show()
 
     def _section(self, title: str, hint: str = "") -> Tuple[QtWidgets.QWidget, QtWidgets.QVBoxLayout]:
         page = QtWidgets.QWidget()
@@ -836,7 +867,7 @@ class HistologyTab(QtWidgets.QWidget):
     def _build_preprocess_page(self) -> QtWidgets.QWidget:
         page, v = self._section(
             "Slice preprocessing",
-            "Load raw images, optionally downsample, then save individual slice "
+            "Load raw TIFF/PNG images, optionally downsample, then save individual slice "
             "images. Use the reorient buttons to fix rotation/flip/order.",
         )
         ctl = QtWidgets.QHBoxLayout()
@@ -889,7 +920,28 @@ class HistologyTab(QtWidgets.QWidget):
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.canvas_match_hist = ImageCanvas()
         self.canvas_match_atlas = ImageCanvas()
-        split.addWidget(self._titled("Histology", self.canvas_match_hist))
+        self.hist_match_histogram = pg.HistogramLUTWidget()
+        self.hist_match_histogram.setMinimumWidth(96)
+        self.hist_match_histogram.setMaximumWidth(150)
+        self.hist_match_histogram.item.gradient.hide()
+        self.hist_match_histogram.setImageItem(self.canvas_match_hist.image_item())
+        self.hist_match_histogram.item.sigLevelsChanged.connect(self._match_histogram_levels_changed)
+        b_reset_hist = QtWidgets.QPushButton("Auto")
+        b_reset_hist.setProperty("role", "secondary")
+        b_reset_hist.setToolTip("Reset histology image contrast to automatic levels.")
+        b_reset_hist.clicked.connect(self._match_reset_histogram)
+        hist_pane = QtWidgets.QWidget()
+        hist_layout = QtWidgets.QHBoxLayout(hist_pane)
+        hist_layout.setContentsMargins(0, 0, 0, 0)
+        hist_layout.setSpacing(8)
+        hist_layout.addWidget(self.canvas_match_hist, 1)
+        hist_ctl = QtWidgets.QVBoxLayout()
+        hist_ctl.setContentsMargins(0, 0, 0, 0)
+        hist_ctl.setSpacing(6)
+        hist_ctl.addWidget(self.hist_match_histogram, 1)
+        hist_ctl.addWidget(b_reset_hist, 0)
+        hist_layout.addLayout(hist_ctl, 0)
+        split.addWidget(self._titled("Histology", hist_pane))
         split.addWidget(self._titled("Atlas plane", self.canvas_match_atlas))
         v.addWidget(split, 1)
 
@@ -905,17 +957,34 @@ class HistologyTab(QtWidgets.QWidget):
         self.sl_ap.setRange(1, 1320)
         self.sl_ap.setValue(540)
         self.sl_ap.valueChanged.connect(self._match_update_atlas)
+        self.lbl_ap_value = QtWidgets.QLabel("")
+        self.lbl_ap_value.setMinimumWidth(58)
+        self.lbl_ap_value.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         ctl.addWidget(self.sl_ap, 2)
+        ctl.addWidget(self.lbl_ap_value)
         ctl.addWidget(QtWidgets.QLabel("LR tilt"))
         self.sl_lr = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sl_lr.setRange(-15, 15)
         self.sl_lr.valueChanged.connect(self._match_update_atlas)
+        self.lbl_lr_value = QtWidgets.QLabel("")
+        self.lbl_lr_value.setMinimumWidth(38)
+        self.lbl_lr_value.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         ctl.addWidget(self.sl_lr, 1)
+        ctl.addWidget(self.lbl_lr_value)
         ctl.addWidget(QtWidgets.QLabel("SI tilt"))
         self.sl_si = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sl_si.setRange(-15, 15)
         self.sl_si.valueChanged.connect(self._match_update_atlas)
+        self.lbl_si_value = QtWidgets.QLabel("")
+        self.lbl_si_value.setMinimumWidth(38)
+        self.lbl_si_value.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         ctl.addWidget(self.sl_si, 1)
+        ctl.addWidget(self.lbl_si_value)
+        b_reset_tilt = QtWidgets.QPushButton("Reset tilt")
+        b_reset_tilt.setProperty("role", "secondary")
+        b_reset_tilt.setToolTip("Set LR and SI tilt back to 0 degrees.")
+        b_reset_tilt.clicked.connect(self._match_reset_tilt)
+        ctl.addWidget(b_reset_tilt)
         self.cb_mode = QtWidgets.QComboBox()
         self.cb_mode.addItems(["TV", "AV", "TV-AV"])
         self.cb_mode.currentTextChanged.connect(self._match_update_atlas)
@@ -925,6 +994,12 @@ class HistologyTab(QtWidgets.QWidget):
         row = QtWidgets.QHBoxLayout()
         self.lbl_match = QtWidgets.QLabel("slice 0 / 0")
         row.addWidget(self.lbl_match)
+        self.lbl_match_assigned = QtWidgets.QLabel("Unassigned")
+        self.lbl_match_assigned.setObjectName("SectionHint")
+        row.addWidget(self.lbl_match_assigned)
+        self.lbl_match_autosave = QtWidgets.QLabel("Progress autosaves on Assign")
+        self.lbl_match_autosave.setObjectName("SectionHint")
+        row.addWidget(self.lbl_match_autosave)
         row.addStretch(1)
         b_assign = QtWidgets.QPushButton("Assign plane to slice")
         b_assign.clicked.connect(self._match_assign)
@@ -1281,7 +1356,7 @@ class HistologyTab(QtWidgets.QWidget):
         self.histology_ccf = []
         self.tforms = []
         # Load any slice images already saved.
-        for p in slice_prep.list_tiffs(self.folder):
+        for p in slice_prep.list_saved_slices(self.folder):
             try:
                 self.slice_images.append(slice_prep.load_image(p))
             except Exception as exc:
@@ -1339,9 +1414,9 @@ class HistologyTab(QtWidgets.QWidget):
             self._log("Set a raw image folder first.")
             return
         factor = float(self.sp_downsample.value())
-        paths = slice_prep.list_tiffs(raw)
+        paths = slice_prep.list_raw_images(raw)
         if not paths:
-            self._log(f"No TIFFs found in {raw}.")
+            self._log(f"No TIFF/PNG images found in {raw}.")
             return
 
         def job():
@@ -1356,6 +1431,7 @@ class HistologyTab(QtWidgets.QWidget):
         def done(result):
             self.slice_images = result
             self._cur_preproc = 0
+            self._sync_slice_state_after_preprocess()
             self._log(f"Loaded {len(result)} raw image(s).")
             self._preproc_show()
 
@@ -1366,8 +1442,33 @@ class HistologyTab(QtWidgets.QWidget):
             self._log("Nothing to save (load images and set a folder).")
             return
         out = slice_prep.save_slices(self.slice_images, self.folder)
+        self._sync_slice_state_after_preprocess()
         self._log(f"Saved {len(out)} slice image(s) to {self.folder}.")
         self._refresh_status()
+
+    def _sync_slice_state_after_preprocess(self) -> None:
+        """Keep match/align/trace state valid after slice images are loaded or replaced."""
+        n = len(self.slice_images)
+        if n <= 0:
+            self._cur_match_slice = 0
+            self._cur_align_slice = 0
+            self._cur_trace_slice = 0
+            self.slice_specs = []
+        else:
+            self._cur_match_slice = int(np.clip(self._cur_match_slice, 0, n - 1))
+            self._cur_align_slice = int(np.clip(self._cur_align_slice, 0, n - 1))
+            self._cur_trace_slice = int(np.clip(self._cur_trace_slice, 0, n - 1))
+            if len(self.slice_specs) < n:
+                self.slice_specs.extend([None] * (n - len(self.slice_specs)))
+            elif len(self.slice_specs) > n:
+                self.slice_specs = self.slice_specs[:n]
+        current = self.nav.currentIndex() if hasattr(self, "nav") else -1
+        if current == getattr(self, "_page_match", -1):
+            self._match_show()
+        elif current == getattr(self, "_page_align", -1):
+            self._align_show()
+        elif current == getattr(self, "_page_trace", -1):
+            self._trace_show()
 
     def _preproc_step(self, d: int) -> None:
         if not self.slice_images:
@@ -1409,13 +1510,93 @@ class HistologyTab(QtWidgets.QWidget):
     def _match_show(self) -> None:
         if not self.slice_images:
             self.canvas_match_hist.set_image(None)
+            self.canvas_match_hist.clear_overlays()
             self.lbl_match.setText("slice 0 / 0")
+            self.lbl_match_assigned.setText("Unassigned")
+            self.lbl_match_assigned.setStyleSheet("")
             return
         idx = min(self._cur_match_slice, len(self.slice_images) - 1)
         self.canvas_match_hist.set_image(self.slice_images[idx])
+        self.canvas_match_hist.clear_overlays()
+        if idx in self._match_hist_levels_by_slice:
+            lo, hi = self._match_hist_levels_by_slice[idx]
+            self._match_apply_histogram_levels(lo, hi)
+        else:
+            self._match_reset_histogram()
         self.lbl_match.setText(f"slice {idx + 1} / {len(self.slice_images)}")
+        self._match_update_assignment_status(idx)
         self._restore_match_sliders(idx)
         self._match_update_atlas()
+
+    def _match_is_assigned(self, idx: int) -> bool:
+        return idx < len(self.slice_specs) and self.slice_specs[idx] is not None
+
+    def _match_update_assignment_status(self, idx: int) -> None:
+        assigned = self._match_is_assigned(idx)
+        total = len(self.slice_images)
+        n_assigned = sum(s is not None for s in self.slice_specs[:total])
+        if assigned:
+            self.lbl_match_assigned.setText(f"Assigned ({n_assigned}/{total})")
+            self.lbl_match_assigned.setStyleSheet("color: #15803d; font-weight: 700;")
+            self._match_draw_assigned_badge(idx)
+        else:
+            self.lbl_match_assigned.setText(f"Unassigned ({n_assigned}/{total})")
+            self.lbl_match_assigned.setStyleSheet("color: #b45309; font-weight: 700;")
+
+    def _match_draw_assigned_badge(self, idx: int) -> None:
+        if idx >= len(self.slice_images):
+            return
+        arr = np.asarray(self.slice_images[idx])
+        if arr.ndim < 2:
+            return
+        pad = max(4.0, min(float(arr.shape[0]), float(arr.shape[1])) * 0.025)
+        self.canvas_match_hist.add_text("ASSIGNED", pad, pad, color="w")
+
+    def _match_histogram_levels_changed(self) -> None:
+        """Remember manually-adjusted histology contrast levels per slice."""
+        if self._updating_match_histogram or not self.slice_images:
+            return
+        idx = min(self._cur_match_slice, len(self.slice_images) - 1)
+        try:
+            lo, hi = self.hist_match_histogram.item.getLevels()
+        except Exception:
+            return
+        self._match_hist_levels_by_slice[idx] = (float(lo), float(hi))
+
+    def _match_apply_histogram_levels(self, lo: float, hi: float) -> None:
+        """Apply contrast levels to both the image and linked histogram widget."""
+        self._updating_match_histogram = True
+        try:
+            self.canvas_match_hist.image_item().setLevels((float(lo), float(hi)))
+            self.hist_match_histogram.setLevels(float(lo), float(hi))
+        finally:
+            self._updating_match_histogram = False
+
+    def _match_reset_histogram(self) -> None:
+        """Reset the histology image contrast control to the current slice range."""
+        if not self.slice_images:
+            return
+        idx = min(self._cur_match_slice, len(self.slice_images) - 1)
+        arr = np.asarray(self.slice_images[idx])
+        if arr.size == 0:
+            return
+        if arr.ndim == 3:
+            values = arr[..., :3].astype(float).mean(axis=2)
+        else:
+            values = arr.astype(float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return
+        lo, hi = np.percentile(values, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = float(values.min()), float(values.max())
+        if hi <= lo:
+            hi = lo + 1.0
+        try:
+            self._match_apply_histogram_levels(float(lo), float(hi))
+            self._match_hist_levels_by_slice[idx] = (float(lo), float(hi))
+        except Exception as exc:
+            self._log(f"Could not reset histology contrast: {exc}")
 
     def _restore_match_sliders(self, idx: int) -> None:
         """Reflect a previously-saved plane for slice ``idx`` in the sliders."""
@@ -1437,6 +1618,7 @@ class HistologyTab(QtWidgets.QWidget):
                 w.blockSignals(False)
 
     def _match_update_atlas(self) -> None:
+        self._match_update_slider_labels()
         at = self._ensure_atlas()
         if at is None:
             return
@@ -1445,6 +1627,26 @@ class HistologyTab(QtWidgets.QWidget):
         sl = at.grab_atlas_slice(sp, cv, spacing=3)
         rgb = matching.render_atlas_slice(sl, at, self.cb_mode.currentText())
         self.canvas_match_atlas.set_image(rgb)
+
+    def _match_update_slider_labels(self) -> None:
+        if hasattr(self, "lbl_ap_value"):
+            self.lbl_ap_value.setText(f"{int(self.sl_ap.value())} um")
+        if hasattr(self, "lbl_lr_value"):
+            self.lbl_lr_value.setText(f"{int(self.sl_lr.value()):+d} deg")
+        if hasattr(self, "lbl_si_value"):
+            self.lbl_si_value.setText(f"{int(self.sl_si.value()):+d} deg")
+
+    def _match_reset_tilt(self) -> None:
+        widgets = (self.sl_lr, self.sl_si)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.sl_lr.setValue(0)
+            self.sl_si.setValue(0)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        self._match_update_atlas()
 
     def _match_assign(self) -> None:
         at = self._ensure_atlas()
@@ -1462,17 +1664,20 @@ class HistologyTab(QtWidgets.QWidget):
             "si": int(self.sl_si.value()),
             "mode": self.cb_mode.currentText(),
         }
-        self._save_match_specs()  # persist immediately so matching survives a reopen
+        saved = self._save_match_specs()  # persist immediately so matching survives a reopen
         n_assigned = sum(s is not None for s in self.slice_specs)
+        self._match_show()
+        if saved:
+            self.lbl_match_autosave.setText(f"Autosaved match progress ({n_assigned}/{len(self.slice_images)})")
         self._log(f"Assigned plane to slice {self._cur_match_slice + 1} "
                   f"({n_assigned}/{len(self.slice_images)} assigned).")
 
     _MATCH_SPECS_FN = "histology_match_specs.json"
 
-    def _save_match_specs(self) -> None:
+    def _save_match_specs(self) -> bool:
         """Persist the per-slice match planes (sidecar to histology_ccf.mat)."""
         if self.folder is None:
-            return
+            return False
         payload = []
         for s in self.slice_specs:
             if s is None:
@@ -1486,11 +1691,21 @@ class HistologyTab(QtWidgets.QWidget):
                 "si": int(s.get("si", 0)),
                 "mode": str(s.get("mode", "TV")),
             })
+        target = self.folder / self._MATCH_SPECS_FN
+        tmp = target.with_suffix(target.suffix + ".tmp")
         try:
-            with open(self.folder / self._MATCH_SPECS_FN, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"specs": payload}, f, indent=2)
+                f.write("\n")
+            tmp.replace(target)
+            return True
         except OSError as exc:
             self._log(f"Could not save match specs: {exc}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
 
     def _read_match_specs_file(self) -> List[Optional[Dict[str, np.ndarray]]]:
         fp = self.folder / self._MATCH_SPECS_FN
