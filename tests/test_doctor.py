@@ -36,6 +36,7 @@ def test_module_group_lists_missing_imports_and_builds_a_pip_fix(monkeypatch) ->
     # The distribution name, not the import name, must appear in the fix.
     assert '"GitPython"' in result.fix
     assert "-m pip install" in result.fix
+    assert "pip:GitPython" in result.install_keys
 
 
 def test_module_group_is_ok_when_everything_imports(monkeypatch) -> None:
@@ -53,6 +54,22 @@ def test_module_group_is_ok_when_everything_imports(monkeypatch) -> None:
     assert result.fix == ""
 
 
+def test_module_group_does_not_auto_install_non_pip_imports(monkeypatch) -> None:
+    monkeypatch.setattr(doctor, "_is_importable", lambda name: False)
+    result = doctor._module_group(
+        key="stdlib",
+        category="Application core",
+        label="stdlib",
+        specs=(doctor.ModuleSpec("tkinter", pip_installable=False),),
+        severity=doctor.REQUIRED,
+        ok_detail="present",
+    )
+
+    assert result.status == doctor.FAIL
+    assert result.install_keys == ()
+    assert result.fix == ""
+
+
 def test_ecephys_schema_stack_requires_both_packages(monkeypatch) -> None:
     monkeypatch.setattr(doctor, "_is_importable", lambda name: name == "argschema")
 
@@ -63,6 +80,10 @@ def test_ecephys_schema_stack_requires_both_packages(monkeypatch) -> None:
     assert "marshmallow" in result.detail
     assert "argschema==1.17.5" in result.fix
     assert "marshmallow>=2.15,<3" in result.fix
+    assert result.install_keys == (
+        "pip-force:argschema==1.17.5",
+        "pip-force:marshmallow>=2.15,<3",
+    )
 
 
 def test_ecephys_schema_stack_rejects_modern_unknown_field_behavior(monkeypatch) -> None:
@@ -100,6 +121,7 @@ def test_missing_kilosort_fails_without_proposing_a_torch_change(monkeypatch) ->
     assert result.severity == doctor.REQUIRED
     assert "kilosort>=4.1,<4.2" in result.fix
     assert "torch" not in result.fix
+    assert result.install_keys == ("kilosort",)
 
 
 def test_kilosort_outside_tested_series_only_warns(monkeypatch) -> None:
@@ -176,6 +198,15 @@ def test_atlas_check_warns_when_volumes_are_absent(tmp_path: Path) -> None:
     assert result.status == doctor.WARN
     assert result.severity == doctor.RECOMMENDED
     assert "osf.io" in result.fix
+
+
+def test_iblapps_check_can_be_installed_automatically(tmp_path: Path) -> None:
+    settings = {"histology/iblapps_path": str(tmp_path / "nope")}
+    read = doctor._settings_reader(lambda key, default: settings.get(key, default))
+    result = doctor._check_iblapps(read)
+
+    assert result.status == doctor.WARN
+    assert result.install_keys == ("iblapps",)
 
 
 def test_settings_reader_survives_a_raising_getter() -> None:

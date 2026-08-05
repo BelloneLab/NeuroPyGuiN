@@ -1672,6 +1672,8 @@ class PreprocessingTab(QtWidgets.QWidget):
             field = fields.get(key)
             if field is not None and path:
                 field.setText(str(path))
+            elif key == "iblapps" and path:
+                self.settings.setValue("histology/iblapps_path", str(path))
 
     def _end_tool_install(self, ok: bool, message: str) -> None:
         """Close out an install run: settle the progress window and the button.
@@ -1693,11 +1695,13 @@ class PreprocessingTab(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def _tool_install_finished(self, installed: object) -> None:
+        requested = list(self._tool_install_worker.requested) if self._tool_install_worker is not None else []
         result = dict(installed) if isinstance(installed, dict) else {}
         self._apply_installed_tool_paths(result)
         self._persist_settings()
         self.settings.sync()
-        remaining = self._refresh_tool_status()
+        missing_now = self._refresh_tool_status()
+        remaining = [key for key in missing_now if key in requested]
         if remaining:
             names = ", ".join(tool_display_name(key) for key in remaining)
             self._end_tool_install(
@@ -1705,7 +1709,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             )
             return
         self._end_tool_install(
-            True, "All preprocessing tools are installed and their paths have been saved."
+            True, "The selected libraries/tools are installed and available."
         )
 
     @QtCore.Slot(str)

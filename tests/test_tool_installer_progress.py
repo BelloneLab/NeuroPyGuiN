@@ -127,6 +127,81 @@ def test_install_kilosort_marks_pip_as_indeterminate(monkeypatch: pytest.MonkeyP
     assert calls[-1] == ("Installed Kilosort4", 1.0)
 
 
+def test_install_python_requirement_uses_force_and_reports_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: List[List[str]] = []
+    calls: List[Tuple[str, float]] = []
+
+    class _Process:
+        stdout = io.StringIO("Successfully installed argschema-1.17.5\n")
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        tool_installer.subprocess,
+        "Popen",
+        lambda cmd, *_a, **_k: (commands.append(list(cmd)), _Process())[1],
+    )
+
+    installed = tool_installer.install_python_requirement(
+        "pip-force:argschema==1.17.5",
+        lambda _m: None,
+        lambda label, fraction: calls.append((label, fraction)),
+    )
+
+    assert installed == "argschema==1.17.5"
+    assert "--force-reinstall" in commands[0]
+    assert commands[0][-1] == "argschema==1.17.5"
+    assert calls[0][1] == tool_installer.BUSY
+    assert calls[-1] == ("Installed argschema==1.17.5", 1.0)
+
+
+def test_install_missing_tools_runs_diagnostics_pip_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: List[str] = []
+    monkeypatch.setattr(
+        tool_installer,
+        "install_python_requirement",
+        lambda key, _report, _progress=None: seen.append(key) or key.removeprefix("pip:"),
+    )
+
+    installed = tool_installer.install_missing_tools(
+        tmp_path,
+        {},
+        requested=["pip:cachecache"],
+        system_name="Windows",
+    )
+
+    assert seen == ["pip:cachecache"]
+    assert installed == {"pip:cachecache": "cachecache"}
+
+
+def test_install_missing_tools_runs_iblapps_installer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: List[bool] = []
+    target = tmp_path / "tools" / "iblapps"
+    monkeypatch.setattr(
+        tool_installer,
+        "install_iblapps",
+        lambda _root, _report, _progress=None, force=False: (seen.append(force), target)[1],
+    )
+
+    installed = tool_installer.install_missing_tools(
+        tmp_path,
+        {},
+        requested=["iblapps"],
+        system_name="Windows",
+        force=True,
+    )
+
+    assert seen == [True]
+    assert installed == {"iblapps": str(target)}
+
+
 def test_install_kilosort_short_circuits_when_already_present(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tool_installer, "installed_kilosort_path", lambda: Path("/env/kilosort"))
     calls: List[Tuple[str, float]] = []

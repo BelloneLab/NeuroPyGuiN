@@ -916,16 +916,22 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
             return
         self.statusBar().showMessage(doctor_module.headline(rows), 5000)
 
-    def _install_missing_tools_from_doctor(self) -> None:
-        """Hand off to the Preprocessing tab's installer for the tools it manages."""
+    def _install_missing_tools_from_doctor(self, requested: object = None) -> None:
+        """Hand off diagnostics-selected install targets to the shared installer."""
         self.tabs.setCurrentWidget(self.pre_tab)
+        keys = [str(key) for key in requested] if isinstance(requested, (list, tuple)) else []
+        if keys:
+            starter = getattr(self.pre_tab, "_start_tool_install", None)
+            if callable(starter):
+                starter(keys)
+                return
         installer = getattr(self.pre_tab, "_install_missing_tools", None)
         if callable(installer):
             installer()
             return
         QtWidgets.QMessageBox.information(
             self,
-            "Install missing tools",
+            "Install missing libraries/tools",
             "Open Preprocessing > Settings > Tool and outputs and use "
             "\"Install missing tools\".",
         )

@@ -78,6 +78,7 @@ class CheckResult:
     detail: str
     severity: str = REQUIRED
     fix: str = ""
+    install_keys: Tuple[str, ...] = ()
 
     @property
     def is_blocking(self) -> bool:
@@ -136,6 +137,7 @@ class ModuleSpec:
 
     module: str
     package: str = ""
+    pip_installable: bool = True
 
     @property
     def install_name(self) -> str:
@@ -161,8 +163,10 @@ def _module_group(
     if not missing:
         return CheckResult(key, category, label, OK, ok_detail, severity)
     names = ", ".join(spec.module for spec in missing)
-    installs = " ".join(f'"{spec.install_name}"' for spec in missing)
+    installable = [spec for spec in missing if spec.pip_installable]
+    installs = " ".join(f'"{spec.install_name}"' for spec in installable)
     status = FAIL if severity == REQUIRED else WARN
+    fix = f"{fix_prefix}{sys.executable} -m pip install {installs}" if installs else fix_prefix.strip()
     return CheckResult(
         key,
         category,
@@ -170,7 +174,8 @@ def _module_group(
         status,
         f"Not importable: {names}",
         severity,
-        fix=f"{fix_prefix}{sys.executable} -m pip install {installs}",
+        fix=fix,
+        install_keys=tuple(f"pip:{spec.install_name}" for spec in installable),
     )
 
 
@@ -249,13 +254,17 @@ def _check_numpy() -> CheckResult:
             "numpy", "Application core", "numpy", WARN,
             f"numpy {version} is above the tested ceiling (numba requires < 2.5, and bundled "
             "code still calls the deprecated np.trapz / np.in1d aliases)",
-            RECOMMENDED, fix=f'{sys.executable} -m pip install "numpy>=1.26,<2.5"',
+            RECOMMENDED,
+            fix=f'{sys.executable} -m pip install "numpy>=1.26,<2.5"',
+            install_keys=("pip:numpy>=1.26,<2.5",),
         )
     if parsed and parsed < (1, 26):
         return CheckResult(
             "numpy", "Application core", "numpy", WARN,
             f"numpy {version} is below the tested floor (pyqtgraph 0.14 requires >= 1.25)",
-            RECOMMENDED, fix=f'{sys.executable} -m pip install "numpy>=1.26,<2.5"',
+            RECOMMENDED,
+            fix=f'{sys.executable} -m pip install "numpy>=1.26,<2.5"',
+            install_keys=("pip:numpy>=1.26,<2.5",),
         )
     return CheckResult("numpy", "Application core", "numpy", OK, f"numpy {version or 'installed'}", REQUIRED)
 
@@ -287,7 +296,7 @@ _ECEPHYS_IMPORTS = (
     ModuleSpec("git", "GitPython"),
     ModuleSpec("xarray"),
     ModuleSpec("phylib"),
-    ModuleSpec("tkinter"),
+    ModuleSpec("tkinter", pip_installable=False),
 )
 
 _ECEPHYS_SCHEMA_FIX = (
@@ -315,6 +324,7 @@ def _check_ecephys_schema_stack() -> CheckResult:
             f"Not importable: {', '.join(missing)}",
             REQUIRED,
             fix=_ECEPHYS_SCHEMA_FIX,
+            install_keys=("pip-force:argschema==1.17.5", "pip-force:marshmallow>=2.15,<3"),
         )
 
     argschema_version = _module_version("argschema")
@@ -336,6 +346,7 @@ def _check_ecephys_schema_stack() -> CheckResult:
             f"{detail}. This combination rejects the pipeline JSON as unknown fields.",
             REQUIRED,
             fix=_ECEPHYS_SCHEMA_FIX,
+            install_keys=("pip-force:argschema==1.17.5", "pip-force:marshmallow>=2.15,<3"),
         )
     return CheckResult(
         "ecephys_schema_stack",
@@ -355,6 +366,7 @@ def _check_kilosort() -> CheckResult:
             "touching the existing torch build.",
             REQUIRED,
             fix=f'{sys.executable} -m pip install "kilosort>=4.1,<4.2"',
+            install_keys=("kilosort",),
         )
     version = _module_version("kilosort")
     parsed = _version_tuple(version)
@@ -363,7 +375,9 @@ def _check_kilosort() -> CheckResult:
             "kilosort", "Spike sorting", "Kilosort 4", WARN,
             f"kilosort {version} is outside the tested 4.1.x series; the bundled ks4_helper "
             "calls run_kilosort(clear_cache=, save_preprocessed_copy=, verbose_console=)",
-            RECOMMENDED, fix=f'{sys.executable} -m pip install "kilosort>=4.1,<4.2"',
+            RECOMMENDED,
+            fix=f'{sys.executable} -m pip install "kilosort>=4.1,<4.2"',
+            install_keys=("kilosort",),
         )
     return CheckResult(
         "kilosort", "Spike sorting", "Kilosort 4", OK, f"kilosort {version or 'installed'}", REQUIRED,
@@ -396,6 +410,7 @@ def _check_torch() -> CheckResult:
                 "python -m pip install --extra-index-url "
                 "https://download.pytorch.org/whl/cu126 torch==2.8.0+cu126"
             ),
+            install_keys=("pip-extra:https://download.pytorch.org/whl/cu126:torch==2.8.0+cu126",),
         )
     return CheckResult("torch", "Spike sorting", "PyTorch", OK, detail, REQUIRED)
 
@@ -517,6 +532,7 @@ def _check_phy() -> CheckResult:
             "phy", "Curation", "phy (manual curation)", WARN,
             f"Could not resolve a phy executable: {exc}", RECOMMENDED,
             fix=f'{sys.executable} -m pip install "phy>=2.1,<3"',
+            install_keys=("pip:phy>=2.1,<3",),
         )
     resolved = exe if Path(exe).exists() else (shutil.which(exe) or "")
     if resolved:
@@ -525,6 +541,7 @@ def _check_phy() -> CheckResult:
         "phy", "Curation", "phy (manual curation)", WARN,
         "No phy executable found in this env, a sibling conda env, or on PATH", RECOMMENDED,
         fix=f'{sys.executable} -m pip install "phy>=2.1,<3"',
+        install_keys=("pip:phy>=2.1,<3",),
     )
 
 
@@ -601,6 +618,7 @@ def _check_iblapps(read: Callable[[str, str], str]) -> CheckResult:
         OPTIONAL,
         fix="git clone https://github.com/int-brain-lab/iblapps, then set "
             "Histology > Setup > iblapps folder.",
+        install_keys=("iblapps",),
     )
 
 
@@ -637,7 +655,16 @@ def _check_external_tools(read: Callable[[str, str], str]) -> List[CheckResult]:
             detail = f"Not found at {configured or '(not configured)'}"
             fix = "Preprocessing > Settings > Tool and outputs > Install missing tools"
         out.append(
-            CheckResult(f"tool_{tool.key}", "External tools", tool.name, WARN, detail, RECOMMENDED, fix=fix)
+            CheckResult(
+                f"tool_{tool.key}",
+                "External tools",
+                tool.name,
+                WARN,
+                detail,
+                RECOMMENDED,
+                fix=fix,
+                install_keys=(tool.key,) if fix else (),
+            )
         )
     return out
 

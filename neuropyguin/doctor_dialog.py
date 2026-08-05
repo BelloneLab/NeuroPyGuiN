@@ -25,9 +25,6 @@ _STATUS_COLORS = {
 _STATUS_WORDS = {doctor.OK: "Ready", doctor.WARN: "Check", doctor.FAIL: "Missing"}
 _STATUS_DOTS = {doctor.OK: "●", doctor.WARN: "▲", doctor.FAIL: "✕"}
 
-# Components whose absence the bundled tool installer can fix by itself.
-_INSTALLABLE_KEYS = ("kilosort", "tool_catgt", "tool_tprime", "tool_cwaves")
-
 
 class _DiagnosticsSignals(QtCore.QObject):
     progress = QtCore.Signal(int, int, str)
@@ -62,7 +59,7 @@ class DiagnosticsWorker(QtCore.QRunnable):
 class DoctorDialog(QtWidgets.QDialog):
     """Modal report of everything the app needs, with per-row fix commands."""
 
-    installToolsRequested = QtCore.Signal()
+    installToolsRequested = QtCore.Signal(list)
 
     def __init__(
         self,
@@ -157,12 +154,11 @@ class DoctorDialog(QtWidgets.QDialog):
         self.btn_report = QtWidgets.QPushButton("Copy full report")
         self.btn_report.setProperty("role", "secondary")
         self.btn_report.clicked.connect(self._copy_report)
-        self.btn_install = QtWidgets.QPushButton("Install missing tools")
+        self.btn_install = QtWidgets.QPushButton("Install missing libraries/tools")
         self.btn_install.setProperty("role", "primary")
         self.btn_install.setEnabled(False)
         self.btn_install.setToolTip(
-            "Download the official CatGT / TPrime / C_Waves package for this platform and "
-            "install Kilosort4 into this Python environment."
+            "Install missing Python packages with pip and download supported native tools."
         )
         self.btn_install.clicked.connect(self._request_install)
         self.btn_close = QtWidgets.QPushButton("Close")
@@ -217,13 +213,28 @@ class DoctorDialog(QtWidgets.QDialog):
             f"{counts[doctor.OK]} ready · {counts[doctor.WARN]} to check · "
             f"{counts[doctor.FAIL]} missing. Select any row for the exact fix."
         )
-        self.btn_install.setEnabled(
-            any(r.key in _INSTALLABLE_KEYS and r.status != doctor.OK for r in self._results)
+        install_keys = self.install_keys()
+        self.btn_install.setEnabled(bool(install_keys))
+        self.btn_install.setToolTip(
+            "Install: " + ", ".join(install_keys)
+            if install_keys
+            else "No automatic installer is available for the remaining checks."
         )
 
     def results(self) -> List[CheckResult]:
         """Return the results of the last completed run."""
         return list(self._results)
+
+    def install_keys(self) -> List[str]:
+        """Return de-duplicated automatic installer keys for unresolved rows."""
+        keys: List[str] = []
+        for result in self._results:
+            if result.status == doctor.OK:
+                continue
+            for key in result.install_keys:
+                if key and key not in keys:
+                    keys.append(key)
+        return keys
 
     # --- rendering -------------------------------------------------------- #
 
@@ -334,5 +345,5 @@ class DoctorDialog(QtWidgets.QDialog):
         )
 
     def _request_install(self) -> None:
-        self.installToolsRequested.emit()
+        self.installToolsRequested.emit(self.install_keys())
         self.accept()

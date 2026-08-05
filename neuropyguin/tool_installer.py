@@ -28,6 +28,7 @@ import zipfile
 
 SPIKEGLX_DOWNLOAD_PAGE = "https://billkarsh.github.io/SpikeGLX/"
 KILOSORT_REPOSITORY = "https://github.com/MouseLand/Kilosort"
+IBLAPPS_REPOSITORY = "https://github.com/int-brain-lab/iblapps"
 PYTORCH_REQUIREMENT = "torch==2.5.1"
 KILOSORT_REQUIREMENT = "kilosort>=4.1,<4.2"
 
@@ -165,12 +166,136 @@ def missing_tools(paths: Dict[str, str], system_name: str | None = None) -> list
 
 
 def tool_display_name(key: str) -> str:
+    if key.startswith("pip-force:"):
+        return key.removeprefix("pip-force:")
+    if key.startswith("pip-extra:"):
+        _extra_index_url, sep, requirement = key.removeprefix("pip-extra:").rpartition(":")
+        return requirement if sep and requirement else key
+    if key.startswith("pip:"):
+        return key.removeprefix("pip:")
+    if key == "iblapps":
+        return "IBL ephys-alignment GUI"
     if key == "kilosort":
         return "Kilosort4"
     for tool in NATIVE_TOOLS:
         if tool.key == key:
             return tool.name
     return key
+
+
+def _parse_pip_key(key: str) -> tuple[str, str, bool]:
+    """Return ``(requirement, extra_index_url, force)`` for a diagnostics pip key."""
+    if key.startswith("pip-force:"):
+        return key.removeprefix("pip-force:"), "", True
+    if key.startswith("pip-extra:"):
+        payload = key.removeprefix("pip-extra:")
+        extra_index_url, sep, requirement = payload.rpartition(":")
+        if not sep or not extra_index_url or not requirement:
+            raise RuntimeError(f"Invalid pip install key: {key}")
+        return requirement, extra_index_url, False
+    if key.startswith("pip:"):
+        return key.removeprefix("pip:"), "", False
+    raise RuntimeError(f"Not a pip install key: {key}")
+
+
+def install_python_requirement(
+    key: str,
+    report: Callable[[str], None],
+    on_progress: ProgressCallback | None = None,
+) -> str:
+    """Install one Python requirement encoded by a ``pip:`` diagnostics key."""
+
+    requirement, extra_index_url, force = _parse_pip_key(key)
+    if not requirement:
+        raise RuntimeError(f"Invalid empty pip requirement in key: {key}")
+    if on_progress is not None:
+        on_progress(f"Installing {requirement} with pip...", BUSY)
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+    ]
+    if extra_index_url:
+        command += ["--extra-index-url", extra_index_url]
+    if force:
+        command += ["--upgrade", "--force-reinstall"]
+    command.append(requirement)
+    report(f"Installing {requirement} into {sys.executable}...")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if line:
+            report(line)
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"pip failed to install {requirement} (exit code {return_code})")
+    importlib.invalidate_caches()
+    report(f"Installed Python requirement: {requirement}")
+    if on_progress is not None:
+        on_progress(f"Installed {requirement}", 1.0)
+    return requirement
+
+
+def install_iblapps(
+    tools_root: Path,
+    report: Callable[[str], None],
+    on_progress: ProgressCallback | None = None,
+    force: bool = False,
+) -> Path:
+    """Clone or refresh the optional IBL ephys-alignment GUI repository."""
+
+    target = Path(tools_root).resolve() / "iblapps"
+    marker = target / "atlaselectrophysiology"
+    if marker.is_dir() and not force:
+        report(f"iblapps is already installed: {target}")
+        if on_progress is not None:
+            on_progress("iblapps is already installed", 1.0)
+        return target
+
+    git = shutil.which("git")
+    if not git:
+        raise RuntimeError("git is required to install iblapps automatically, but it was not found on PATH")
+    tools_root.mkdir(parents=True, exist_ok=True)
+    if on_progress is not None:
+        on_progress("Installing iblapps from GitHub...", BUSY)
+    if target.exists():
+        if not (target / ".git").is_dir():
+            raise RuntimeError(f"Cannot update iblapps: {target} exists but is not a git checkout")
+        command = [git, "-C", str(target), "pull", "--ff-only"]
+        report(f"Updating iblapps in {target}...")
+    else:
+        command = [git, "clone", "--depth", "1", IBLAPPS_REPOSITORY, str(target)]
+        report(f"Cloning iblapps into {target}...")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if line:
+            report(line)
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"git failed to install iblapps (exit code {return_code})")
+    if not marker.is_dir():
+        raise RuntimeError(f"iblapps installation could not be verified at {target}")
+    report(f"Installed iblapps: {target}")
+    if on_progress is not None:
+        on_progress("Installed iblapps", 1.0)
+    return target
 
 
 def _safe_extract_zip(archive: Path, destination: Path) -> None:
@@ -407,6 +532,7 @@ def install_missing_tools(
     os_name = detected_os(system_name)
     wanted = list(requested) if requested is not None else missing_tools(configured_paths, os_name)
     native_keys = {tool.key for tool in NATIVE_TOOLS}
+    pip_keys = [key for key in wanted if str(key).startswith(("pip:", "pip-force:", "pip-extra:"))]
     if os_name not in {"windows", "linux"} and any(key in native_keys for key in wanted):
         names = ", ".join(tool_display_name(key) for key in wanted if key in native_keys)
         raise RuntimeError(
@@ -421,6 +547,9 @@ def install_missing_tools(
     step_keys = [tool.key for tool in NATIVE_TOOLS if tool.key in wanted]
     if "kilosort" in wanted:
         step_keys.append("kilosort")
+    if "iblapps" in wanted:
+        step_keys.append("iblapps")
+    step_keys.extend(pip_keys)
     total_steps = max(len(step_keys), 1)
 
     def scaled(step_index: int) -> ProgressCallback:
@@ -448,6 +577,12 @@ def install_missing_tools(
         installed["kilosort"] = str(
             install_kilosort(reporter, scaled(step_keys.index("kilosort")), force=force)
         )
+    if "iblapps" in wanted:
+        installed["iblapps"] = str(
+            install_iblapps(tools_root, reporter, scaled(step_keys.index("iblapps")), force=force)
+        )
+    for key in pip_keys:
+        installed[key] = install_python_requirement(key, reporter, scaled(step_keys.index(key)))
 
     manifest = {
         "platform": os_name,
@@ -456,6 +591,7 @@ def install_missing_tools(
         "sources": {
             "spikeglx": SPIKEGLX_DOWNLOAD_PAGE,
             "kilosort": KILOSORT_REPOSITORY,
+            "iblapps": IBLAPPS_REPOSITORY,
         },
     }
     if installed:
