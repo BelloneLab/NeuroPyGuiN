@@ -113,13 +113,23 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         self.view.addItem(ln)
         self._overlays.append(ln)
 
-    def add_text(self, text: str, x: float, y: float, color="w") -> None:
+    def add_text(
+        self,
+        text: str,
+        x: float,
+        y: float,
+        color="w",
+        *,
+        fill=None,
+        border=None,
+        anchor=(0, 0),
+    ) -> None:
         item = pg.TextItem(
             text=text,
             color=color,
-            anchor=(0, 0),
-            fill=pg.mkBrush(21, 128, 61, 210),
-            border=pg.mkPen(255, 255, 255, 180),
+            anchor=anchor,
+            fill=fill if fill is not None else pg.mkBrush(21, 128, 61, 210),
+            border=border if border is not None else pg.mkPen(255, 255, 255, 180),
         )
         item.setPos(float(x), float(y))
         item.setZValue(30)
@@ -950,8 +960,19 @@ class HistologyTab(QtWidgets.QWidget):
         b_prev.clicked.connect(lambda: self._match_step(-1))
         b_next = QtWidgets.QPushButton("Slice >")
         b_next.clicked.connect(lambda: self._match_step(1))
+        b_auto_match = QtWidgets.QPushButton("Auto match")
+        b_auto_match.setProperty("role", "secondary")
+        b_auto_match.setToolTip("Estimate the best AP plane from the current histology slice shape.")
+        b_auto_match.clicked.connect(self._match_auto)
+        self.ck_match_auto_adjust = QtWidgets.QCheckBox("Auto-adjust histology")
+        self.ck_match_auto_adjust.setToolTip(
+            "After Auto match, assign the plane and run the isolated intensity auto-align "
+            "for this slice, then autosave progress."
+        )
         ctl.addWidget(b_prev)
         ctl.addWidget(b_next)
+        ctl.addWidget(b_auto_match)
+        ctl.addWidget(self.ck_match_auto_adjust)
         ctl.addWidget(QtWidgets.QLabel("AP"))
         self.sl_ap = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sl_ap.setRange(1, 1320)
@@ -1648,10 +1669,54 @@ class HistologyTab(QtWidgets.QWidget):
                 w.blockSignals(False)
         self._match_update_atlas()
 
-    def _match_assign(self) -> None:
+    def _match_auto(self) -> None:
         at = self._ensure_atlas()
         if at is None or not self.slice_images:
             return
+        idx = min(self._cur_match_slice, len(self.slice_images) - 1)
+        image = np.asarray(self.slice_images[idx])
+
+        def job():
+            return matching.automatch_coronal_ap(image, at)
+
+        def done(result):
+            if not isinstance(result, dict) or "ap" not in result:
+                self._log("Auto match did not return an AP estimate.")
+                return
+            ap = int(np.clip(int(result["ap"]), self.sl_ap.minimum(), self.sl_ap.maximum()))
+            self.sl_ap.setValue(ap)
+            self.sl_lr.setValue(0)
+            self.sl_si.setValue(0)
+            self._match_update_atlas()
+            if self.ck_match_auto_adjust.isChecked():
+                self._match_assign_current_plane(log=False)
+            score = float(result.get("score", 0.0))
+            confidence = float(result.get("confidence", 0.0))
+            self.lbl_match_autosave.setText(
+                f"Auto matched AP {ap} um (score {score:.2f}, conf {confidence:.2f})"
+            )
+            top = result.get("top") or []
+            if top:
+                bests = ", ".join(f"{int(t['ap'])}:{float(t['score']):.2f}" for t in top[:3])
+                self._log(f"Auto match slice {idx + 1}: AP {ap} (top {bests}).")
+            else:
+                self._log(f"Auto match slice {idx + 1}: AP {ap} (score {score:.2f}).")
+            if self.ck_match_auto_adjust.isChecked():
+                self._auto_adjust_current_match_slice(at, idx)
+
+        self._run_bg(
+            job,
+            done,
+            busy_msg=f"Auto matching slice {idx + 1} from tissue shape...",
+        )
+
+    def _match_assign(self) -> None:
+        self._match_assign_current_plane(log=True)
+
+    def _match_assign_current_plane(self, *, log: bool = True) -> bool:
+        at = self._ensure_atlas()
+        if at is None or not self.slice_images:
+            return False
         cv = hatlas.coronal_camera_vector(self.sl_lr.value(), self.sl_si.value())
         sp = hatlas.coronal_slice_point(self.sl_ap.value(), at)
         while len(self.slice_specs) < len(self.slice_images):
@@ -1669,8 +1734,10 @@ class HistologyTab(QtWidgets.QWidget):
         self._match_show()
         if saved:
             self.lbl_match_autosave.setText(f"Autosaved match progress ({n_assigned}/{len(self.slice_images)})")
-        self._log(f"Assigned plane to slice {self._cur_match_slice + 1} "
-                  f"({n_assigned}/{len(self.slice_images)} assigned).")
+        if log:
+            self._log(f"Assigned plane to slice {self._cur_match_slice + 1} "
+                      f"({n_assigned}/{len(self.slice_images)} assigned).")
+        return saved
 
     _MATCH_SPECS_FN = "histology_match_specs.json"
 
@@ -1854,8 +1921,23 @@ class HistologyTab(QtWidgets.QWidget):
         ap = self._align_atlas_pts.get(idx, [])
         if hp:
             self.canvas_align_hist.add_scatter([p[0] for p in hp], [p[1] for p in hp], "w")
+            self._add_numbered_points(self.canvas_align_hist, hp, fill=(20, 20, 20, 210))
         if ap:
             self.canvas_align_atlas.add_scatter([p[0] for p in ap], [p[1] for p in ap], "r")
+            self._add_numbered_points(self.canvas_align_atlas, ap, fill=(160, 0, 0, 215))
+
+    @staticmethod
+    def _add_numbered_points(canvas: ImageCanvas, points, *, fill) -> None:
+        """Overlay 1-based labels beside control points so pairs are easy to match."""
+        for i, (x, y) in enumerate(points, start=1):
+            canvas.add_text(
+                str(i),
+                float(x) + 6.0,
+                float(y) - 6.0,
+                color="w",
+                fill=pg.mkBrush(*fill),
+                border=pg.mkPen(255, 255, 255, 190),
+            )
 
     def _align_click_hist(self, x: float, y: float) -> None:
         self._align_hist_pts.setdefault(self._cur_align_slice, []).append((x, y))
@@ -1909,6 +1991,50 @@ class HistologyTab(QtWidgets.QWidget):
 
         self._run_bg(job, done,
                      busy_msg="Auto-aligning in an isolated process (intensity registration)...")
+
+    def _ensure_histology_ccf_slice(self, at: hatlas.AllenCCFAtlas, idx: int, spacing: int = 1) -> bool:
+        """Build/store ``histology_ccf[idx]`` from the current match spec if needed."""
+        if idx < len(self.histology_ccf) and self.histology_ccf[idx]:
+            return True
+        if idx >= len(self.slice_specs) or self.slice_specs[idx] is None:
+            return False
+        while len(self.histology_ccf) <= idx:
+            self.histology_ccf.append({})
+        self.histology_ccf[idx] = matching.build_histology_ccf(at, [self.slice_specs[idx]], spacing=spacing)[0]
+        return True
+
+    def _auto_adjust_current_match_slice(self, at: hatlas.AllenCCFAtlas, idx: int) -> None:
+        """Run the existing intensity auto-align after an Auto Match result."""
+        if idx >= len(self.slice_images):
+            return
+        if not self._ensure_histology_ccf_slice(at, idx, spacing=1):
+            self._log("Auto-adjust skipped: no matched plane is available for this slice.")
+            return
+        hist = self.slice_images[idx]
+        hist_gray = hist.mean(axis=2) if hist.ndim == 3 else hist
+        atlas_tv = self.histology_ccf[idx].get("tv_slices")
+        if atlas_tv is None or np.asarray(atlas_tv).size == 0:
+            self._log("Auto-adjust skipped: atlas plane has no template image.")
+            return
+
+        def job():
+            return alignment.auto_align_isolated(hist_gray, atlas_tv)
+
+        def done(result):
+            T, status = result
+            self._set_tform(idx, T)
+            self._autosave_tforms()
+            self._log(f"Slice {idx + 1}: auto-adjust after Auto match: {status}")
+            self.lbl_match_autosave.setText(f"Auto-adjusted and autosaved slice {idx + 1}")
+            if self.nav.currentIndex() == getattr(self, "_page_align", -1):
+                self._cur_align_slice = idx
+                self._align_overlay(idx)
+
+        self._run_bg(
+            job,
+            done,
+            busy_msg=f"Auto-adjusting slice {idx + 1} after Auto match...",
+        )
 
     def _set_tform(self, idx: int, T: np.ndarray) -> None:
         while len(self.tforms) <= idx:

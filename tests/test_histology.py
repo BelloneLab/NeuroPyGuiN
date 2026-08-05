@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from neuropyguin.histology import alignment, io_formats, tracing, slice_prep
+from neuropyguin.histology import alignment, io_formats, matching, tracing, slice_prep
 from neuropyguin.histology import atlas as hatlas
 
 
@@ -137,6 +137,130 @@ def test_png_alpha_channel_is_converted_to_rgb(tmp_path):
     Image.fromarray(np.zeros((3, 4, 4), dtype=np.uint8), mode="RGBA").save(path)
 
     assert slice_prep.load_image(path).shape == (3, 4, 3)
+
+
+def test_histology_shape_mask_fills_tissue_outline():
+    img = np.zeros((80, 100, 3), dtype=np.uint8)
+    yy, xx = np.ogrid[:80, :100]
+    left = ((yy - 42) / 24) ** 2 + ((xx - 42) / 25) ** 2 <= 1
+    right = ((yy - 42) / 24) ** 2 + ((xx - 58) / 25) ** 2 <= 1
+    outline = left | right
+    img[outline] = [5, 30, 160]
+    img[40:45, 50:54] = [160, 5, 5]
+
+    mask = matching.histology_shape_mask(img)
+
+    assert mask.sum() > 2000
+    assert mask[42, 50]
+
+
+def test_automatch_coronal_ap_prefers_matching_shape(monkeypatch):
+    class FakeAtlas:
+        shape = (120, 80, 100)
+
+        def grab_atlas_slice(self, slice_point, _camera_vector, spacing=8):
+            ap = int(round(float(slice_point[0])))
+            yy, xx = np.ogrid[:80:spacing, :100:spacing]
+            width = 16 if ap < 60 else 32
+            mask = ((yy - 40) / 22) ** 2 + ((xx - 50) / width) ** 2 <= 1
+            tv = np.full(mask.shape, np.nan, dtype=float)
+            tv[mask] = 1.0
+            return {"tv_slices": tv}
+
+    hist = np.zeros((80, 100, 3), dtype=np.uint8)
+    yy, xx = np.ogrid[:80, :100]
+    wide = ((yy - 40) / 22) ** 2 + ((xx - 50) / 32) ** 2 <= 1
+    hist[wide] = [10, 30, 180]
+
+    result = matching.automatch_coronal_ap(
+        hist,
+        FakeAtlas(),
+        ap_step=20,
+        refine_radius=10,
+        refine_step=5,
+        spacing=4,
+        canvas_size=64,
+    )
+
+    assert result["ap"] >= 60
+    assert result["score"] > 0.5
+
+
+def test_automatch_tolerates_split_and_missing_tissue():
+    class FakeAtlas:
+        shape = (120, 90, 120)
+
+        def grab_atlas_slice(self, slice_point, _camera_vector, spacing=8):
+            ap = int(round(float(slice_point[0])))
+            yy, xx = np.ogrid[:90:spacing, :120:spacing]
+            if ap < 60:
+                mask = ((yy - 45) / 18) ** 2 + ((xx - 60) / 26) ** 2 <= 1
+            else:
+                left = ((yy - 45) / 25) ** 2 + ((xx - 42) / 28) ** 2 <= 1
+                right = ((yy - 45) / 25) ** 2 + ((xx - 78) / 28) ** 2 <= 1
+                mask = left | right
+            tv = np.full(mask.shape, np.nan, dtype=float)
+            tv[mask] = 1.0
+            return {"tv_slices": tv}
+
+    hist = np.zeros((90, 120, 3), dtype=np.uint8)
+    yy, xx = np.ogrid[:90, :120]
+    left = ((yy - 45) / 25) ** 2 + ((xx - 42) / 28) ** 2 <= 1
+    right = ((yy - 45) / 25) ** 2 + ((xx - 78) / 28) ** 2 <= 1
+    gap = (xx > 54) & (xx < 66)
+    missing_left = (xx < 32) & (yy < 38)
+    partial = (left | right) & ~gap & ~missing_left
+    hist[partial] = [6, 34, 190]
+    hist[np.broadcast_to((xx > 54) & (xx < 66), hist.shape[:2])] = [30, 0, 0]
+
+    mask = matching.histology_shape_mask(hist)
+    labels, n_labels = matching.ndi.label(mask)
+    result = matching.automatch_coronal_ap(
+        hist,
+        FakeAtlas(),
+        ap_step=20,
+        refine_radius=10,
+        refine_step=5,
+        spacing=4,
+        canvas_size=64,
+    )
+
+    assert n_labels >= 2
+    assert result["ap"] >= 60
+    assert result["score"] > 0.45
+
+
+def test_match_auto_toggle_assigns_and_auto_adjusts(monkeypatch, tmp_path):
+    from PySide6 import QtCore, QtWidgets
+    from neuropyguin.tabs.histology_tab import HistologyTab
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    tab = HistologyTab(QtCore.QThreadPool.globalInstance())
+    tab.folder = tmp_path
+    tab.slice_images = [np.ones((16, 20, 3), dtype=np.uint8) * 120]
+    tab.slice_specs = [None]
+    tab.ck_match_auto_adjust.setChecked(True)
+    seen = []
+
+    class FakeAtlas:
+        shape = (120, 80, 100)
+
+    monkeypatch.setattr(tab, "_ensure_atlas", lambda: FakeAtlas())
+    monkeypatch.setattr(tab, "_match_update_atlas", lambda: tab._match_update_slider_labels())
+    monkeypatch.setattr(
+        matching,
+        "automatch_coronal_ap",
+        lambda _image, _atlas: {"ap": 77, "score": 0.8, "confidence": 0.2, "top": []},
+    )
+    monkeypatch.setattr(tab, "_auto_adjust_current_match_slice", lambda _atlas, idx: seen.append(idx))
+    monkeypatch.setattr(tab, "_run_bg", lambda fn, done, *args, **kwargs: done(fn()))
+
+    tab._match_auto()
+
+    assert tab.sl_ap.value() == 77
+    assert tab.slice_specs[0] is not None
+    assert seen == [0]
+    assert (tmp_path / tab._MATCH_SPECS_FN).exists()
 
 
 def test_probe_ccf_csv_schema(tmp_path):
