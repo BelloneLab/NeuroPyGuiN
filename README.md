@@ -255,7 +255,8 @@ Re-open it any time with **Help > Run Diagnostics** (`Ctrl+Shift+D`), or from a
 terminal:
 
 ```bash
-python -m neuropyguin.doctor      # prints the report, exits non-zero if broken
+python main.py doctor             # prints the report, exits non-zero if broken
+python main.py doctor --json      # same check, machine-readable
 ```
 
 > **GPU:** Both environment files install `torch==2.8.0+cu126` and
@@ -343,6 +344,75 @@ rebuilding or packaging the app.
 - Settings, recents, and window layout are remembered between sessions.
 - Cell-type classification: **C4** (cerebellar) runs in a separate `npyx_c4` env via subprocess; **Bombcell** (cortex/striatum) runs in the main env. Both write `cell_types_*.csv` and a phy-compatible `cluster_*_cell_type.tsv` into the dataset folder.
 - "Export waveforms" writes a single `good_units_waveform_acg.pdf` plus per-unit PNGs for every good unit.
+
+## ⌨️ Drive it from the terminal
+
+Every workflow in the window is also a command. Launching with no arguments still
+opens the GUI, so nothing about the existing habit changes:
+
+```bash
+python main.py                    # the graphical app, exactly as before
+python main.py <group> <command>  # the same work, headless
+python -m neuropyguin <group> ... # equivalent, from anywhere on the PYTHONPATH
+```
+
+The command groups mirror the tabs:
+
+| Group | Covers | Examples |
+| --- | --- | --- |
+| `preprocess` | Preprocessing tab | `discover`, `validate`, `runs`, `plan`, `run`, `concat`, `split`, `build-catgt`, `build-tprime`, `steps`, `show-config` |
+| `curate` | Curation tab | `phy`, `bombcell`, `bombcell-gui`, `labels`, `label`, `thresholds`, `sync-phy`, `figures` |
+| `postproc` | Post Processing tab | `info`, `units`, `export-units`, `export-figures`, `psth`, `correlogram`, `npyx`, `network`, `c4`, `celltype`, `figure`, `events` |
+| `histology` | Histology tab | `status`, `prep`, `match`, `build-ccf`, `align`, `export`, `alf`, `xyz`, `channels`, `pipeline`, `propose`, `finalize`, `gui`, `atlas-info` |
+| `doctor` / `tools` / `config` | Help menu, installer, Settings | `doctor`, `tools list`, `tools install`, `config get/set/export/import` |
+
+A typical batch, start to finish:
+
+```bash
+# See what is there, and where a run would be written, before committing to it
+python main.py preprocess discover D:/rawData/mouse01
+python main.py preprocess plan     D:/rawData/mouse01 --output-root I:/processedData
+
+# Sort it. Stage selection, CatGT flags and tool paths default to whatever the
+# GUI is configured with, so usually only the input needs naming.
+python main.py preprocess run D:/rawData/mouse01 --steps catgt,kilosort,quality_metrics
+
+# Quality metrics, labels, and phy
+python main.py curate bombcell I:/processedData/mouse01/day1/spike_sorting/imec0_ks4
+python main.py curate phy      I:/processedData/mouse01/day1/spike_sorting/imec0_ks4
+
+# Analyse and export
+python main.py postproc info         .../imec0_ks4
+python main.py postproc export-units .../imec0_ks4 --good-only -o units.h5
+python main.py postproc psth         .../imec0_ks4 --events reward=events.csv --figure
+
+# Histology, from raw slides to a channel map
+python main.py histology prep     D:/histology/raw -o D:/histology/mouse01
+python main.py histology match    D:/histology/mouse01 --sequential
+python main.py histology build-ccf D:/histology/mouse01
+python main.py histology align    D:/histology/mouse01
+python main.py histology pipeline D:/histology/mouse01 --extract --ks .../imec0_ks4
+```
+
+Notes that matter when scripting:
+
+- **Settings are shared with the GUI.** The CLI reads the same store, so tool
+  paths, CatGT strings, output layout and the enabled stages carry over. Pass
+  `--no-saved-settings` for a reproducible run from built-in defaults, and
+  `--config run.json` (written by `preprocess show-config --save-config`) to pin
+  a configuration exactly.
+- **`--json` makes stdout machine-readable.** Progress moves to stderr, so
+  `python main.py --json postproc info ... | jq .n_units` works.
+- **Exit codes are meaningful.** `0` success, `1` the work ran but something
+  failed (a failed sorting job, a blocking diagnostic, an invalid recording),
+  `2` a usage or runtime error, `130` interrupted.
+- **`preprocess run` is the same code the GUI runs**, executed synchronously on
+  the calling thread, so logs and results are identical to the window's.
+- Interactive-only steps (drawing probe tracks, nudging alignment control
+  points) stay in the GUI; the CLI covers every automatic path around them.
+
+Run `python main.py <group> --help` for a group's commands and
+`python main.py <group> <command> --help` for its options.
 
 ## Standing on the shoulders of giants
 

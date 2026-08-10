@@ -32,6 +32,8 @@ tools/_postproc_shots/
 
 # Local development notes
 /postprocessing.md
+/.codex_memory.md
+/.cli_memory.md
 
 # Large binary/runtime artifacts
 *.npy

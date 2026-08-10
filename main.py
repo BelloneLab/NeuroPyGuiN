@@ -48,6 +48,31 @@ def _maybe_relaunch_in_supported_env() -> int | None:
     return subprocess.call(args, cwd=str(Path(__file__).resolve().parent), env=env)
 
 
+def _qt_import_failure(exc: Exception) -> bool:
+    """True when an import error looks like a broken/missing Qt runtime."""
+    msg = str(exc)
+    return "PySide6" in msg or "QtCore" in msg or "DLL load failed" in msg
+
+
+def _run_cli(argv: list[str]) -> int:
+    """Dispatch to the command line interface, keeping the env-relaunch fallback."""
+    try:
+        from neuropyguin.cli import main as cli_main
+    except Exception as exc:
+        if _qt_import_failure(exc):
+            relaunched = _maybe_relaunch_in_supported_env()
+            if relaunched is not None:
+                return int(relaunched)
+            print("Failed to import the Qt runtime needed by the CLI.", file=sys.stderr)
+            print(f"Python executable: {sys.executable}", file=sys.stderr)
+            print("Activate the intended conda env, for example:", file=sys.stderr)
+            print("  conda activate neuropyguin", file=sys.stderr)
+            return 2
+        traceback.print_exc()
+        return 1
+    return int(cli_main(argv))
+
+
 def _entry() -> int:
     try:
         from neuropyguin._diagnostics import install_crash_logging
@@ -55,11 +80,17 @@ def _entry() -> int:
         print(f"NeuroPyGuiN crash log: {crash_log}", file=sys.stderr)
     except Exception:
         pass
+
+    # Any argument at all means "run a CLI command"; a bare launch keeps opening
+    # the window, so existing shortcuts and habits are unchanged.
+    argv = sys.argv[1:]
+    if argv:
+        return _run_cli(argv)
+
     try:
         from neuropyguin.app import main
     except Exception as exc:
-        msg = str(exc)
-        if "PySide6" in msg or "QtCore" in msg or "DLL load failed" in msg:
+        if _qt_import_failure(exc):
             relaunched = _maybe_relaunch_in_supported_env()
             if relaunched is not None:
                 return int(relaunched)
