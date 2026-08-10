@@ -630,28 +630,23 @@ def _precompute_unit_gui_data(unit_idx, unit_id, template_waveforms, quality_met
             # Spatial decay fit
             if len(distances) >= 3 and len(amplitudes) >= 3:
                 try:
-                    from scipy.optimize import curve_fit
-                    
-                    def exp_decay(x, a, b):
-                        return a * np.exp(-b * x)
-                    
                     valid_mask = (np.array(distances) > 0) & (np.array(amplitudes) > 0)
                     if np.sum(valid_mask) >= 3:
                         dist_fit = np.array(distances)[valid_mask]
                         amp_fit = np.array(amplitudes)[valid_mask]
-                        
-                        popt, _ = curve_fit(exp_decay, dist_fit, amp_fit, 
-                                          p0=[np.max(amp_fit), 0.01], maxfev=1000)
-                        
+                        slope = qm.exponential_decay_slope(dist_fit, amp_fit)
+                        if not np.isfinite(slope):
+                            raise ValueError("invalid spatial decay slope")
+                        intercept = float(np.exp(np.mean(np.log(amp_fit) + slope * dist_fit)))
                         x_smooth = np.linspace(0, np.max(dist_fit), 100)
-                        y_smooth = exp_decay(x_smooth, *popt)
+                        y_smooth = intercept * np.exp(-slope * x_smooth)
                         
                         gui_data['spatial_decay_fits'][unit_id] = {
                             'distances': distances,
                             'amplitudes': amplitudes,
                             'fit_x': x_smooth,
                             'fit_y': y_smooth,
-                            'fit_params': popt
+                            'fit_params': np.array([intercept, slope])
                         }
                 except:
                     pass  # Skip if fitting fails
@@ -664,20 +659,14 @@ def _precompute_unit_gui_data(unit_idx, unit_id, template_waveforms, quality_met
                 hist, bin_edges = np.histogram(unit_amplitudes, bins=50, density=True)
                 bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
                 
-                from scipy.optimize import curve_fit
-                
-                def gaussian(x, a, mu, sigma):
-                    return a * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
-                
                 mu_init = np.mean(unit_amplitudes)
                 sigma_init = np.std(unit_amplitudes)
                 a_init = np.max(hist)
-                
-                popt, _ = curve_fit(gaussian, bin_centers, hist, 
-                                  p0=[a_init, mu_init, sigma_init], maxfev=1000)
+                if not np.isfinite(sigma_init) or sigma_init <= np.finfo(float).eps:
+                    raise ValueError("invalid amplitude distribution width")
                 
                 x_smooth = np.linspace(np.min(unit_amplitudes), np.max(unit_amplitudes), 100)
-                y_smooth = gaussian(x_smooth, *popt)
+                y_smooth = a_init * np.exp(-((x_smooth - mu_init) ** 2) / (2 * sigma_init ** 2))
                 
                 cutoff_val = mu_init - 2 * sigma_init
                 percent_missing = np.sum(unit_amplitudes < cutoff_val) / len(unit_amplitudes) * 100
@@ -689,7 +678,7 @@ def _precompute_unit_gui_data(unit_idx, unit_id, template_waveforms, quality_met
                     'fit_x': x_smooth,
                     'fit_y': y_smooth,
                     'percent_missing': percent_missing,
-                    'fit_params': popt
+                    'fit_params': np.array([a_init, mu_init, sigma_init])
                 }
             except:
                 pass  # Skip if fitting fails

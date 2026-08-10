@@ -20,6 +20,7 @@ from neuropyguin.pybombcell_integration import (
     save_pybombcell_labels,
     summarize_saved_pybombcell_results,
 )
+from neuropyguin.pybombcell_runtime import ensure_pybombcell_on_sys_path
 
 
 def test_summarize_saved_pybombcell_results_counts_labels_and_reuses_matching_manifest(tmp_path: Path) -> None:
@@ -338,6 +339,72 @@ def test_ensure_saved_metrics_maxchannels_rebuilds_from_template_waveforms() -> 
 
     assert rebuilt["maxChannels"].tolist() == [1, 2]
     assert full_max_channels.tolist() == [1, 3, 2]
+
+
+def test_bombcell_missing_spikes_estimate_avoids_scipy_curve_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    ensure_pybombcell_on_sys_path()
+    from bombcell import quality_metrics as qm
+
+    rng = np.random.default_rng(42)
+    amplitudes = np.clip(rng.normal(loc=80.0, scale=8.0, size=500), 1.0, None)
+    spike_times = np.linspace(0.0, 1.0, amplitudes.size, endpoint=False)
+
+    def forbidden_curve_fit(*_args, **_kwargs):
+        raise AssertionError("perc_spikes_missing must not call scipy.optimize.curve_fit")
+
+    monkeypatch.setattr(qm, "curve_fit", forbidden_curve_fit, raising=False)
+
+    gaussian, symmetric = qm.perc_spikes_missing(
+        amplitudes,
+        spike_times,
+        np.asarray([0.0, 1.0]),
+        {"plotDetails": False},
+        metric=True,
+    )
+
+    assert np.isfinite(gaussian)
+    assert gaussian == pytest.approx(symmetric)
+
+
+def test_bombcell_missing_spikes_fit_falls_back_to_symmetric(monkeypatch: pytest.MonkeyPatch) -> None:
+    ensure_pybombcell_on_sys_path()
+    from bombcell import quality_metrics as qm
+
+    rng = np.random.default_rng(7)
+    amplitudes = np.clip(rng.normal(loc=70.0, scale=9.0, size=500), 1.0, None)
+    spike_times = np.linspace(0.0, 1.0, amplitudes.size, endpoint=False)
+
+    def failing_curve_fit(*_args, **_kwargs):
+        raise RuntimeError("ill-conditioned fit")
+
+    monkeypatch.setattr(qm, "curve_fit", failing_curve_fit, raising=False)
+
+    gaussian, symmetric = qm.perc_spikes_missing(
+        amplitudes,
+        spike_times,
+        np.asarray([0.0, 1.0]),
+        {"plotDetails": False},
+        metric=True,
+    )
+
+    assert np.isfinite(gaussian)
+    assert gaussian == pytest.approx(symmetric)
+
+
+def test_bombcell_spatial_decay_fits_are_numpy_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    ensure_pybombcell_on_sys_path()
+    from bombcell import quality_metrics as qm
+
+    def forbidden_curve_fit(*_args, **_kwargs):
+        raise AssertionError("spatial decay fits must not call scipy.optimize.curve_fit")
+
+    monkeypatch.setattr(qm, "curve_fit", forbidden_curve_fit, raising=False)
+    distances = np.asarray([0.0, 20.0, 40.0, 60.0, 80.0])
+    linear_points = 1.0 - 0.005 * distances
+    exponential_points = 1.5 * np.exp(-0.02 * distances)
+
+    assert qm.linear_decay_slope(distances, linear_points) == pytest.approx(0.005)
+    assert qm.exponential_decay_slope(distances, exponential_points) == pytest.approx(0.02)
 
 
 def test_run_pybombcell_on_folders_aggregates_success_cache_and_failure(monkeypatch: pytest.MonkeyPatch) -> None:

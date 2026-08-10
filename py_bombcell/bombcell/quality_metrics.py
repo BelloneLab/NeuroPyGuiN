@@ -3,7 +3,6 @@ import os
 import numpy as np
 from numba import njit
 
-from scipy.optimize import curve_fit
 from scipy.signal import medfilt, find_peaks
 from scipy.stats import norm, chi2
 
@@ -486,34 +485,12 @@ def perc_spikes_missing(these_amplitudes, these_spike_times, time_chunks, param,
             not_cutoff = is_peak_cutoff(spike_counts_per_amp_bin_gaussian)
 
             if not_cutoff:
-                # Testing for cut-off solves all of these issues
-                p0 = np.array(
-                    (
-                        np.percentile(spike_counts_per_amp_bin_gaussian, 99),
-                        mode_seed,
-                        np.nanstd(these_amplitudes_here),
-                        np.percentile(these_amplitudes_here, 1),
-                    )
-                )
-                fit_params = curve_fit(
-                    gaussian_cut,
-                    amp_bin_gaussian,
-                    spike_counts_per_amp_bin_gaussian,
-                    p0=p0,
-                    ftol=1e-3,
-                    xtol=1e-3,
-                    maxfev=10000,
-                    method = 'trf'
-                )[0]
-                gaussian_fit = gaussian_cut(
-                    amp_bin_gaussian, fit_params[0], fit_params[1], fit_params[2], p0[3]
-                )
-
-                norm_area = norm.cdf(
-                    (fit_params[1] - fit_params[3]) / np.abs(fit_params[2])
-                )
-                fit_params_save.append(fit_params)
-                percent_missing_gaussian[time_chunk_idx] = 100 * (1 - norm_area)
+                # Avoid scipy.optimize.curve_fit here. On some Windows SciPy
+                # builds the compiled least-squares backend can terminate the
+                # whole Python process before an exception can be caught. The
+                # symmetric estimate above is NumPy-only and keeps the GUI alive.
+                percent_missing_gaussian[time_chunk_idx] = percent_missing_symmetric[time_chunk_idx]
+                gaussian_fit = np.nan
             else:
                 percent_missing_gaussian[time_chunk_idx] = 100  # Use one as a fail here
                 gaussian_fit = np.nan
@@ -1159,6 +1136,66 @@ def exp_fit(x, m, A):
     return A * np.exp(m * x)
 
 
+def linear_decay_slope(channel_distances, spatial_decay_points):
+    """
+    Estimate spatial-decay slope with a direct NumPy line fit.
+
+    Parameters
+    ----------
+    channel_distances : ndarray
+        Distances from the unit's peak channel.
+    spatial_decay_points : ndarray
+        Waveform amplitudes at those distances.
+
+    Returns
+    -------
+    spatial_decay_slope : float
+        Negative fitted gradient, or NaN when the fit is not well-defined.
+    """
+    x = np.asarray(channel_distances, dtype=float)
+    y = np.asarray(spatial_decay_points, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+    if x.size < 2 or np.unique(x).size < 2:
+        return np.nan
+    try:
+        gradient, _intercept = np.polyfit(x, y, 1)
+    except Exception:
+        return np.nan
+    return -float(gradient) if np.isfinite(gradient) else np.nan
+
+
+def exponential_decay_slope(channel_distances, spatial_decay_points):
+    """
+    Estimate exponential spatial decay with a log-linear NumPy fit.
+
+    Parameters
+    ----------
+    channel_distances : ndarray
+        Distances from the unit's peak channel.
+    spatial_decay_points : ndarray
+        Positive waveform amplitudes at those distances.
+
+    Returns
+    -------
+    spatial_decay_slope : float
+        Negative exponential coefficient, or NaN when the fit is not well-defined.
+    """
+    x = np.asarray(channel_distances, dtype=float)
+    y = np.asarray(spatial_decay_points, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y) & (y > np.finfo(float).eps)
+    x = x[valid]
+    y = y[valid]
+    if x.size < 2 or np.unique(x).size < 2:
+        return np.nan
+    try:
+        gradient, _log_intercept = np.polyfit(x, np.log(y), 1)
+    except Exception:
+        return np.nan
+    return -float(gradient) if np.isfinite(gradient) else np.nan
+
+
 def waveform_shape(
     template_waveforms,
     this_unit,
@@ -1537,19 +1574,10 @@ def waveform_shape(
                     if param["normalizeSpDecay"]:
                         spatial_decay_points = spatial_decay_points / np.max(spatial_decay_points)
 
-                    # estimate initial paramters
-                    intercept = np.max(
-                        spatial_decay_points
-                    )  # Take the max value of the max channel
-                    grad = (spatial_decay_points[1] - spatial_decay_points[0]) / (
-                        channel_distances[1] - channel_distances[0]
+                    spatial_decay_slope = linear_decay_slope(
+                        channel_distances,
+                        spatial_decay_points,
                     )
-
-                    # Can add p0 to linear params, but not needed as easier to fit linear curve
-                    out_linear = curve_fit(linear_fit, channel_distances, spatial_decay_points)[
-                        0
-                    ]  #
-                    spatial_decay_slope = -out_linear[0]
                 else:
                     use_these_channels = np.argsort(y_dist)[:NUM_CHANNELS_FOR_FIT]  
 
@@ -1572,22 +1600,14 @@ def waveform_shape(
                     if param["normalizeSpDecay"]:
                         spatial_decay_points = spatial_decay_points / np.max(spatial_decay_points)
 
-                    # Initial parameters matching MATLAB
-                    initial_guess = [0.1, 1]  # [A, b]
-
                     # Ensure inputs are float64 (equivalent to MATLAB double)
                     channel_distances = np.float64(channel_distances)
                     spatial_decay_points = np.float64(spatial_decay_points)
 
-                    # Curve fit with same initial parameters as MATLAB
-                    out_exp = curve_fit(
-                        exp_fit,
+                    spatial_decay_slope = exponential_decay_slope(
                         channel_distances,
                         spatial_decay_points,
-                        p0=initial_guess,
-                        maxfev=5000
-                    )[0]
-                    spatial_decay_slope = -out_exp[0]
+                    )
 
         # get waveform baseline fraction
         waveform_baseline = np.nan
