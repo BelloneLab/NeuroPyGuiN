@@ -60,14 +60,14 @@ def test_load_pybombcell_labels_normalizes_saved_csv(tmp_path: Path) -> None:
     ks = tmp_path / "imec0_ks4"
     ks.mkdir(parents=True)
     (ks / "bombcell_labels.csv").write_text(
-        "cluster_id,bombcell_label\n0,GOOD\n1,MUA\n2,NON-SOMA GOOD\n3,noise\n",
+        "cluster_id,bombcell_label\n0,GOOD\n1,MUA\n2,NON-SOMA GOOD\n3,noise\n4,non_soma_noise\n",
         encoding="utf-8",
     )
 
     labels = load_pybombcell_labels(ks)
 
-    assert labels.index.tolist() == [0, 1, 2, 3]
-    assert labels["bombcell_label"].tolist() == ["good", "mua", "non_soma", "noise"]
+    assert labels.index.tolist() == [0, 1, 2, 3, 4]
+    assert labels["bombcell_label"].tolist() == ["good", "mua", "non_soma", "noise", "noise"]
 
 
 def test_classify_pybombcell_metrics_uses_bombcell_thresholds() -> None:

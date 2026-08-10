@@ -169,12 +169,20 @@ def _normalize_label_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _labels_to_phy_groups(labels: pd.Series) -> pd.Series:
-    """Normalize free-form label strings to phy group names (lowercased, non_soma unified)."""
+    """Normalize free-form label strings to the default four phy group names."""
     out = labels.astype(str).str.strip().str.lower()
+    out = out.str.replace(",", "", regex=False).str.replace("-", "_", regex=False).str.replace(" ", "_", regex=False)
     remap = {
-        "non-soma": "non_soma",
-        "non soma": "non_soma",
+        "non_soma_good": "non_soma",
+        "non_soma_mua": "non_soma",
+        "non_soma_noise": "noise",
         "non_somatic": "non_soma",
+        "non_somatic_good": "non_soma",
+        "non_somatic_mua": "non_soma",
+        "non_somatic_noise": "noise",
+        "nonsomatic": "non_soma",
+        "somatic_good": "good",
+        "somatic_mua": "mua",
     }
     out = out.map(lambda v: remap.get(v, v))
     return out

@@ -43,6 +43,25 @@ def test_sync_phy_cluster_group_keeps_existing_non_noise_groups(tmp_path: Path) 
     assert out["group"].tolist() == ["good", "mua"]
 
 
+def test_sync_phy_cluster_group_collapses_detailed_non_soma_labels_to_four_classes(tmp_path: Path) -> None:
+    ks = tmp_path / "imec0_ks4"
+    ks.mkdir(parents=True, exist_ok=True)
+    (ks / "bombcell_labels.csv").write_text(
+        "cluster_id,bombcell_label\n"
+        "0,good\n"
+        "1,non_soma_good\n"
+        "2,non_soma_mua\n"
+        "3,non_soma_noise\n",
+        encoding="utf-8",
+    )
+
+    result = sync_phy_cluster_group(ks, force=True)
+
+    assert result["updated"] is True
+    out = pd.read_csv(ks / "cluster_group.tsv", sep="\t")
+    assert out["group"].tolist() == ["good", "non_soma", "non_soma", "noise"]
+
+
 def test_run_bombcell_saves_phy_cluster_group(tmp_path: Path) -> None:
     ks = tmp_path / "imec0_ks4"
     ks.mkdir(parents=True, exist_ok=True)

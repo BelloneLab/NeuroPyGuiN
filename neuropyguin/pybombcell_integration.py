@@ -180,8 +180,6 @@ def _normalize_label_name(label: object) -> str:
     raw = raw.replace("-", "_").replace(" ", "_")
     if not raw:
         return ""
-    if raw.startswith("non_soma"):
-        return "non_soma"
     if raw.startswith("somatic_good"):
         return "good"
     if raw.startswith("somatic_mua"):
@@ -190,12 +188,18 @@ def _normalize_label_name(label: object) -> str:
         "noise": "noise",
         "good": "good",
         "mua": "mua",
+        "non_soma_noise": "noise",
+        "non_somatic_noise": "noise",
         "non_somatic": "non_soma",
         "nonsomatic": "non_soma",
         "non_soma_good": "non_soma",
         "non_soma_mua": "non_soma",
     }
-    return remap.get(raw, raw)
+    if raw in remap:
+        return remap[raw]
+    if raw.startswith("non_soma"):
+        return "non_soma"
+    return raw
 
 
 def normalize_pybombcell_label(label: object) -> str:
