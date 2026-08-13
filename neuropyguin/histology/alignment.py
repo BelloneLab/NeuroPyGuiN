@@ -19,11 +19,16 @@ from typing import Optional, Tuple
 import numpy as np
 from scipy import ndimage as ndi
 
+from . import acceleration
+
 try:  # OpenCV is optional; manual alignment works without it.
     import cv2  # type: ignore
     _HAS_CV2 = True
 except Exception:  # pragma: no cover
     _HAS_CV2 = False
+
+
+AUTO_ALIGN_MIN_SHAPE_SCORE = 0.65
 
 
 def fit_affine_from_points(atlas_pts: np.ndarray, histology_pts: np.ndarray) -> np.ndarray:
@@ -103,6 +108,293 @@ def _pad_to(img: np.ndarray, h: int, w: int) -> np.ndarray:
     return out
 
 
+def _as_gray(image: np.ndarray) -> np.ndarray:
+    arr = np.nan_to_num(np.asarray(image, dtype=np.float32))
+    if arr.ndim == 3:
+        arr = arr[..., :3].mean(axis=2)
+    return arr
+
+
+def _bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    rows = np.flatnonzero(np.any(mask, axis=1))
+    cols = np.flatnonzero(np.any(mask, axis=0))
+    if rows.size == 0 or cols.size == 0:
+        return None
+    return int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+
+
+def _edge_mask(mask: np.ndarray) -> np.ndarray:
+    mask = np.asarray(mask, bool)
+    if not mask.any():
+        return np.zeros_like(mask, dtype=bool)
+    return mask ^ ndi.binary_erosion(mask, iterations=1)
+
+
+def _safe_scale(mask: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    mask = np.asarray(mask, bool)
+    side = max(mask.shape) if mask.ndim == 2 and mask.size else 0
+    if side <= max_side or side <= 0:
+        return mask, 1.0
+    scale = float(max_side) / float(side)
+    small = ndi.zoom(mask.astype(float), (scale, scale), order=0) > 0.5
+    return small, scale
+
+
+def _histology_tissue_mask(image: np.ndarray) -> np.ndarray:
+    """Extract a filled histology tissue mask while keeping split hemispheres."""
+    try:
+        from . import matching
+
+        mask = matching.histology_shape_mask(image)
+    except Exception:
+        gray = _as_gray(image)
+        if gray.ndim != 2 or gray.size == 0:
+            return np.zeros(gray.shape[:2], dtype=bool)
+        positive = gray[gray > 0]
+        thresh = float(np.percentile(positive, 55.0)) if positive.size else float(gray.mean())
+        mask = gray >= thresh
+        mask = ndi.binary_opening(mask, iterations=1)
+        mask = ndi.binary_closing(mask, iterations=max(2, int(min(mask.shape) * 0.012)))
+        mask = ndi.binary_fill_holes(mask)
+    return np.asarray(mask, bool)
+
+
+def _atlas_tissue_mask(atlas_tv: np.ndarray) -> np.ndarray:
+    try:
+        from . import matching
+
+        return matching.atlas_shape_mask(atlas_tv)
+    except Exception:
+        tv = np.nan_to_num(np.asarray(atlas_tv, dtype=float), nan=0.0)
+        return tv > 0
+
+
+def _midline_x(mask: np.ndarray) -> float | None:
+    """Estimate the coronal midline from a split tissue gap or bbox center."""
+    mask = np.asarray(mask, bool)
+    box = _bbox(mask)
+    if box is None:
+        return None
+    _r0, _r1, c0, c1 = box
+    cols = mask.sum(axis=0).astype(float)
+    lo = int(round(c0 + 0.32 * (c1 - c0)))
+    hi = int(round(c0 + 0.68 * (c1 - c0)))
+    if hi > lo + 2:
+        central = cols[lo:hi]
+        if central.size:
+            return float(lo + int(np.argmin(central)))
+    return float((c0 + c1 - 1) / 2.0)
+
+
+def _centroid(mask: np.ndarray) -> tuple[float, float] | None:
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
+        return None
+    return float(xs.mean()), float(ys.mean())
+
+
+def _transform_from_centers(
+    atlas_center: tuple[float, float],
+    hist_center: tuple[float, float],
+    sx: float,
+    sy: float,
+    angle_deg: float = 0.0,
+) -> np.ndarray:
+    ax, ay = atlas_center
+    hx, hy = hist_center
+    theta = np.deg2rad(float(angle_deg))
+    c, s = float(np.cos(theta)), float(np.sin(theta))
+    # Row-vector affine: [x y 1] @ T = [x' y' 1].
+    a = sx * c
+    b = sx * s
+    d = -sy * s
+    e = sy * c
+    tx = hx - (ax * a + ay * d)
+    ty = hy - (ax * b + ay * e)
+    return np.array([[a, b, 0.0], [d, e, 0.0], [tx, ty, 1.0]], dtype=np.float64)
+
+
+def _warp_mask(mask: np.ndarray, T: np.ndarray, out_shape: tuple[int, int]) -> np.ndarray:
+    if not np.isfinite(T).all():
+        return np.zeros(out_shape, dtype=bool)
+    try:
+        warped = warp_atlas(mask.astype(np.uint8), T, out_shape, nearest=True, use_cv2=_HAS_CV2)
+    except Exception:
+        warped = warp_atlas(mask.astype(np.uint8), T, out_shape, nearest=True, use_cv2=False)
+    return np.asarray(warped) > 0.5
+
+
+def _shape_score(
+    hist_mask: np.ndarray,
+    atlas_warped: np.ndarray,
+    *,
+    hist_edge: np.ndarray | None = None,
+    dist_to_hist_edge: np.ndarray | None = None,
+) -> float:
+    hist_mask = np.asarray(hist_mask, bool)
+    atlas_warped = np.asarray(atlas_warped, bool)
+    if not hist_mask.any() or not atlas_warped.any():
+        return 0.0
+    inter = np.logical_and(hist_mask, atlas_warped).sum()
+    hist_sum = max(1, int(hist_mask.sum()))
+    atlas_sum = max(1, int(atlas_warped.sum()))
+    observed_fit = float(inter / hist_sum)
+    atlas_precision = float(inter / atlas_sum)
+    dice = float(2.0 * inter / max(1, hist_sum + atlas_sum))
+
+    hist_edge = _edge_mask(hist_mask) if hist_edge is None else np.asarray(hist_edge, bool)
+    atlas_edge = _edge_mask(atlas_warped)
+    if hist_edge.any() and atlas_edge.any():
+        dist_to_hist = (
+            ndi.distance_transform_edt(~hist_edge)
+            if dist_to_hist_edge is None
+            else np.asarray(dist_to_hist_edge, dtype=np.float32)
+        )
+        dist_to_atlas = ndi.distance_transform_edt(~atlas_edge)
+        atlas_edge_fit = float(np.exp(-np.mean(np.clip(dist_to_hist[atlas_edge], 0, 20)) / 5.0))
+        hist_edge_fit = float(np.exp(-np.mean(np.clip(dist_to_atlas[hist_edge], 0, 20)) / 5.0))
+    else:
+        atlas_edge_fit = hist_edge_fit = 0.0
+
+    area_ratio = atlas_sum / hist_sum
+    area_penalty = min(abs(np.log(max(area_ratio, 1e-6))), 2.0)
+    return float(
+        0.34 * observed_fit
+        + 0.26 * atlas_edge_fit
+        + 0.18 * hist_edge_fit
+        + 0.14 * dice
+        + 0.08 * atlas_precision
+        - 0.05 * area_penalty
+    )
+
+
+def _shape_align_impl(histology_image: np.ndarray, atlas_tv: np.ndarray) -> tuple[np.ndarray, float]:
+    hist_mask_full = _histology_tissue_mask(histology_image)
+    atlas_mask_full = _atlas_tissue_mask(atlas_tv)
+    if hist_mask_full.ndim != 2 or atlas_mask_full.ndim != 2:
+        return resize_only_transform(hist_mask_full.shape, atlas_mask_full.shape), 0.0
+    if hist_mask_full.sum() < 64 or atlas_mask_full.sum() < 64:
+        return resize_only_transform(hist_mask_full.shape, atlas_mask_full.shape), 0.0
+
+    max_side = 320
+    hist_mask, hist_scale = _safe_scale(hist_mask_full, max_side)
+    atlas_mask, atlas_scale = _safe_scale(atlas_mask_full, max_side)
+    hbox = _bbox(hist_mask)
+    abox = _bbox(atlas_mask)
+    if hbox is None or abox is None:
+        return resize_only_transform(hist_mask_full.shape, atlas_mask_full.shape), 0.0
+
+    hr0, hr1, hc0, hc1 = hbox
+    ar0, ar1, ac0, ac1 = abox
+    hw, hh = max(1, hc1 - hc0), max(1, hr1 - hr0)
+    aw, ah = max(1, ac1 - ac0), max(1, ar1 - ar0)
+    hist_mid = _midline_x(hist_mask)
+    atlas_mid = _midline_x(atlas_mask)
+    hist_centroid = _centroid(hist_mask)
+    atlas_centroid = _centroid(atlas_mask)
+    hist_bbox_center = ((hc0 + hc1 - 1) / 2.0, (hr0 + hr1 - 1) / 2.0)
+    atlas_bbox_center = ((ac0 + ac1 - 1) / 2.0, (ar0 + ar1 - 1) / 2.0)
+    if hist_centroid is None:
+        hist_centroid = hist_bbox_center
+    if atlas_centroid is None:
+        atlas_centroid = atlas_bbox_center
+
+    hist_centers = [hist_bbox_center, hist_centroid]
+    if hist_mid is not None:
+        hist_centers.append((hist_mid, hist_bbox_center[1]))
+        hist_centers.append((hist_mid, hist_centroid[1]))
+    atlas_centers = [atlas_bbox_center, atlas_centroid]
+    if atlas_mid is not None:
+        atlas_centers.append((atlas_mid, atlas_bbox_center[1]))
+
+    width_scale = hw / aw
+    height_scale = hh / ah
+    if hist_mid is not None:
+        sym_half = max(abs(hist_mid - hc0), abs((hc1 - 1) - hist_mid))
+        sym_width_scale = max(1.0, 2.0 * sym_half) / aw
+    else:
+        sym_width_scale = width_scale
+    base_scales = [
+        (width_scale, height_scale),
+        (height_scale, height_scale),
+        (sym_width_scale, height_scale),
+        (np.sqrt(max(width_scale * height_scale, 1e-9)), np.sqrt(max(width_scale * height_scale, 1e-9))),
+    ]
+    scale_pairs: list[tuple[float, float]] = []
+    for sx, sy in base_scales:
+        for mult in (0.90, 1.0, 1.10):
+            sxm, sym = float(sx * mult), float(sy * mult)
+            if 0.05 <= sxm <= 20 and 0.05 <= sym <= 20:
+                scale_pairs.append((sxm, sym))
+
+    dy_step = max(4.0, hh * 0.06)
+    dx_step = max(4.0, hw * 0.06)
+    offsets = [
+        (0.0, 0.0),
+        (-dx_step, 0.0), (dx_step, 0.0), (0.0, -dy_step), (0.0, dy_step),
+        (-0.5 * dx_step, -0.5 * dy_step), (0.5 * dx_step, -0.5 * dy_step),
+        (-0.5 * dx_step, 0.5 * dy_step), (0.5 * dx_step, 0.5 * dy_step),
+    ]
+    angles = (-8.0, -4.0, 0.0, 4.0, 8.0)
+
+    candidates: list[np.ndarray] = []
+    seen: set[tuple[float, ...]] = set()
+    for ac in atlas_centers:
+        for hc in hist_centers:
+            for sx, sy in scale_pairs:
+                for angle in angles:
+                    for dx, dy in offsets:
+                        hcx = (hc[0] + dx, hc[1] + dy)
+                        T = _transform_from_centers(ac, hcx, sx, sy, angle)
+                        key = tuple(np.round(T.ravel(), 3))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        candidates.append(T)
+
+    if not candidates:
+        return resize_only_transform(hist_mask_full.shape, atlas_mask_full.shape), 0.0
+
+    keep = min(len(candidates), max(48, len(candidates) // 12))
+    ranked = acceleration.rank_affine_candidates(hist_mask, atlas_mask, candidates, keep=keep)
+    candidate_order = ranked if ranked is not None and len(candidates) > keep else list(range(len(candidates)))
+
+    best_T_small: np.ndarray | None = None
+    best_score = -np.inf
+    hist_edge = _edge_mask(hist_mask)
+    dist_to_hist_edge = ndi.distance_transform_edt(~hist_edge).astype(np.float32) if hist_edge.any() else None
+    for i in candidate_order:
+        T = candidates[i]
+        warped = _warp_mask(atlas_mask, T, hist_mask.shape)
+        score = _shape_score(hist_mask, warped, hist_edge=hist_edge, dist_to_hist_edge=dist_to_hist_edge)
+        if score > best_score:
+            best_score = score
+            best_T_small = T
+
+    if best_T_small is None or not np.isfinite(best_score):
+        return resize_only_transform(hist_mask_full.shape, atlas_mask_full.shape), 0.0
+
+    # Convert small-mask coordinates back to full-resolution atlas -> histology.
+    scale_atlas_to_small = np.diag([atlas_scale, atlas_scale, 1.0])
+    scale_hist_to_full = np.diag([1.0 / hist_scale, 1.0 / hist_scale, 1.0])
+    T_full = scale_atlas_to_small @ best_T_small @ scale_hist_to_full
+    if not np.isfinite(T_full).all():
+        return resize_only_transform(hist_mask_full.shape, atlas_mask_full.shape), 0.0
+    return T_full, float(best_score)
+
+
+def auto_align_shape(histology_image: np.ndarray, atlas_tv: np.ndarray) -> np.ndarray:
+    """Shape-constrained atlas->histology alignment.
+
+    This uses the filled tissue silhouette and atlas brain mask, so it remains
+    useful when sections are split, cropped, or have missing tissue. It is the
+    preferred initializer for automatic alignment; manual control points remain
+    the exact override.
+    """
+    T, _score = _shape_align_impl(histology_image, atlas_tv)
+    return T
+
+
 def auto_align(
     histology_gray: np.ndarray,
     atlas_tv: np.ndarray,
@@ -111,12 +403,13 @@ def auto_align(
 ) -> np.ndarray:
     """Intensity-based affine alignment of atlas template -> histology.
 
-    Port of ``align_auto_histology_atlas.m``: resize the atlas to roughly match
-    the histology, run a multi-resolution affine registration, and return the
-    full-resolution 3x3 ``T`` (atlas -> histology). Best effort; returns a pure
-    resize transform if registration cannot converge or OpenCV is missing.
+    The primary path is shape-constrained: estimate the histology tissue outline,
+    align the atlas brain mask to it, and return the full-resolution 3x3 ``T``.
+    The older ECC intensity registration is kept only as a fallback for slices
+    where a tissue outline cannot be extracted.
     """
-    hist = np.nan_to_num(np.asarray(histology_gray, dtype=np.float32))
+    hist_image = np.nan_to_num(np.asarray(histology_gray, dtype=np.float32))
+    hist = _as_gray(hist_image)
     atlas = np.nan_to_num(np.asarray(atlas_tv, dtype=np.float32))
     # Degenerate inputs (wrong rank, empty) can hard-crash the native ECC solver;
     # bail out to the identity rather than letting OpenCV abort the process.
@@ -131,6 +424,9 @@ def auto_align(
     if not np.isfinite(resize_factor) or resize_factor <= 0:
         return np.eye(3)
     scale_match = np.diag([resize_factor, resize_factor, 1.0])
+    shape_T, shape_score = _shape_align_impl(hist_image, atlas)
+    if shape_score > 0.25 and np.isfinite(shape_T).all():
+        return shape_T
 
     if not _HAS_CV2:
         return scale_match  # only the resize component
@@ -220,9 +516,25 @@ def auto_align_isolated(
 
     hist = np.nan_to_num(np.asarray(histology_gray, dtype=np.float32))
     atlas = np.nan_to_num(np.asarray(atlas_tv, dtype=np.float32))
-    if hist.ndim != 2 or atlas.ndim != 2 or hist.size == 0 or atlas.size == 0:
+    if hist.ndim not in (2, 3) or atlas.ndim != 2 or hist.size == 0 or atlas.size == 0:
         return np.eye(3), "auto-align skipped (unexpected slice shape); used identity."
-    fallback = resize_only_transform(hist.shape, atlas.shape)
+    fallback = resize_only_transform(hist.shape[:2], atlas.shape)
+
+    # The preferred shape-constrained path is pure Python/NumPy/Numba around
+    # small binary masks and avoids OpenCV ECC, the native solver this isolation
+    # wrapper was originally built to contain. Run it in-process so repeated GUI
+    # auto-aligns reuse the Numba cache instead of launching a fresh interpreter.
+    try:
+        shape_T, shape_score = _shape_align_impl(hist, atlas)
+        if shape_score >= AUTO_ALIGN_MIN_SHAPE_SCORE and np.isfinite(shape_T).all():
+            return shape_T, f"auto-aligned (accelerated shape; score {shape_score:.2f})."
+        if np.isfinite(shape_score):
+            return fallback, (
+                f"auto-align low confidence (shape score {shape_score:.2f}; "
+                f"needs >= {AUTO_ALIGN_MIN_SHAPE_SCORE:.2f}); transform not changed."
+            )
+    except Exception:
+        pass
 
     tmp = Path(tempfile.mkdtemp(prefix="npx_autoalign_"))
     try:
@@ -245,7 +557,7 @@ def auto_align_isolated(
         T = np.asarray(np.load(op), dtype=np.float64)
         if T.shape != (3, 3) or not np.isfinite(T).all():
             return fallback, "auto-align produced an invalid transform; used resize-only."
-        return T, "auto-aligned (isolated registration)."
+        return T, "auto-aligned (shape-constrained registration)."
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Sequence, Tuple
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -60,6 +61,45 @@ def list_raw_images(folder: str | Path) -> List[Path]:
 def list_saved_slices(folder: str | Path) -> List[Path]:
     """Natural-sorted saved slice images produced or accepted by the app."""
     return [p for p in list_raw_images(folder) if p.stem.lower().startswith("slice_")]
+
+
+def image_metadata_sidecar(path: str | Path) -> Path:
+    """Return the ZEN-style XML sidecar path for a raw exported image."""
+    path = Path(path)
+    return path.with_name(f"{path.name}_metadata.xml")
+
+
+def pixel_size_um(path: str | Path) -> float | None:
+    """Return image pixel size in micrometres from a ZEN metadata sidecar.
+
+    Zeiss/ZEN PNG exports store distances in metres under
+    ``Scaling/Items/Distance``. We average X/Y when both are present. ``None``
+    means no readable metadata was found.
+    """
+    sidecar = image_metadata_sidecar(path)
+    if not sidecar.exists():
+        return None
+    try:
+        root = ET.parse(str(sidecar)).getroot()
+    except Exception:
+        return None
+    values: list[float] = []
+    for distance in root.findall(".//Scaling/Items/Distance"):
+        ident = str(distance.attrib.get("Id", "")).upper()
+        if ident not in {"X", "Y"}:
+            continue
+        value_node = distance.find("Value")
+        if value_node is None or value_node.text is None:
+            continue
+        try:
+            metres = float(value_node.text.strip())
+        except ValueError:
+            continue
+        if np.isfinite(metres) and metres > 0:
+            values.append(metres * 1_000_000.0)
+    if not values:
+        return None
+    return float(np.mean(values))
 
 
 def _natsort(paths: Sequence[Path]) -> List[Path]:

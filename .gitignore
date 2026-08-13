@@ -29,6 +29,7 @@ neuropyguin_json/
 # Histology verification scratch screenshots
 tools/_verify_shots/
 tools/_postproc_shots/
+tools/_pytest_tmp/
 
 # Local development notes
 /postprocessing.md

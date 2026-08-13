@@ -29,7 +29,7 @@ import pyqtgraph as pg
 from ..side_nav import SideNavStack
 from ..workers import FunctionWorker
 from ..histology import atlas as hatlas
-from ..histology import io_formats, matching, tracing, alignment, slice_prep, ibl_launch
+from ..histology import acceleration, io_formats, matching, tracing, alignment, slice_prep, ibl_launch
 
 try:
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -66,12 +66,20 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         self.img.setOpts(axisOrder="row-major")
         self.view.addItem(self.img)
         self._overlays: List[pg.GraphicsObject] = []
+        self._has_image = False
         self.scene().sigMouseClicked.connect(self._on_click)
 
-    def set_image(self, arr: Optional[np.ndarray], levels=None) -> None:
+    def set_image(self, arr: Optional[np.ndarray], levels=None, *, preserve_view: bool = False) -> None:
         if arr is None:
             self.img.clear()
+            self._has_image = False
             return
+        old_range = None
+        if preserve_view and self._has_image:
+            try:
+                old_range = [list(axis) for axis in self.view.viewRange()]
+            except Exception:
+                old_range = None
         a = np.asarray(arr)
         if a.dtype.kind == "f":
             # pyqtgraph autoLevels on NaN/Inf data yields NaN levels, which can
@@ -83,8 +91,13 @@ class ImageCanvas(pg.GraphicsLayoutWidget):
         a = np.ascontiguousarray(a)
         _crumb(f"ImageCanvas.set_image setImage {a.shape} {a.dtype}")
         self.img.setImage(a, autoLevels=(levels is None), levels=levels)
-        _crumb("ImageCanvas.set_image autoRange")
-        self.view.autoRange()
+        self._has_image = True
+        if old_range is not None:
+            _crumb("ImageCanvas.set_image restoreRange")
+            self.view.setRange(xRange=old_range[0], yRange=old_range[1], padding=0)
+        else:
+            _crumb("ImageCanvas.set_image autoRange")
+            self.view.autoRange()
         _crumb("ImageCanvas.set_image done")
 
     def image_item(self) -> pg.ImageItem:
@@ -222,6 +235,10 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
 
         self.figure.clear()
         shell_polygons = self._brain_shell_polygons(atlas) if atlas is not None else []
+        region_polygons = (
+            self._build_probe_region_polygons(atlas, self._last_probes)
+            if atlas is not None else []
+        )
         self._draw_scene(
             self.figure,
             atlas,
@@ -229,6 +246,7 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
             self._plot_theme,
             azim=-58.0,
             shell_polygons=shell_polygons,
+            region_polygons=region_polygons,
         )
         self.canvas.draw_idle()
 
@@ -255,6 +273,7 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         frames = max(int(frames), 2)
         fps = max(int(fps), 1)
         shell_polygons = cls._build_brain_shell_polygons(atlas) if atlas is not None else []
+        region_polygons = cls._build_probe_region_polygons(atlas, probes) if atlas is not None else []
 
         fig = Figure(figsize=(5.6, 5.2), dpi=100)
         fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
@@ -269,6 +288,7 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                 theme,
                 azim=float(azim),
                 shell_polygons=shell_polygons,
+                region_polygons=region_polygons,
             )
             canvas.draw()
             rgba = np.asarray(canvas.buffer_rgba()).copy()
@@ -294,6 +314,7 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
         theme: str,
         azim: float,
         shell_polygons: Optional[List[np.ndarray]] = None,
+        region_polygons: Optional[List[Tuple[List[np.ndarray], Tuple[float, float, float]]]] = None,
     ) -> None:
         bg, fg, shell = cls._theme_colors_for(theme)
         figure.patch.set_facecolor(bg)
@@ -308,6 +329,7 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                 else cls._build_brain_shell_polygons(atlas)
             )
             plotted_anything = cls._draw_brain_shell(ax, polygons, shell, theme)
+            cls._draw_region_highlights(ax, region_polygons or [])
             cls._set_atlas_limits(ax, atlas)
 
         plotted_probe = False
@@ -321,35 +343,35 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
             if region_segments:
                 for seg_start, seg_end, seg_color in region_segments:
                     seg_xyz = cls._ccf_to_plot_mm(np.vstack([seg_start, seg_end]))
-                    mesh = cls._tube_mesh(seg_xyz[0], seg_xyz[1], radius_mm=0.075)
+                    mesh = cls._tube_mesh(seg_xyz[0], seg_xyz[1], radius_mm=0.22, sides=20)
                     if mesh is None:
                         continue
                     ax.plot_surface(
                         mesh[0], mesh[1], mesh[2],
                         color=seg_color,
-                        alpha=0.86,
+                        alpha=0.56,
                         linewidth=0,
-                        antialiased=False,
-                        shade=False,
+                        antialiased=True,
+                        shade=True,
                     )
-            else:
-                mesh = cls._tube_mesh(xyz[0], xyz[-1], radius_mm=0.065)
-                if mesh is not None:
-                    ax.plot_surface(
-                        mesh[0], mesh[1], mesh[2],
-                        color=color,
-                        alpha=0.62,
-                        linewidth=0,
-                        antialiased=False,
-                        shade=False,
-                    )
+            core_mesh = cls._tube_mesh(xyz[0], xyz[-1], radius_mm=0.065, sides=16)
+            if core_mesh is not None:
+                ax.plot_surface(
+                    core_mesh[0], core_mesh[1], core_mesh[2],
+                    color=color,
+                    alpha=0.96,
+                    linewidth=0,
+                    antialiased=True,
+                    shade=True,
+                )
             ax.plot(
                 xyz[:, 0], xyz[:, 1], xyz[:, 2],
-                color=color, linewidth=0.95, alpha=0.96,
+                color="#7f0000", linewidth=1.1, alpha=0.98,
             )
             ax.scatter(
                 xyz[:, 0], xyz[:, 1], xyz[:, 2],
-                color=[color], s=18, depthshade=False,
+                color=[color], s=24, depthshade=False,
+                edgecolors="#fff0f0", linewidths=0.45,
             )
             ax.text(
                 xyz[0, 0], xyz[0, 1], xyz[0, 2],
@@ -369,7 +391,7 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                 transform=ax.transAxes, ha="center", va="center", color=fg, fontsize=9,
             )
 
-        ax.view_init(elev=18, azim=azim)
+        ax.view_init(elev=22, azim=azim)
         ax.set_axis_off()
         try:
             ax.set_box_aspect((1.0, 1.15, 0.82))
@@ -388,14 +410,12 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
     @staticmethod
     def _brain_shell_style_for(theme: str) -> Tuple[str, str, float, float, float]:
         if str(theme).lower().startswith("dark"):
-            return "#314253", "#d9e6f2", 0.10, 0.56, 0.62
-        return "#d3dbe5", "#425466", 0.11, 0.72, 0.58
+            return "#aab7c2", "#dce7f0", 0.045, 0.26, 0.36
+        return "#d9dee3", "#66717c", 0.055, 0.22, 0.32
 
     @staticmethod
     def _probe_rgb(index: int) -> Tuple[float, float, float]:
-        colors = tracing.probe_colormap(index + 1)
-        rgb = colors[index % len(colors)]
-        return float(rgb[0]), float(rgb[1]), float(rgb[2])
+        return 0.86, 0.05, 0.04
 
     @staticmethod
     def _probe_coords(probe: dict) -> np.ndarray:
@@ -457,6 +477,137 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                 solid_capstyle="round",
             )
         return True
+
+    @classmethod
+    def _draw_region_highlights(
+        cls,
+        ax,
+        region_polygons: List[Tuple[List[np.ndarray], Tuple[float, float, float]]],
+    ) -> bool:
+        if not region_polygons:
+            return False
+        try:
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        except Exception:
+            return False
+        drew = False
+        for polygons, color in region_polygons:
+            xyz_polygons = [
+                cls._ccf_to_plot_mm(poly)
+                for poly in polygons
+                if np.asarray(poly).ndim == 2 and np.asarray(poly).shape[0] >= 3
+            ]
+            if not xyz_polygons:
+                continue
+            coll = Poly3DCollection(
+                xyz_polygons,
+                facecolors=color,
+                edgecolors=color,
+                linewidths=0.25,
+                alpha=0.22,
+                zsort="average",
+            )
+            coll.set_antialiased(True)
+            ax.add_collection3d(coll)
+            drew = True
+        return drew
+
+    @classmethod
+    def _atlas_row_values_for_region_id(cls, atlas: hatlas.AllenCCFAtlas, region_id) -> np.ndarray:
+        try:
+            rid = int(float(region_id))
+        except (TypeError, ValueError):
+            return np.zeros(0, dtype=int)
+        st = getattr(atlas, "structure_tree", None)
+        if st is None or "id" not in st:
+            return np.zeros(0, dtype=int)
+        ids = st["id"].astype(int).to_numpy()
+        mask = ids == rid
+        if "structure_id_path" in st:
+            token = f"/{rid}/"
+            paths = st["structure_id_path"].astype(str)
+            mask = mask | paths.str.contains(token, regex=False).to_numpy()
+        rows = np.flatnonzero(mask)
+        return (rows + 1).astype(int)
+
+    @classmethod
+    def _build_probe_region_polygons(
+        cls,
+        atlas: Optional[hatlas.AllenCCFAtlas],
+        probes,
+        *,
+        max_regions: int = 7,
+        step: int = 18,
+    ) -> List[Tuple[List[np.ndarray], Tuple[float, float, float]]]:
+        if atlas is None or getattr(atlas, "av", None) is None:
+            return []
+        weighted: dict[int, dict] = {}
+        for probe in probes or []:
+            for row in cls._trajectory_area_rows(probe.get("trajectory_areas")):
+                try:
+                    rid = int(float(row.get("region_id")))
+                    d0 = float(row.get("depth_start_um"))
+                    d1 = float(row.get("depth_end_um"))
+                except (TypeError, ValueError):
+                    continue
+                if rid <= 0 or not np.isfinite(d0) or not np.isfinite(d1) or d1 <= d0:
+                    continue
+                item = weighted.setdefault(rid, {
+                    "span": 0.0,
+                    "color": cls._hex_to_rgb(row.get("color_hex_triplet"), (0.4, 0.7, 0.55)),
+                })
+                item["span"] += float(d1 - d0)
+        if not weighted:
+            return []
+
+        ranked = sorted(weighted.items(), key=lambda item: item[1]["span"], reverse=True)[:max_regions]
+        step = max(8, int(step))
+        av_small = np.asarray(atlas.av[::step, ::step, ::step])
+        out: List[Tuple[List[np.ndarray], Tuple[float, float, float]]] = []
+
+        for rid, meta in ranked:
+            row_values = cls._atlas_row_values_for_region_id(atlas, rid)
+            if row_values.size == 0:
+                continue
+            mask = np.isin(av_small, row_values)
+            if int(mask.sum()) < 8:
+                continue
+            polygons: List[np.ndarray] = []
+            present_ap = np.flatnonzero(mask.any(axis=(1, 2)))
+            present_ml = np.flatnonzero(mask.any(axis=(0, 1)))
+            present_dv = np.flatnonzero(mask.any(axis=(0, 2)))
+
+            def selected(values: np.ndarray, count: int) -> np.ndarray:
+                if values.size == 0:
+                    return values
+                if values.size <= count:
+                    return values
+                return values[np.unique(np.linspace(0, values.size - 1, count, dtype=int))]
+
+            for ap_i in selected(present_ap, 7):
+                for y, x in cls._contour_lines(mask[int(ap_i), :, :], max_points=86):
+                    polygons.append(np.column_stack([
+                        np.full(y.shape, int(ap_i) * step + 1.0),
+                        y * step + 1.0,
+                        x * step + 1.0,
+                    ]))
+            for ml_i in selected(present_ml, 4):
+                for y, x in cls._contour_lines(mask[:, :, int(ml_i)], max_points=72):
+                    polygons.append(np.column_stack([
+                        y * step + 1.0,
+                        x * step + 1.0,
+                        np.full(y.shape, int(ml_i) * step + 1.0),
+                    ]))
+            for dv_i in selected(present_dv, 3):
+                for y, x in cls._contour_lines(mask[:, int(dv_i), :], max_points=72):
+                    polygons.append(np.column_stack([
+                        y * step + 1.0,
+                        np.full(y.shape, int(dv_i) * step + 1.0),
+                        x * step + 1.0,
+                    ]))
+            if polygons:
+                out.append((polygons, meta["color"]))
+        return out
 
     @staticmethod
     def _tube_mesh(
@@ -529,11 +680,17 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                 rows.append({
                     "depth_start_um": d0,
                     "depth_end_um": d1,
+                    "acronym": row.get("acronym", ""),
+                    "region_id": row.get("id", row.get("region_id", "")),
                     "color_hex_triplet": row.get("color_hex_triplet", ""),
                 })
             return rows
         if isinstance(areas, dict):
             colors = cls._flatten_field(areas.get("color_hex_triplet"))
+            acronyms = cls._flatten_field(areas.get("acronym"))
+            region_ids = cls._flatten_field(areas.get("id"))
+            if not region_ids:
+                region_ids = cls._flatten_field(areas.get("region_id"))
             if "depth_start_um" in areas and "depth_end_um" in areas:
                 starts = np.asarray(areas.get("depth_start_um"), dtype=float).reshape(-1)
                 ends = np.asarray(areas.get("depth_end_um"), dtype=float).reshape(-1)
@@ -542,6 +699,8 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                     rows.append({
                         "depth_start_um": starts[j],
                         "depth_end_um": ends[j],
+                        "acronym": acronyms[j] if j < len(acronyms) else "",
+                        "region_id": region_ids[j] if j < len(region_ids) else "",
                         "color_hex_triplet": colors[j] if j < len(colors) else "",
                     })
                 return rows
@@ -552,6 +711,8 @@ class Trajectory3DCanvas(QtWidgets.QWidget):
                     rows.append({
                         "depth_start_um": d0,
                         "depth_end_um": d1,
+                        "acronym": acronyms[j] if j < len(acronyms) else "",
+                        "region_id": region_ids[j] if j < len(region_ids) else "",
                         "color_hex_triplet": colors[j] if j < len(colors) else "",
                     })
         return rows
@@ -713,6 +874,9 @@ class HistologyTab(QtWidgets.QWidget):
 
     #: Emitted from worker threads so log lines reach the GUI thread safely.
     log_requested = QtCore.Signal(str)
+    _SELECTION_PATH_ROLE = QtCore.Qt.UserRole
+    _SELECTION_SELECTED_ROLE = QtCore.Qt.UserRole + 1
+    _SELECTION_PIXMAP_ROLE = QtCore.Qt.UserRole + 2
 
     def __init__(self, thread_pool: QtCore.QThreadPool) -> None:
         super().__init__()
@@ -722,7 +886,7 @@ class HistologyTab(QtWidgets.QWidget):
         # instant probe_ccf build "Building..." forever. A dedicated pool keeps
         # histology responsive regardless of what other tabs are running.
         self.pool = QtCore.QThreadPool(self)
-        self.pool.setMaxThreadCount(4)
+        self.pool.setMaxThreadCount(max(2, min(4, acceleration.auto_worker_count())))
         self._shared_pool = thread_pool
         self.settings = QtCore.QSettings("NeuroPyGuiN", "NeuroPyGuiN")
         self._busy_count = 0
@@ -731,13 +895,29 @@ class HistologyTab(QtWidgets.QWidget):
         # Pipeline state
         self.folder: Optional[Path] = None
         self.atlas: Optional[hatlas.AllenCCFAtlas] = None
+        self.raw_image_paths: List[Path] = []
+        self.selected_raw_paths: List[Path] = []
+        self.validated_raw_paths: List[Path] = []
+        self._selection_grid_updating = False
+        self._selection_preview_image: Optional[np.ndarray] = None
         self.slice_images: List[np.ndarray] = []
+        self.slice_pixel_um: List[Optional[float]] = []
         self.histology_ccf: List[Dict[str, np.ndarray]] = []
         self.tforms: List[np.ndarray] = []
         self.slice_specs: List[Optional[Dict[str, np.ndarray]]] = []
         self.probe_points: Dict[Tuple[int, int], np.ndarray] = {}
         self._cur_match_slice = 0
-        self._match_hist_levels_by_slice: Dict[int, Tuple[float, float]] = {}
+        self._hist_levels_by_stage: Dict[str, Dict[int, Tuple[float, float]]] = {
+            "select": {},
+            "preproc": {},
+            "match": {},
+            "align": {},
+            "trace": {},
+        }
+        self._histogram_widgets: Dict[str, pg.HistogramLUTWidget] = {}
+        self._histogram_canvases: Dict[str, ImageCanvas] = {}
+        self._updating_histogram_stage: Optional[str] = None
+        self._match_hist_levels_by_slice = self._hist_levels_by_stage["match"]
         self._updating_match_histogram = False
         self._cur_align_slice = 0
         self._cur_trace_slice = 0
@@ -756,6 +936,7 @@ class HistologyTab(QtWidgets.QWidget):
         self._build_ui()
         self._restore_settings()
         self.log_requested.connect(self._log)  # queued: safe to emit from workers
+        self._log(f"Histology acceleration: {acceleration.hardware_summary()}")
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -769,6 +950,7 @@ class HistologyTab(QtWidgets.QWidget):
         main.addWidget(self.nav, 1)
 
         self._page_setup = self.nav.add_page("Setup", self._build_setup_page())
+        self._page_select_images = self.nav.add_page("Select images", self._build_image_selection_page())
         self._page_preprocess = self.nav.add_page("Preprocess", self._build_preprocess_page())
         self._page_match = self.nav.add_page("Match atlas", self._build_match_page())
         self._page_align = self.nav.add_page("Align", self._build_align_page())
@@ -790,6 +972,8 @@ class HistologyTab(QtWidgets.QWidget):
         """Refresh lazily-rendered pages whenever the user navigates to them."""
         if index == getattr(self, "_page_preprocess", -1):
             self._preproc_show()
+        elif index == getattr(self, "_page_select_images", -1):
+            self._selection_refresh()
         elif index == getattr(self, "_page_match", -1):
             self._match_show()
         elif index == getattr(self, "_page_align", -1):
@@ -812,6 +996,150 @@ class HistologyTab(QtWidgets.QWidget):
             v.addWidget(h)
         return page, v
 
+    @staticmethod
+    def _workflow_steps_text() -> str:
+        return (
+            "Order: 1 Setup paths -> 2 Select images -> 3 Preprocess/save slices -> "
+            "4 Match atlas -> 5 Align -> 6 Trace probes -> 7 Channel map -> "
+            "8 optional IBL refine/finalize"
+        )
+
+    def _histology_contrast_pane(self, stage: str, canvas: ImageCanvas) -> QtWidgets.QWidget:
+        """Wrap a histology image canvas with a reusable intensity histogram control."""
+        histogram = pg.HistogramLUTWidget()
+        histogram.setMinimumWidth(96)
+        histogram.setMaximumWidth(150)
+        histogram.item.gradient.hide()
+        histogram.setImageItem(canvas.image_item())
+        histogram.item.sigLevelsChanged.connect(lambda: self._histology_levels_changed(stage))
+        self._histogram_widgets[stage] = histogram
+        self._histogram_canvases[stage] = canvas
+        if stage == "match":
+            self.hist_match_histogram = histogram
+
+        b_reset = QtWidgets.QPushButton("Auto")
+        b_reset.setProperty("role", "secondary")
+        b_reset.setToolTip("Reset histology image contrast to automatic levels.")
+        b_reset.clicked.connect(lambda: self._reset_histology_levels(stage))
+
+        pane = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(pane)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(canvas, 1)
+        controls = QtWidgets.QVBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(6)
+        controls.addWidget(histogram, 1)
+        controls.addWidget(b_reset, 0)
+        layout.addLayout(controls, 0)
+        return pane
+
+    def _current_histology_slice_index(self, stage: str) -> int:
+        if stage == "select":
+            row = self.lst_raw_images.currentRow() if hasattr(self, "lst_raw_images") else 0
+            return max(0, int(row))
+        if stage == "preproc":
+            return int(getattr(self, "_cur_preproc", 0))
+        if stage == "align":
+            return int(self._cur_align_slice)
+        if stage == "trace":
+            return int(self._cur_trace_slice)
+        return int(self._cur_match_slice)
+
+    def _show_histology_slice(
+        self,
+        stage: str,
+        canvas: ImageCanvas,
+        idx: int,
+        image: np.ndarray,
+        *,
+        preserve_view: bool = False,
+    ) -> None:
+        """Display a histology slice and apply the stage-specific contrast memory."""
+        canvas.set_image(image, preserve_view=preserve_view)
+        level_key = 0 if stage == "select" else idx
+        levels = self._hist_levels_by_stage.setdefault(stage, {}).get(level_key)
+        if levels is None:
+            self._reset_histology_levels(stage, idx=level_key, remember=True)
+        else:
+            self._apply_histology_levels(stage, levels[0], levels[1])
+
+    def _histology_levels_changed(self, stage: str) -> None:
+        """Remember manually adjusted contrast levels for the active slice."""
+        if self._updating_histogram_stage == stage or self._updating_match_histogram:
+            return
+        n_images = len(self.raw_image_paths) if stage == "select" else len(self.slice_images)
+        if n_images <= 0:
+            return
+        idx = 0 if stage == "select" else min(self._current_histology_slice_index(stage), n_images - 1)
+        widget = self._histogram_widgets.get(stage)
+        if widget is None:
+            return
+        try:
+            lo, hi = widget.item.getLevels()
+        except Exception:
+            return
+        self._hist_levels_by_stage.setdefault(stage, {})[idx] = (float(lo), float(hi))
+
+    def _apply_histology_levels(self, stage: str, lo: float, hi: float) -> None:
+        """Apply contrast levels to the image and its linked histogram widget."""
+        widget = self._histogram_widgets.get(stage)
+        canvas = self._histogram_canvases.get(stage)
+        if widget is None or canvas is None:
+            return
+        self._updating_histogram_stage = stage
+        if stage == "match":
+            self._updating_match_histogram = True
+        try:
+            canvas.image_item().setLevels((float(lo), float(hi)))
+            widget.setLevels(float(lo), float(hi))
+        finally:
+            if stage == "match":
+                self._updating_match_histogram = False
+            self._updating_histogram_stage = None
+
+    def _reset_histology_levels(
+        self,
+        stage: str,
+        *,
+        idx: Optional[int] = None,
+        remember: bool = True,
+    ) -> None:
+        """Reset the selected histology contrast control to robust image percentiles."""
+        if stage == "select":
+            if self._selection_preview_image is None or not self.raw_image_paths:
+                return
+            n_images = len(self.raw_image_paths)
+            idx = 0
+            arr = np.asarray(self._selection_preview_image)
+        else:
+            if not self.slice_images:
+                return
+            n_images = len(self.slice_images)
+            idx = min(self._current_histology_slice_index(stage) if idx is None else idx, n_images - 1)
+            arr = np.asarray(self.slice_images[idx])
+        if arr.size == 0:
+            return
+        if arr.ndim == 3:
+            values = arr[..., :3].astype(float).mean(axis=2)
+        else:
+            values = arr.astype(float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return
+        lo, hi = np.percentile(values, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = float(values.min()), float(values.max())
+        if hi <= lo:
+            hi = lo + 1.0
+        try:
+            self._apply_histology_levels(stage, float(lo), float(hi))
+            if remember:
+                self._hist_levels_by_stage.setdefault(stage, {})[idx] = (float(lo), float(hi))
+        except Exception as exc:
+            self._log(f"Could not reset histology contrast: {exc}")
+
     # ---- Setup page ----
     def _build_setup_page(self) -> QtWidgets.QWidget:
         page, v = self._section(
@@ -829,6 +1157,7 @@ class HistologyTab(QtWidgets.QWidget):
         form.addRow("Histology folder", self._with_button(self.ed_folder, b_folder))
 
         self.ed_raw = QtWidgets.QLineEdit()
+        self.ed_raw.editingFinished.connect(self._selection_refresh)
         b_raw = QtWidgets.QPushButton("Browse...")
         b_raw.clicked.connect(lambda: self._pick_into(self.ed_raw, "Raw image folder"))
         form.addRow("Raw images", self._with_button(self.ed_raw, b_raw))
@@ -856,6 +1185,11 @@ class HistologyTab(QtWidgets.QWidget):
 
         v.addLayout(form)
 
+        order = QtWidgets.QLabel(self._workflow_steps_text())
+        order.setObjectName("SectionHint")
+        order.setWordWrap(True)
+        v.addWidget(order)
+
         row = QtWidgets.QHBoxLayout()
         b_load = QtWidgets.QPushButton("Load session")
         b_load.clicked.connect(self._load_session)
@@ -873,12 +1207,73 @@ class HistologyTab(QtWidgets.QWidget):
         v.addStretch(1)
         return page
 
+    # ---- Image selection page ----
+    def _build_image_selection_page(self) -> QtWidgets.QWidget:
+        page, v = self._section(
+            "Select raw images",
+            "Choose which raw TIFF/PNG images should enter preprocessing. Stamped images "
+            "are loaded and carried forward; unmarked images are ignored.",
+        )
+        order = QtWidgets.QLabel(self._workflow_steps_text())
+        order.setObjectName("SectionHint")
+        order.setWordWrap(True)
+        v.addWidget(order)
+
+        row = QtWidgets.QHBoxLayout()
+        b_refresh = QtWidgets.QPushButton("Refresh raw folder")
+        b_refresh.clicked.connect(self._selection_refresh)
+        b_all = QtWidgets.QPushButton("Select all")
+        b_all.clicked.connect(lambda: self._selection_set_all(True))
+        b_none = QtWidgets.QPushButton("Select none")
+        b_none.clicked.connect(lambda: self._selection_set_all(False))
+        b_invert = QtWidgets.QPushButton("Invert")
+        b_invert.clicked.connect(self._selection_invert)
+        b_validate = QtWidgets.QPushButton("Validate selection")
+        b_validate.setProperty("role", "primary")
+        b_validate.setToolTip("Commit the selected raw images and load exactly that list into Preprocess.")
+        b_validate.clicked.connect(self._selection_validate)
+        for b in (b_refresh, b_all, b_none, b_invert, b_validate):
+            row.addWidget(b)
+        row.addStretch(1)
+        self.lbl_image_selection = QtWidgets.QLabel("No raw folder loaded.")
+        self.lbl_image_selection.setObjectName("SectionHint")
+        row.addWidget(self.lbl_image_selection)
+        v.addLayout(row)
+
+        self.lst_raw_images = QtWidgets.QListWidget()
+        self.lst_raw_images.setViewMode(QtWidgets.QListView.IconMode)
+        self.lst_raw_images.setResizeMode(QtWidgets.QListView.Adjust)
+        self.lst_raw_images.setMovement(QtWidgets.QListView.Static)
+        self.lst_raw_images.setIconSize(QtCore.QSize(150, 110))
+        self.lst_raw_images.setGridSize(QtCore.QSize(178, 150))
+        self.lst_raw_images.setUniformItemSizes(True)
+        self.lst_raw_images.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.lst_raw_images.itemClicked.connect(self._selection_toggle_item)
+
+        self.canvas_select_raw = ImageCanvas()
+        self.lbl_select_preview = QtWidgets.QLabel("No raw image preview.")
+        self.lbl_select_preview.setObjectName("SectionHint")
+        self.lbl_select_preview.setAlignment(QtCore.Qt.AlignCenter)
+        preview = QtWidgets.QWidget()
+        preview_layout = QtWidgets.QVBoxLayout(preview)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(8)
+        preview_layout.addWidget(self._histology_contrast_pane("select", self.canvas_select_raw), 1)
+        preview_layout.addWidget(self.lbl_select_preview, 0)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.addWidget(self.lst_raw_images)
+        split.addWidget(self._titled("Raw image preview", preview))
+        split.setSizes([720, 520])
+        v.addWidget(split, 1)
+        return page
+
     # ---- Preprocess page ----
     def _build_preprocess_page(self) -> QtWidgets.QWidget:
         page, v = self._section(
             "Slice preprocessing",
-            "Load raw TIFF/PNG images, optionally downsample, then save individual slice "
-            "images. Use the reorient buttons to fix rotation/flip/order.",
+            "Load the selected raw TIFF/PNG images, optionally downsample, then save "
+            "individual slice images. Use the reorient buttons to fix rotation/flip/order.",
         )
         ctl = QtWidgets.QHBoxLayout()
         self.sp_downsample = QtWidgets.QDoubleSpinBox()
@@ -888,7 +1283,7 @@ class HistologyTab(QtWidgets.QWidget):
         ctl.addWidget(QtWidgets.QLabel("Downsample"))
         ctl.addWidget(self.sp_downsample)
         b_loadimg = QtWidgets.QPushButton("Load raw images")
-        b_loadimg.clicked.connect(self._preproc_load)
+        b_loadimg.clicked.connect(lambda: self._preproc_load())
         ctl.addWidget(b_loadimg)
         b_save_slices = QtWidgets.QPushButton("Save slices")
         b_save_slices.clicked.connect(self._preproc_save)
@@ -917,7 +1312,7 @@ class HistologyTab(QtWidgets.QWidget):
         v.addLayout(nav)
 
         self.canvas_preproc = ImageCanvas()
-        v.addWidget(self.canvas_preproc, 1)
+        v.addWidget(self._histology_contrast_pane("preproc", self.canvas_preproc), 1)
         return page
 
     # ---- Match page ----
@@ -930,28 +1325,7 @@ class HistologyTab(QtWidgets.QWidget):
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.canvas_match_hist = ImageCanvas()
         self.canvas_match_atlas = ImageCanvas()
-        self.hist_match_histogram = pg.HistogramLUTWidget()
-        self.hist_match_histogram.setMinimumWidth(96)
-        self.hist_match_histogram.setMaximumWidth(150)
-        self.hist_match_histogram.item.gradient.hide()
-        self.hist_match_histogram.setImageItem(self.canvas_match_hist.image_item())
-        self.hist_match_histogram.item.sigLevelsChanged.connect(self._match_histogram_levels_changed)
-        b_reset_hist = QtWidgets.QPushButton("Auto")
-        b_reset_hist.setProperty("role", "secondary")
-        b_reset_hist.setToolTip("Reset histology image contrast to automatic levels.")
-        b_reset_hist.clicked.connect(self._match_reset_histogram)
-        hist_pane = QtWidgets.QWidget()
-        hist_layout = QtWidgets.QHBoxLayout(hist_pane)
-        hist_layout.setContentsMargins(0, 0, 0, 0)
-        hist_layout.setSpacing(8)
-        hist_layout.addWidget(self.canvas_match_hist, 1)
-        hist_ctl = QtWidgets.QVBoxLayout()
-        hist_ctl.setContentsMargins(0, 0, 0, 0)
-        hist_ctl.setSpacing(6)
-        hist_ctl.addWidget(self.hist_match_histogram, 1)
-        hist_ctl.addWidget(b_reset_hist, 0)
-        hist_layout.addLayout(hist_ctl, 0)
-        split.addWidget(self._titled("Histology", hist_pane))
+        split.addWidget(self._titled("Histology", self._histology_contrast_pane("match", self.canvas_match_hist)))
         split.addWidget(self._titled("Atlas plane", self.canvas_match_atlas))
         v.addWidget(split, 1)
 
@@ -962,11 +1336,11 @@ class HistologyTab(QtWidgets.QWidget):
         b_next.clicked.connect(lambda: self._match_step(1))
         b_auto_match = QtWidgets.QPushButton("Auto match")
         b_auto_match.setProperty("role", "secondary")
-        b_auto_match.setToolTip("Estimate the best AP plane from the current histology slice shape.")
+        b_auto_match.setToolTip("Estimate the best AP plane near the current AP slider from tissue shape and signal.")
         b_auto_match.clicked.connect(self._match_auto)
         self.ck_match_auto_adjust = QtWidgets.QCheckBox("Auto-adjust histology")
         self.ck_match_auto_adjust.setToolTip(
-            "After Auto match, assign the plane and run the isolated intensity auto-align "
+            "After Auto match, assign the plane and run accelerated shape auto-align "
             "for this slice, then autosave progress."
         )
         ctl.addWidget(b_prev)
@@ -1043,7 +1417,7 @@ class HistologyTab(QtWidgets.QWidget):
         self.canvas_align_atlas = ImageCanvas()
         self.canvas_align_hist.clicked.connect(self._align_click_hist)
         self.canvas_align_atlas.clicked.connect(self._align_click_atlas)
-        split.addWidget(self._titled("Histology (click landmarks)", self.canvas_align_hist))
+        split.addWidget(self._titled("Histology (click landmarks)", self._histology_contrast_pane("align", self.canvas_align_hist)))
         split.addWidget(self._titled("Atlas (click landmarks)", self.canvas_align_atlas))
         v.addWidget(split, 1)
 
@@ -1078,7 +1452,7 @@ class HistologyTab(QtWidgets.QWidget):
         body = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.canvas_trace = ImageCanvas()
         self.canvas_trace.clicked.connect(self._trace_click)
-        body.addWidget(self._titled("Histology probe line", self.canvas_trace))
+        body.addWidget(self._titled("Histology probe line", self._histology_contrast_pane("trace", self.canvas_trace)))
 
         trajectory_panel = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.trace_areas = pg.GraphicsLayoutWidget()
@@ -1141,39 +1515,40 @@ class HistologyTab(QtWidgets.QWidget):
     def _build_channels_page(self) -> QtWidgets.QWidget:
         page, v = self._section(
             "Per-channel region map",
-            "Generate xyz_picks and the channel region map directly from the probe "
-            "tracks (AP_histology is enough). ALF extraction is optional and only "
-            "needed if the ephys files are not present yet.",
+            "Prepare the ALF, xyz_picks, RMS/QC maps, and per-channel regions for "
+            "the IBL Electrophysiology Atlas in one numbered workflow.",
         )
-        self.ck_extract = QtWidgets.QCheckBox("Run ALF extraction first (needs Kilosort + ephys folders)")
-        v.addWidget(self.ck_extract)
-        self.ck_rms = QtWidgets.QCheckBox(
-            "Also compute RMS/QC map (slow: streams the whole raw binary; only for IBL GUI)")
-        v.addWidget(self.ck_rms)
+        order = QtWidgets.QLabel(
+            "1 Prepare for IBL -> 2 Review unit distribution -> 3 Propose alignment -> "
+            "4 Refine in IBL GUI -> 5 Finalize regions."
+        )
+        order.setObjectName("SectionHint")
+        order.setWordWrap(True)
+        v.addWidget(order)
         self.cb_alignment = QtWidgets.QComboBox()
         self.cb_alignment.addItems(["original", "latest"])
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Alignment source"))
+        row.addWidget(QtWidgets.QLabel("5 Finalize alignment source"))
         row.addWidget(self.cb_alignment)
         row.addStretch(1)
         v.addLayout(row)
 
         btns = QtWidgets.QHBoxLayout()
-        b_xyz = QtWidgets.QPushButton("Generate xyz_picks")
-        b_xyz.clicked.connect(self._gen_xyz)
-        b_ch = QtWidgets.QPushButton("Generate channel map")
-        b_ch.clicked.connect(self._gen_channels)
-        b_all = QtWidgets.QPushButton("Run all (extract -> xyz -> channels)")
-        b_all.clicked.connect(self._gen_all)
-        b_units = QtWidgets.QPushButton("Plot unit distribution")
+        b_prepare = QtWidgets.QPushButton("1 Prepare for IBL")
+        b_prepare.setToolTip(
+            "Run fast ALF extraction, RMS/QC map extraction, xyz_picks generation, "
+            "and the initial channel map. Needs Kilosort, ephys, and probe_ccf.mat."
+        )
+        b_prepare.clicked.connect(self._prepare_for_ibl)
+        b_units = QtWidgets.QPushButton("2 Plot unit distribution")
         b_units.clicked.connect(self._plot_unit_distribution)
-        b_prop = QtWidgets.QPushButton("Propose alignment (auto)")
+        b_prop = QtWidgets.QPushButton("3 Propose alignment (auto)")
         b_prop.clicked.connect(self._propose_alignment)
-        b_final = QtWidgets.QPushButton("Finalize regions (IBL alignment)")
+        b_final = QtWidgets.QPushButton("5 Finalize regions")
         b_final.setToolTip("Regenerate channel_locations_shankN.json from the latest "
                            "alignment you saved in the IBL GUI (per shank).")
         b_final.clicked.connect(self._finalize_channels)
-        for b in [b_xyz, b_ch, b_all, b_units, b_prop, b_final]:
+        for b in [b_prepare, b_units, b_prop, b_final]:
             btns.addWidget(b)
         btns.addStretch(1)
         v.addLayout(btns)
@@ -1199,9 +1574,9 @@ class HistologyTab(QtWidgets.QWidget):
             "the channel map with the 'latest' alignment.",
         )
         btns = QtWidgets.QHBoxLayout()
-        b_launch = QtWidgets.QPushButton("Launch IBL alignment GUI")
+        b_launch = QtWidgets.QPushButton("4 Launch IBL alignment GUI")
         b_launch.clicked.connect(self._launch_ibl)
-        b_refresh = QtWidgets.QPushButton("Regenerate channel map (latest)")
+        b_refresh = QtWidgets.QPushButton("5 Regenerate channel map (latest)")
         b_refresh.clicked.connect(lambda: self._gen_channels(alignment_override="latest"))
         btns.addWidget(b_launch)
         btns.addWidget(b_refresh)
@@ -1239,6 +1614,81 @@ class HistologyTab(QtWidgets.QWidget):
         v.addWidget(widget, 1)
         return host
 
+    @staticmethod
+    def _thumbnail_pixmap(image: np.ndarray, size: QtCore.QSize) -> QtGui.QPixmap:
+        arr = np.asarray(image)
+        if arr.ndim == 2:
+            v = np.nan_to_num(arr.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+            finite = v[np.isfinite(v)]
+            lo, hi = np.percentile(finite, [1.0, 99.0]) if finite.size else (0.0, 1.0)
+            g = np.clip((v - lo) / max(float(hi - lo), 1e-9), 0, 1)
+            rgb = np.dstack([g, g, g])
+        else:
+            rgb = arr[..., :3].astype(float)
+            if rgb.max(initial=0) > 1.5:
+                rgb /= 255.0
+            rgb = np.clip(rgb, 0, 1)
+        rgb8 = np.ascontiguousarray((rgb * 255).astype(np.uint8))
+        h, w = rgb8.shape[:2]
+        qimg = QtGui.QImage(rgb8.data, w, h, 3 * w, QtGui.QImage.Format_RGB888).copy()
+        pix = QtGui.QPixmap.fromImage(qimg).scaled(
+            size,
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+        return pix
+
+    @staticmethod
+    def _selection_icon_from_pixmap(base: QtGui.QPixmap, selected: bool) -> QtGui.QIcon:
+        if base.isNull():
+            return QtGui.QIcon()
+        pix = QtGui.QPixmap(base.size())
+        pix.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(pix)
+        if not selected:
+            painter.setOpacity(0.58)
+        painter.drawPixmap(0, 0, base)
+        painter.setOpacity(1.0)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        if selected:
+            width, height = pix.width(), pix.height()
+            short_side = max(1, min(width, height))
+            margin = max(5, int(short_side * 0.06))
+            badge = max(28, int(short_side * 0.30))
+            rect = QtCore.QRect(width - badge - margin, margin, badge, badge)
+
+            painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 2))
+            painter.setBrush(QtGui.QColor("#0f9d58"))
+            painter.drawEllipse(rect)
+
+            check = QtGui.QPainterPath()
+            check.moveTo(rect.left() + badge * 0.26, rect.top() + badge * 0.54)
+            check.lineTo(rect.left() + badge * 0.43, rect.top() + badge * 0.70)
+            check.lineTo(rect.left() + badge * 0.76, rect.top() + badge * 0.34)
+            painter.setPen(QtGui.QPen(
+                QtGui.QColor("#ffffff"),
+                max(3, int(badge * 0.12)),
+                QtCore.Qt.SolidLine,
+                QtCore.Qt.RoundCap,
+                QtCore.Qt.RoundJoin,
+            ))
+            painter.drawPath(check)
+
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#0f9d58"), 4))
+            painter.drawRoundedRect(pix.rect().adjusted(2, 2, -2, -2), 8, 8)
+
+        painter.end()
+        return QtGui.QIcon(pix)
+
+    @staticmethod
+    def _thumbnail_icon(image: np.ndarray, size: QtCore.QSize) -> QtGui.QIcon:
+        return HistologyTab._selection_icon_from_pixmap(
+            HistologyTab._thumbnail_pixmap(image, size),
+            selected=False,
+        )
+
     def _log(self, msg: str) -> None:
         self.log.appendPlainText(str(msg))
 
@@ -1251,7 +1701,7 @@ class HistologyTab(QtWidgets.QWidget):
         self._plot_theme = "Dark" if str(theme).lower().startswith("dark") else "Light"
         bg = "#0b0f14" if self._plot_theme == "Dark" else "#ffffff"
         for c in [getattr(self, n, None) for n in (
-            "canvas_preproc", "canvas_match_hist", "canvas_match_atlas",
+            "canvas_select_raw", "canvas_preproc", "canvas_match_hist", "canvas_match_atlas",
             "canvas_align_hist", "canvas_align_atlas", "canvas_trace", "trace_areas",
         )]:
             if c is not None:
@@ -1295,12 +1745,197 @@ class HistologyTab(QtWidgets.QWidget):
         self._log(f"Atlas loaded: shape {self.atlas.shape}.")
         return self.atlas
 
+    # ------------------------------------------------ Image selection actions
+    def _resolve_raw_folder_for_selection(self) -> Tuple[Optional[Path], List[Path], Optional[Path]]:
+        """Return the raw folder and images to show, repairing stale saved paths.
+
+        The raw-image textbox is persisted globally. When the user switches from
+        one run to another, that saved path can still point at a different
+        session. Prefer it only when it actually contains images; otherwise fall
+        back to the loaded session's ``raw`` folder.
+        """
+        typed = Path(self.ed_raw.text().strip()) if self.ed_raw.text().strip() else None
+        candidates: list[Path] = []
+        if typed is not None:
+            candidates.append(typed)
+        if self.folder is not None:
+            session_raw = self.folder / "raw"
+            if all(session_raw != p for p in candidates):
+                candidates.append(session_raw)
+
+        for folder in candidates:
+            paths = slice_prep.list_raw_images(folder)
+            if paths:
+                repaired_from = typed if typed is not None and folder != typed else None
+                return folder, paths, repaired_from
+        return typed, [], None
+
+    def _selection_refresh(self) -> None:
+        if not hasattr(self, "lst_raw_images"):
+            return
+        raw_folder, self.raw_image_paths, repaired_from = self._resolve_raw_folder_for_selection()
+        if raw_folder is not None and self.ed_raw.text().strip() != str(raw_folder):
+            self.ed_raw.setText(str(raw_folder))
+        if repaired_from is not None:
+            self._log(f"Raw image path had no images; using session raw folder: {raw_folder}")
+        previous = {str(p) for p in self.selected_raw_paths}
+        if not previous:
+            previous = {str(p) for p in self.raw_image_paths}
+        self._selection_grid_updating = True
+        try:
+            self.lst_raw_images.clear()
+            icon_size = self.lst_raw_images.iconSize()
+            for path in self.raw_image_paths:
+                item = QtWidgets.QListWidgetItem(path.name)
+                item.setData(self._SELECTION_PATH_ROLE, str(path))
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsUserCheckable)
+                selected = str(path) in previous
+                try:
+                    pix = self._thumbnail_pixmap(slice_prep.load_image(path), icon_size)
+                    item.setData(self._SELECTION_PIXMAP_ROLE, pix)
+                    self._selection_set_item_selected(item, selected)
+                except Exception:
+                    item.setIcon(QtGui.QIcon())
+                    item.setToolTip(f"Could not preview {path.name}")
+                    item.setData(self._SELECTION_SELECTED_ROLE, selected)
+                self.lst_raw_images.addItem(item)
+            if self.raw_image_paths:
+                self.lst_raw_images.setCurrentRow(0)
+        finally:
+            self._selection_grid_updating = False
+        self._selection_item_changed()
+        if not self.raw_image_paths and hasattr(self, "lbl_image_selection"):
+            where = str(raw_folder) if raw_folder is not None else "no folder set"
+            self.lbl_image_selection.setText(f"No raw TIFF/PNG images found ({where})")
+            self._selection_clear_preview(where)
+        else:
+            self._selection_show_preview(self.lst_raw_images.currentItem())
+
+    def _selection_set_item_selected(self, item: QtWidgets.QListWidgetItem, selected: bool) -> None:
+        item.setData(self._SELECTION_SELECTED_ROLE, bool(selected))
+        pix = item.data(self._SELECTION_PIXMAP_ROLE)
+        if isinstance(pix, QtGui.QPixmap):
+            item.setIcon(self._selection_icon_from_pixmap(pix, selected))
+        item.setToolTip(
+            "Selected for preprocessing. Click to remove."
+            if selected else "Ignored during preprocessing. Click to include."
+        )
+        font = item.font()
+        font.setBold(bool(selected))
+        item.setFont(font)
+        item.setForeground(QtGui.QBrush(
+            QtGui.QColor("#064e3b") if selected else QtGui.QColor("#6b7280")
+        ))
+
+    def _selection_toggle_item(self, item: QtWidgets.QListWidgetItem) -> None:
+        if self._selection_grid_updating:
+            return
+        self.lst_raw_images.setCurrentItem(item)
+        self._selection_set_item_selected(item, not bool(item.data(self._SELECTION_SELECTED_ROLE)))
+        self._selection_item_changed()
+        self._selection_show_preview(item)
+
+    def _selection_clear_preview(self, message: str = "") -> None:
+        self._selection_preview_image = None
+        if hasattr(self, "canvas_select_raw"):
+            self.canvas_select_raw.set_image(None)
+        if hasattr(self, "lbl_select_preview"):
+            self.lbl_select_preview.setText(message or "No raw image preview.")
+
+    def _selection_show_preview(self, item: Optional[QtWidgets.QListWidgetItem]) -> None:
+        if item is None or not hasattr(self, "canvas_select_raw"):
+            self._selection_clear_preview()
+            return
+        path = Path(str(item.data(self._SELECTION_PATH_ROLE)))
+        try:
+            image = slice_prep.load_image(path)
+        except Exception as exc:
+            self._selection_clear_preview(f"Could not preview {path.name}: {exc}")
+            return
+        self._selection_preview_image = image
+        idx = max(0, self.lst_raw_images.row(item))
+        self._show_histology_slice("select", self.canvas_select_raw, idx, image)
+        if hasattr(self, "lbl_select_preview"):
+            state = "selected" if bool(item.data(self._SELECTION_SELECTED_ROLE)) else "ignored"
+            self.lbl_select_preview.setText(f"{path.name} ({state})")
+
+    def _selection_item_changed(self, *_args) -> None:
+        if self._selection_grid_updating or not hasattr(self, "lst_raw_images"):
+            return
+        selected: list[Path] = []
+        for i in range(self.lst_raw_images.count()):
+            item = self.lst_raw_images.item(i)
+            if bool(item.data(self._SELECTION_SELECTED_ROLE)):
+                selected.append(Path(str(item.data(self._SELECTION_PATH_ROLE))))
+        self.selected_raw_paths = selected
+        if self.validated_raw_paths and [str(p) for p in self.validated_raw_paths] != [str(p) for p in selected]:
+            self.validated_raw_paths = []
+        total = len(self.raw_image_paths)
+        if hasattr(self, "lbl_image_selection"):
+            suffix = "validated" if self.validated_raw_paths else "not validated"
+            self.lbl_image_selection.setText(f"{len(selected)} / {total} selected, {suffix}")
+
+    def _selection_validate(self) -> None:
+        """Commit selected raw images and load exactly those images into Preprocess."""
+        self._selection_item_changed()
+        if not self.selected_raw_paths:
+            self._log("No raw images selected. Select at least one image before validating.")
+            return
+        self.validated_raw_paths = list(self.selected_raw_paths)
+        if hasattr(self, "lbl_image_selection"):
+            self.lbl_image_selection.setText(
+                f"{len(self.validated_raw_paths)} / {len(self.raw_image_paths)} selected, validated"
+            )
+        self._log(f"Validated {len(self.validated_raw_paths)} raw image(s) for preprocessing.")
+        self.nav.setCurrentIndex(getattr(self, "_page_preprocess", self.nav.currentIndex()))
+        self._preproc_load(paths=list(self.validated_raw_paths), require_validated=False)
+
+    def _selection_set_all(self, checked: bool) -> None:
+        if not hasattr(self, "lst_raw_images"):
+            return
+        self._selection_grid_updating = True
+        try:
+            for i in range(self.lst_raw_images.count()):
+                self._selection_set_item_selected(self.lst_raw_images.item(i), checked)
+        finally:
+            self._selection_grid_updating = False
+        self._selection_item_changed()
+        self._selection_show_preview(self.lst_raw_images.currentItem())
+
+    def _selection_invert(self) -> None:
+        if not hasattr(self, "lst_raw_images"):
+            return
+        self._selection_grid_updating = True
+        try:
+            for i in range(self.lst_raw_images.count()):
+                item = self.lst_raw_images.item(i)
+                self._selection_set_item_selected(item, not bool(item.data(self._SELECTION_SELECTED_ROLE)))
+        finally:
+            self._selection_grid_updating = False
+        self._selection_item_changed()
+        self._selection_show_preview(self.lst_raw_images.currentItem())
+
+    def _selected_raw_image_paths(self) -> List[Path]:
+        if self.validated_raw_paths:
+            return list(self.validated_raw_paths)
+        if not self.raw_image_paths and self.ed_raw.text().strip():
+            self._selection_refresh()
+        if hasattr(self, "lst_raw_images") and self.lst_raw_images.count() > 0:
+            return list(self.selected_raw_paths)
+        raw = self.ed_raw.text().strip()
+        return slice_prep.list_raw_images(raw) if raw else []
+
     # ----------------------------------------------------- Setup actions
     def _pick_into(self, edit: QtWidgets.QLineEdit, title: str) -> None:
         start = edit.text().strip() or str(self.settings.value("paths/last_folder", str(Path.cwd())))
         d = QtWidgets.QFileDialog.getExistingDirectory(self, title, start)
         if d:
             edit.setText(d)
+            if edit is getattr(self, "ed_raw", None):
+                self.raw_image_paths = []
+                self.selected_raw_paths = []
+                self.validated_raw_paths = []
+                self._selection_refresh()
 
     def _pick_folder(self) -> None:
         self._pick_into(self.ed_folder, "Histology folder")
@@ -1364,7 +1999,7 @@ class HistologyTab(QtWidgets.QWidget):
         self._load_session()
         self.nav.setCurrentIndex(0)
         if not self.ed_raw.text().strip():
-            self._log("Next: point 'Raw images' at your histology scans, then Preprocess.")
+            self._log("Next: point 'Raw images' at your histology scans, then Select images.")
 
     def _load_session(self) -> None:
         text = self.ed_folder.text().strip()
@@ -1373,7 +2008,9 @@ class HistologyTab(QtWidgets.QWidget):
         self.folder = Path(text)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.settings.setValue("histology/last_folder", text)
+        self.validated_raw_paths = []
         self.slice_images = []
+        self.slice_pixel_um = []
         self.histology_ccf = []
         self.tforms = []
         # Load any slice images already saved.
@@ -1382,6 +2019,7 @@ class HistologyTab(QtWidgets.QWidget):
                 self.slice_images.append(slice_prep.load_image(p))
             except Exception as exc:
                 self._log(f"Could not load slice image {p.name}: {exc}")
+        self.slice_pixel_um = self._infer_saved_slice_pixel_sizes()
         # Existing products.
         hccf = self.folder / "histology_ccf.mat"
         if hccf.exists():
@@ -1405,11 +2043,63 @@ class HistologyTab(QtWidgets.QWidget):
         except Exception:
             pass
         self._refresh_status()
+        self._selection_refresh()
         self._preproc_show()
         self._match_show()
         self._align_show()
         self._trace_show()
         self._log(f"Loaded session: {self.folder}")
+
+    def _raw_image_paths_for_session(self) -> List[Path]:
+        candidates: list[Path] = []
+        if self.folder is not None:
+            candidates.append(self.folder / "raw")
+        text = self.ed_raw.text().strip() if hasattr(self, "ed_raw") else ""
+        if text:
+            candidates.append(Path(text))
+        for folder in candidates:
+            try:
+                paths = slice_prep.list_raw_images(folder)
+            except Exception:
+                paths = []
+            if paths:
+                return paths
+        return []
+
+    def _infer_saved_slice_pixel_sizes(self) -> List[Optional[float]]:
+        """Infer saved ``slice_N`` pixel sizes from raw-image sidecar metadata."""
+        out: list[Optional[float]] = [None] * len(self.slice_images)
+        raw_paths = self.selected_raw_paths or self._raw_image_paths_for_session()
+        if not raw_paths:
+            return out
+        for i, raw_path in enumerate(raw_paths[: len(out)]):
+            raw_px = slice_prep.pixel_size_um(raw_path)
+            if raw_px is None:
+                continue
+            try:
+                raw_img = slice_prep.load_image(raw_path)
+                saved_img = self.slice_images[i]
+                raw_area = max(1.0, float(raw_img.shape[0] * raw_img.shape[1]))
+                saved_area = max(1.0, float(saved_img.shape[0] * saved_img.shape[1]))
+                downsample = float(np.sqrt(raw_area / saved_area))
+            except Exception:
+                downsample = 1.0
+            if np.isfinite(downsample) and downsample > 0:
+                out[i] = float(raw_px * downsample)
+            else:
+                out[i] = float(raw_px)
+        return out
+
+    def _atlas_to_histology_scale_for_slice(self, idx: int) -> float:
+        """Atlas pixel/voxel size converted into current histology image pixels."""
+        if 0 <= idx < len(self.slice_pixel_um):
+            px = self.slice_pixel_um[idx]
+            if px is not None and np.isfinite(px) and px > 0:
+                return float(hatlas.CCF_VOXEL_UM / px)
+        try:
+            return 1.0 / max(1.0, float(self.sp_downsample.value()))
+        except Exception:
+            return 1.0
 
     def _refresh_status(self) -> None:
         if self.folder is None:
@@ -1429,31 +2119,48 @@ class HistologyTab(QtWidgets.QWidget):
         self.lbl_status.setText("<br>".join(items))
 
     # ------------------------------------------------ Preprocess actions
-    def _preproc_load(self) -> None:
+    def _preproc_load(
+        self,
+        paths: Optional[List[Path]] = None,
+        *,
+        require_validated: bool = False,
+    ) -> None:
         raw = self.ed_raw.text().strip()
         if not raw:
             self._log("Set a raw image folder first.")
             return
         factor = float(self.sp_downsample.value())
-        paths = slice_prep.list_raw_images(raw)
+        paths = list(paths) if paths is not None else self._selected_raw_image_paths()
         if not paths:
-            self._log(f"No TIFF/PNG images found in {raw}.")
+            self._log(f"No raw images selected in {raw}. Select images first, or use Select all.")
+            return
+        if require_validated and not self.validated_raw_paths:
+            self._log("Validate the raw image selection first.")
             return
 
         def job():
             imgs = []
+            pixels = []
             for p in paths:
                 im = slice_prep.load_image(p)
+                px = slice_prep.pixel_size_um(p)
                 if factor != 1:
                     im = slice_prep.downsample(im, factor)
+                    if px is not None:
+                        px *= factor
                 imgs.append(im)
-            return imgs
+                pixels.append(px)
+            return imgs, pixels
 
         def done(result):
-            self.slice_images = result
+            imgs, pixels = result
+            self.slice_images = imgs
+            self.slice_pixel_um = list(pixels)
             self._cur_preproc = 0
             self._sync_slice_state_after_preprocess()
-            self._log(f"Loaded {len(result)} raw image(s).")
+            n_meta = sum(px is not None for px in self.slice_pixel_um)
+            suffix = f" ({n_meta} with pixel-size metadata)" if n_meta else ""
+            self._log(f"Loaded {len(imgs)} selected raw image(s){suffix}.")
             self._preproc_show()
 
         self._run_bg(job, done, busy_msg="Loading raw images...")
@@ -1463,8 +2170,24 @@ class HistologyTab(QtWidgets.QWidget):
             self._log("Nothing to save (load images and set a folder).")
             return
         out = slice_prep.save_slices(self.slice_images, self.folder)
+        out_set = {p.resolve() for p in out}
+        removed = 0
+        for stale in slice_prep.list_saved_slices(self.folder):
+            if stale.suffix.lower() not in {".tif", ".tiff"}:
+                continue
+            try:
+                stale_resolved = stale.resolve()
+            except OSError:
+                stale_resolved = stale
+            if stale_resolved not in out_set:
+                try:
+                    stale.unlink()
+                    removed += 1
+                except OSError as exc:
+                    self._log(f"Could not remove stale slice image {stale.name}: {exc}")
         self._sync_slice_state_after_preprocess()
-        self._log(f"Saved {len(out)} slice image(s) to {self.folder}.")
+        suffix = f" Removed {removed} stale slice image(s)." if removed else ""
+        self._log(f"Saved {len(out)} slice image(s) to {self.folder}.{suffix}")
         self._refresh_status()
 
     def _sync_slice_state_after_preprocess(self) -> None:
@@ -1475,6 +2198,7 @@ class HistologyTab(QtWidgets.QWidget):
             self._cur_align_slice = 0
             self._cur_trace_slice = 0
             self.slice_specs = []
+            self.slice_pixel_um = []
         else:
             self._cur_match_slice = int(np.clip(self._cur_match_slice, 0, n - 1))
             self._cur_align_slice = int(np.clip(self._cur_align_slice, 0, n - 1))
@@ -1483,6 +2207,10 @@ class HistologyTab(QtWidgets.QWidget):
                 self.slice_specs.extend([None] * (n - len(self.slice_specs)))
             elif len(self.slice_specs) > n:
                 self.slice_specs = self.slice_specs[:n]
+            if len(self.slice_pixel_um) < n:
+                self.slice_pixel_um.extend([None] * (n - len(self.slice_pixel_um)))
+            elif len(self.slice_pixel_um) > n:
+                self.slice_pixel_um = self.slice_pixel_um[:n]
         current = self.nav.currentIndex() if hasattr(self, "nav") else -1
         if current == getattr(self, "_page_match", -1):
             self._match_show()
@@ -1504,7 +2232,7 @@ class HistologyTab(QtWidgets.QWidget):
             self.lbl_preproc.setText("0 / 0")
             return
         idx = min(idx, len(self.slice_images) - 1)
-        self.canvas_preproc.set_image(self.slice_images[idx])
+        self._show_histology_slice("preproc", self.canvas_preproc, idx, self.slice_images[idx])
         self.lbl_preproc.setText(f"{idx + 1} / {len(self.slice_images)}")
 
     def _preproc_rotate(self, angle: float) -> None:
@@ -1537,13 +2265,8 @@ class HistologyTab(QtWidgets.QWidget):
             self.lbl_match_assigned.setStyleSheet("")
             return
         idx = min(self._cur_match_slice, len(self.slice_images) - 1)
-        self.canvas_match_hist.set_image(self.slice_images[idx])
+        self._show_histology_slice("match", self.canvas_match_hist, idx, self.slice_images[idx])
         self.canvas_match_hist.clear_overlays()
-        if idx in self._match_hist_levels_by_slice:
-            lo, hi = self._match_hist_levels_by_slice[idx]
-            self._match_apply_histogram_levels(lo, hi)
-        else:
-            self._match_reset_histogram()
         self.lbl_match.setText(f"slice {idx + 1} / {len(self.slice_images)}")
         self._match_update_assignment_status(idx)
         self._restore_match_sliders(idx)
@@ -1575,49 +2298,15 @@ class HistologyTab(QtWidgets.QWidget):
 
     def _match_histogram_levels_changed(self) -> None:
         """Remember manually-adjusted histology contrast levels per slice."""
-        if self._updating_match_histogram or not self.slice_images:
-            return
-        idx = min(self._cur_match_slice, len(self.slice_images) - 1)
-        try:
-            lo, hi = self.hist_match_histogram.item.getLevels()
-        except Exception:
-            return
-        self._match_hist_levels_by_slice[idx] = (float(lo), float(hi))
+        self._histology_levels_changed("match")
 
     def _match_apply_histogram_levels(self, lo: float, hi: float) -> None:
         """Apply contrast levels to both the image and linked histogram widget."""
-        self._updating_match_histogram = True
-        try:
-            self.canvas_match_hist.image_item().setLevels((float(lo), float(hi)))
-            self.hist_match_histogram.setLevels(float(lo), float(hi))
-        finally:
-            self._updating_match_histogram = False
+        self._apply_histology_levels("match", lo, hi)
 
     def _match_reset_histogram(self) -> None:
         """Reset the histology image contrast control to the current slice range."""
-        if not self.slice_images:
-            return
-        idx = min(self._cur_match_slice, len(self.slice_images) - 1)
-        arr = np.asarray(self.slice_images[idx])
-        if arr.size == 0:
-            return
-        if arr.ndim == 3:
-            values = arr[..., :3].astype(float).mean(axis=2)
-        else:
-            values = arr.astype(float)
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            return
-        lo, hi = np.percentile(values, [0.5, 99.5])
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            lo, hi = float(values.min()), float(values.max())
-        if hi <= lo:
-            hi = lo + 1.0
-        try:
-            self._match_apply_histogram_levels(float(lo), float(hi))
-            self._match_hist_levels_by_slice[idx] = (float(lo), float(hi))
-        except Exception as exc:
-            self._log(f"Could not reset histology contrast: {exc}")
+        self._reset_histology_levels("match")
 
     def _restore_match_sliders(self, idx: int) -> None:
         """Reflect a previously-saved plane for slice ``idx`` in the sliders."""
@@ -1675,9 +2364,19 @@ class HistologyTab(QtWidgets.QWidget):
             return
         idx = min(self._cur_match_slice, len(self.slice_images) - 1)
         image = np.asarray(self.slice_images[idx])
+        center_ap = int(self.sl_ap.value())
+        if center_ap <= self.sl_ap.minimum() + 5 or center_ap >= self.sl_ap.maximum() - 5:
+            center_ap = 540
+        atlas_to_histology_scale = self._atlas_to_histology_scale_for_slice(idx)
 
         def job():
-            return matching.automatch_coronal_ap(image, at)
+            return matching.automatch_coronal_ap(
+                image,
+                at,
+                center_ap=center_ap,
+                search_radius=280,
+                atlas_to_histology_scale=atlas_to_histology_scale,
+            )
 
         def done(result):
             if not isinstance(result, dict) or "ap" not in result:
@@ -1696,11 +2395,23 @@ class HistologyTab(QtWidgets.QWidget):
                 f"Auto matched AP {ap} um (score {score:.2f}, conf {confidence:.2f})"
             )
             top = result.get("top") or []
+            engine = result.get("engine") or {}
+            engine_txt = (
+                f"; workers {int(engine.get('workers', 1))}"
+                f"; numba {'yes' if engine.get('numba') else 'no'}"
+                f"; cuda {'yes' if engine.get('cuda') else 'no'}"
+            )
             if top:
                 bests = ", ".join(f"{int(t['ap'])}:{float(t['score']):.2f}" for t in top[:3])
-                self._log(f"Auto match slice {idx + 1}: AP {ap} (top {bests}).")
+                self._log(
+                    f"Auto match slice {idx + 1}: AP {ap} "
+                    f"(scale {atlas_to_histology_scale:.3f}{engine_txt}; top {bests})."
+                )
             else:
-                self._log(f"Auto match slice {idx + 1}: AP {ap} (score {score:.2f}).")
+                self._log(
+                    f"Auto match slice {idx + 1}: AP {ap} "
+                    f"(scale {atlas_to_histology_scale:.3f}{engine_txt}; score {score:.2f})."
+                )
             if self.ck_match_auto_adjust.isChecked():
                 self._auto_adjust_current_match_slice(at, idx)
 
@@ -1717,11 +2428,12 @@ class HistologyTab(QtWidgets.QWidget):
         at = self._ensure_atlas()
         if at is None or not self.slice_images:
             return False
+        idx = min(self._cur_match_slice, len(self.slice_images) - 1)
         cv = hatlas.coronal_camera_vector(self.sl_lr.value(), self.sl_si.value())
         sp = hatlas.coronal_slice_point(self.sl_ap.value(), at)
         while len(self.slice_specs) < len(self.slice_images):
             self.slice_specs.append(None)
-        self.slice_specs[self._cur_match_slice] = {
+        self.slice_specs[idx] = {
             "slice_point": sp,
             "camera_vector": cv,
             "ap": int(self.sl_ap.value()),
@@ -1729,15 +2441,54 @@ class HistologyTab(QtWidgets.QWidget):
             "si": int(self.sl_si.value()),
             "mode": self.cb_mode.currentText(),
         }
+        self._invalidate_downstream_for_match_change(idx)
+        self._ensure_histology_ccf_slice(at=at, idx=idx, spacing=1, force=True)
         saved = self._save_match_specs()  # persist immediately so matching survives a reopen
         n_assigned = sum(s is not None for s in self.slice_specs)
         self._match_show()
         if saved:
             self.lbl_match_autosave.setText(f"Autosaved match progress ({n_assigned}/{len(self.slice_images)})")
         if log:
-            self._log(f"Assigned plane to slice {self._cur_match_slice + 1} "
-                      f"({n_assigned}/{len(self.slice_images)} assigned).")
+            self._log(f"Assigned plane to slice {idx + 1} "
+                      f"({n_assigned}/{len(self.slice_images)} assigned). "
+                      "Downstream alignment for this slice was reset.")
         return saved
+
+    def _invalidate_downstream_for_match_change(self, idx: int) -> None:
+        """Clear atlas-derived caches that become stale when a match plane changes."""
+        if idx < 0:
+            return
+        while len(self.histology_ccf) <= idx:
+            self.histology_ccf.append({})
+        self.histology_ccf[idx] = {}
+        while len(self.tforms) <= idx:
+            self.tforms.append(np.eye(3))
+        self.tforms[idx] = np.eye(3)
+        self._align_hist_pts.pop(idx, None)
+        self._align_atlas_pts.pop(idx, None)
+        if self.folder is not None:
+            stale = [
+                "probe_ccf.mat",
+                "probe_ccf.csv",
+                "probe_ccf_points.csv",
+                "channel_locations_all_shanks.json",
+            ]
+            stale.extend(f"channel_locations_shank{i}.json" for i in range(1, 5))
+            stale.extend(f"xyz_picks_shank{i}.json" for i in range(1, 5))
+            stale.append("xyz_picks.json")
+            for name in stale:
+                try:
+                    (self.folder / name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self._autosave_tforms()
+        current = self.nav.currentIndex() if hasattr(self, "nav") else -1
+        if current == getattr(self, "_page_align", -1):
+            self._cur_align_slice = idx
+            self._align_show()
+        elif current == getattr(self, "_page_trace", -1):
+            self._cur_trace_slice = idx
+            self._trace_show()
 
     _MATCH_SPECS_FN = "histology_match_specs.json"
 
@@ -1901,16 +2652,29 @@ class HistologyTab(QtWidgets.QWidget):
 
     def _align_show(self) -> None:
         if not self.slice_images:
+            self.canvas_align_hist.set_image(None)
+            self.canvas_align_hist.clear_overlays()
+            self.canvas_align_atlas.set_image(None)
+            self.canvas_align_atlas.clear_overlays()
             return
         idx = min(self._cur_align_slice, len(self.slice_images) - 1)
-        if idx < len(self.histology_ccf):
-            self.canvas_align_atlas.set_image(self.histology_ccf[idx]["tv_slices"])
+        atlas_ready = self._ensure_histology_ccf_slice(idx=idx, spacing=1)
+        if atlas_ready:
+            atlas_tv = self.histology_ccf[idx].get("tv_slices")
+            if atlas_tv is not None and np.asarray(atlas_tv).size:
+                self.canvas_align_atlas.set_image(atlas_tv)
+            else:
+                atlas_ready = False
+        if not atlas_ready:
+            self.canvas_align_atlas.set_image(None)
+            self.canvas_align_atlas.clear_overlays()
+            self._log(f"Slice {idx + 1}: atlas image is unavailable; re-run Match atlas for this slice.")
         self.lbl_align.setText(f"slice {idx + 1} / {len(self.slice_images)}")
         # A reopened run with a saved transform shows its overlay immediately.
-        if idx < len(self.tforms) and not np.allclose(np.asarray(self.tforms[idx]), np.eye(3)):
+        if atlas_ready and idx < len(self.tforms) and not np.allclose(np.asarray(self.tforms[idx]), np.eye(3)):
             self._align_overlay(idx)
         else:
-            self.canvas_align_hist.set_image(self.slice_images[idx])
+            self._show_histology_slice("align", self.canvas_align_hist, idx, self.slice_images[idx])
             self._align_redraw_points()
 
     def _align_redraw_points(self) -> None:
@@ -1970,38 +2734,75 @@ class HistologyTab(QtWidgets.QWidget):
         if idx >= len(self.histology_ccf) or idx >= len(self.slice_images):
             self._log("Match atlas slices first (need histology_ccf).")
             return
+        hp = self._align_hist_pts.get(idx, [])
+        ap = self._align_atlas_pts.get(idx, [])
+        if len(hp) >= 3 and len(hp) == len(ap):
+            T = alignment.fit_affine_from_points(np.array(ap), np.array(hp))
+            self._set_tform(idx, T)
+            self._log(f"Slice {idx + 1}: auto-align used {len(hp)} existing landmark pairs.")
+            self._align_overlay(idx)
+            self._autosave_tforms()
+            return
+        if hp or ap:
+            self._log("Auto-align ignored incomplete landmark points. Need the same "
+                      "number of histology and atlas points, with at least 3 pairs.")
+            return
         hist = self.slice_images[idx]
-        hist_gray = hist.mean(axis=2) if hist.ndim == 3 else hist
         atlas_tv = self.histology_ccf[idx].get("tv_slices")
         if atlas_tv is None or np.asarray(atlas_tv).size == 0:
             self._log("Atlas slice has no tv_slices; re-run Match before auto-align.")
             return
 
         def job():
-            # Isolated in a child process: OpenCV's ECC can abort natively, which
-            # would otherwise crash the whole GUI. Returns (T, status).
-            return alignment.auto_align_isolated(hist_gray, atlas_tv)
+            # Runs accelerated shape alignment in-process; only the legacy ECC
+            # fallback is isolated because it can abort natively.
+            return alignment.auto_align_isolated(hist, atlas_tv)
 
         def done(result):
             T, status = result
+            if "low confidence" in str(status).lower():
+                self._log(f"Slice {idx + 1}: {status}")
+                self._log("Auto-align did not overwrite the current transform. Add "
+                          "landmark pairs and press Auto-align or Apply points.")
+                return
             self._set_tform(idx, T)
             self._log(f"Slice {idx + 1}: {status}")
             self._align_overlay(idx)
             self._autosave_tforms()
 
         self._run_bg(job, done,
-                     busy_msg="Auto-aligning in an isolated process (intensity registration)...")
+                     busy_msg="Auto-aligning with accelerated shape registration...")
 
-    def _ensure_histology_ccf_slice(self, at: hatlas.AllenCCFAtlas, idx: int, spacing: int = 1) -> bool:
+    def _ensure_histology_ccf_slice(
+        self,
+        at: Optional[hatlas.AllenCCFAtlas] = None,
+        idx: int = 0,
+        spacing: int = 1,
+        force: bool = False,
+    ) -> bool:
         """Build/store ``histology_ccf[idx]`` from the current match spec if needed."""
-        if idx < len(self.histology_ccf) and self.histology_ccf[idx]:
-            return True
+        if not force and idx < len(self.histology_ccf) and self.histology_ccf[idx]:
+            sl = self.histology_ccf[idx]
+            if all(k in sl and np.asarray(sl[k]).size for k in ("tv_slices", "av_slices")):
+                return True
         if idx >= len(self.slice_specs) or self.slice_specs[idx] is None:
+            return False
+        at = at or self._ensure_atlas()
+        if at is None:
             return False
         while len(self.histology_ccf) <= idx:
             self.histology_ccf.append({})
-        self.histology_ccf[idx] = matching.build_histology_ccf(at, [self.slice_specs[idx]], spacing=spacing)[0]
-        return True
+        try:
+            self.histology_ccf[idx] = matching.build_histology_ccf(
+                at, [self.slice_specs[idx]], spacing=spacing
+            )[0]
+        except Exception as exc:
+            self._log(f"Could not rebuild atlas slice {idx + 1}: {exc}")
+            return False
+        sl = self.histology_ccf[idx]
+        if all(k in sl and np.asarray(sl[k]).size for k in ("tv_slices", "av_slices")):
+            return True
+        return False
 
     def _auto_adjust_current_match_slice(self, at: hatlas.AllenCCFAtlas, idx: int) -> None:
         """Run the existing intensity auto-align after an Auto Match result."""
@@ -2011,17 +2812,20 @@ class HistologyTab(QtWidgets.QWidget):
             self._log("Auto-adjust skipped: no matched plane is available for this slice.")
             return
         hist = self.slice_images[idx]
-        hist_gray = hist.mean(axis=2) if hist.ndim == 3 else hist
         atlas_tv = self.histology_ccf[idx].get("tv_slices")
         if atlas_tv is None or np.asarray(atlas_tv).size == 0:
             self._log("Auto-adjust skipped: atlas plane has no template image.")
             return
 
         def job():
-            return alignment.auto_align_isolated(hist_gray, atlas_tv)
+            return alignment.auto_align_isolated(hist, atlas_tv)
 
         def done(result):
             T, status = result
+            if "low confidence" in str(status).lower():
+                self._log(f"Slice {idx + 1}: auto-adjust after Auto match skipped: {status}")
+                self.lbl_match_autosave.setText(f"Auto-adjust skipped for slice {idx + 1}")
+                return
             self._set_tform(idx, T)
             self._autosave_tforms()
             self._log(f"Slice {idx + 1}: auto-adjust after Auto match: {status}")
@@ -2042,7 +2846,10 @@ class HistologyTab(QtWidgets.QWidget):
         self.tforms[idx] = T
 
     def _align_overlay(self, idx: int) -> None:
-        if idx >= len(self.histology_ccf) or idx >= len(self.tforms) or idx >= len(self.slice_images):
+        if idx >= len(self.tforms) or idx >= len(self.slice_images):
+            return
+        if not self._ensure_histology_ccf_slice(idx=idx, spacing=1):
+            self._log(f"Slice {idx + 1}: atlas overlay unavailable; re-run Match atlas for this slice.")
             return
         try:
             av = self.histology_ccf[idx]["av_slices"]
@@ -2051,7 +2858,7 @@ class HistologyTab(QtWidgets.QWidget):
             # use_cv2=False: GUI-thread warp must not be able to abort natively.
             warped = alignment.warp_atlas(av, self.tforms[idx], shape, nearest=True, use_cv2=False)
             bound = alignment.atlas_boundaries(warped)
-            self.canvas_align_hist.set_image(self.slice_images[idx])
+            self._show_histology_slice("align", self.canvas_align_hist, idx, self.slice_images[idx])
             self._align_redraw_points()
             self.canvas_align_hist.add_mask_overlay(bound, (60, 180, 255))
         except Exception as exc:
@@ -2096,17 +2903,106 @@ class HistologyTab(QtWidgets.QWidget):
     def _trace_key(self) -> Tuple[int, int]:
         return self._cur_trace_slice, self._active_probe
 
+    def _trace_visible_center(self, h: int, w: int) -> Tuple[float, float] | None:
+        try:
+            (x0, x1), (y0, y1) = self.canvas_trace.view.viewRange()
+        except Exception:
+            return None
+        vals = np.asarray([x0, x1, y0, y1], dtype=float)
+        if not np.isfinite(vals).all():
+            return None
+        x = float(np.clip((x0 + x1) / 2.0, 0, max(w - 1, 0)))
+        y = float(np.clip((y0 + y1) / 2.0, 0, max(h - 1, 0)))
+        return x, y
+
+    def _trace_reference_line(self, exclude_key: Tuple[int, int] | None = None) -> tuple[np.ndarray, int, int] | None:
+        current = self._trace_key()
+        exclude_key = current if exclude_key is None else exclude_key
+        roi_pts = self._trace_roi_points()
+        if roi_pts is not None and current != exclude_key:
+            return roi_pts, current[0], current[1]
+
+        candidates: list[tuple[tuple[int, int, int, int], np.ndarray, int, int]] = []
+        for (s, p), pts in self.probe_points.items():
+            if (s, p) == exclude_key:
+                continue
+            arr = np.asarray(pts, dtype=float)
+            if arr.shape != (2, 2) or not np.isfinite(arr).all():
+                continue
+            same_slice = 0 if s == self._cur_trace_slice else 1
+            same_probe = 0 if p == self._active_probe else 1
+            probe_dist = abs(p - self._active_probe)
+            slice_dist = abs(s - self._cur_trace_slice)
+            candidates.append(((same_slice, same_probe, probe_dist, slice_dist), arr, s, p))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        _rank, pts, s, p = candidates[0]
+        return pts, s, p
+
+    @staticmethod
+    def _trace_fit_line_to_image(pts: np.ndarray, h: int, w: int) -> np.ndarray:
+        out = np.asarray(pts, dtype=float).copy()
+        if out.shape != (2, 2):
+            return out
+        max_x = float(max(w - 1, 0))
+        max_y = float(max(h - 1, 0))
+        span_x = float(out[:, 0].max() - out[:, 0].min())
+        span_y = float(out[:, 1].max() - out[:, 1].min())
+        if span_x <= max_x:
+            if out[:, 0].min() < 0:
+                out[:, 0] -= out[:, 0].min()
+            if out[:, 0].max() > max_x:
+                out[:, 0] -= out[:, 0].max() - max_x
+        if span_y <= max_y:
+            if out[:, 1].min() < 0:
+                out[:, 1] -= out[:, 1].min()
+            if out[:, 1].max() > max_y:
+                out[:, 1] -= out[:, 1].max() - max_y
+        out[:, 0] = np.clip(out[:, 0], 0, max_x)
+        out[:, 1] = np.clip(out[:, 1], 0, max_y)
+        return out
+
     def _trace_default_line(self, center: Optional[Tuple[float, float]] = None) -> np.ndarray:
         idx = min(self._cur_trace_slice, len(self.slice_images) - 1)
         img = self.slice_images[idx]
         h, w = img.shape[:2]
+        ref = self._trace_reference_line()
+        if ref is not None:
+            ref_pts, ref_slice, ref_probe = ref
+            vec = ref_pts[1] - ref_pts[0]
+            if not np.isfinite(vec).all() or float(np.linalg.norm(vec)) < 2.0:
+                vec = np.array([0.0, max(40.0, min(120.0, 0.20 * h))], dtype=float)
+            if center is None:
+                c = ref_pts.mean(axis=0)
+                if ref_slice == idx and ref_probe != self._active_probe:
+                    perp = np.array([-vec[1], vec[0]], dtype=float)
+                    norm = float(np.linalg.norm(perp))
+                    if norm > 1e-6:
+                        perp /= norm
+                        sign = 1.0 if self._active_probe >= ref_probe else -1.0
+                        c = c + sign * perp * max(10.0, min(45.0, 0.20 * float(np.linalg.norm(vec))))
+                x = float(np.clip(c[0], 0, max(w - 1, 0)))
+                y = float(np.clip(c[1], 0, max(h - 1, 0)))
+            else:
+                x = float(np.clip(center[0], 0, max(w - 1, 0)))
+                y = float(np.clip(center[1], 0, max(h - 1, 0)))
+            pts = np.array([[x, y], [x, y]], dtype=float)
+            pts[0] -= 0.5 * vec
+            pts[1] += 0.5 * vec
+            return self._trace_fit_line_to_image(pts, h, w)
+
         if center is None:
-            x = float(np.clip(w * (0.42 + 0.045 * ((self._active_probe - 1) % 6)), 0, max(w - 1, 0)))
-            y = h * 0.56
+            visible = self._trace_visible_center(h, w)
+            if visible is not None:
+                x, y = visible
+            else:
+                x = float(np.clip(w * (0.42 + 0.045 * ((self._active_probe - 1) % 6)), 0, max(w - 1, 0)))
+                y = h * 0.56
         else:
             x = float(np.clip(center[0], 0, max(w - 1, 0)))
             y = float(np.clip(center[1], 0, max(h - 1, 0)))
-        length = max(40.0, 0.62 * h)
+        length = max(40.0, min(140.0, 0.22 * h))
         y0 = float(np.clip(y - 0.5 * length, 0, max(h - 1, 0)))
         y1 = float(np.clip(y + 0.5 * length, 0, max(h - 1, 0)))
         if abs(y1 - y0) < 1.0:
@@ -2179,9 +3075,11 @@ class HistologyTab(QtWidgets.QWidget):
 
     def _trace_show(self) -> None:
         if not self.slice_images:
+            self.canvas_trace.set_image(None)
+            self.canvas_trace.clear_overlays()
             return
         idx = min(self._cur_trace_slice, len(self.slice_images) - 1)
-        self.canvas_trace.set_image(self.slice_images[idx])
+        self._show_histology_slice("trace", self.canvas_trace, idx, self.slice_images[idx], preserve_view=True)
         self.canvas_trace.clear_overlays()
         self._trace_roi = None
         active_pts = None
@@ -2323,7 +3221,6 @@ class HistologyTab(QtWidgets.QWidget):
             self._log(f"Saved probe_ccf.mat ({len(probes)} probes) + CSV.")
             self._refresh_status()
             self._draw_trajectory_areas(probes)
-            self._show_trajectory_3d_popup(probes)
             self._save_trajectory_3d_gif(probes)
 
         def finished(_payload):
@@ -2475,18 +3372,112 @@ class HistologyTab(QtWidgets.QWidget):
             "log": self.log_requested.emit,
         }
 
+    def _extract_alf(self, *, compute_rms: bool = True) -> None:
+        if self.folder is None:
+            self._log("Load a session folder first.")
+            return
+        ks = self.ed_ks.text().strip()
+        ephys = self.ed_ephys.text().strip()
+        if not ks or not ephys:
+            self._log("ALF extraction needs both Kilosort and ephys folders set on Setup.")
+            return
+        args = ["extract_alf", ks, ephys, str(self.folder)]
+        if compute_rms:
+            args.append("--rms")
+        kw = self._ibl_kwargs()
+
+        def job():
+            return ibl_launch.run_bridge(args, **kw)[0]
+
+        def done(rc):
+            if rc == 0:
+                self._log("ALF extraction done.")
+                self._refresh_status()
+                self._load_channel_table()
+            else:
+                self._log("ALF extraction failed.")
+
+        self._run_bg(job, done, busy_msg="Running fast ALF extraction via IBL bridge...")
+
+    def _prepare_for_ibl(self) -> None:
+        """Run the complete preparation pipeline needed before opening the IBL GUI."""
+        if self.folder is None:
+            self._log("Load a session folder first.")
+            return
+        if not (self.folder / "probe_ccf.mat").exists():
+            self._log("Need probe_ccf.mat first. Finish Trace probes and save probe_ccf.")
+            return
+        ks = self.ed_ks.text().strip()
+        ephys = self.ed_ephys.text().strip()
+        if not ks or not ephys:
+            self._log("Prepare for IBL needs both Kilosort and ephys folders set on Setup.")
+            return
+
+        align = self.cb_alignment.currentText()
+        args = [
+            "all",
+            str(self.folder),
+            "--alignment", align,
+            "--ks", ks,
+            "--ephys", ephys,
+            "--rms",
+            "--force-alf",
+        ]
+        kw = self._ibl_kwargs()
+
+        def job():
+            rc, _ = ibl_launch.run_bridge(args, **kw)
+            return rc
+
+        def done(rc):
+            if rc != 0:
+                self._log("Prepare for IBL failed.")
+                return
+            self._log("Prepare for IBL complete: ALF, RMS/QC, xyz_picks, and channel map are ready.")
+            self._on_channels_done(0)
+
+        self._run_bg(
+            job,
+            done,
+            busy_msg="Preparing IBL inputs (ALF + RMS/QC + xyz_picks + channel map)...",
+        )
+
     def _gen_xyz(self) -> None:
         if self.folder is None or not (self.folder / "probe_ccf.mat").exists():
             self._log("Need probe_ccf.mat (Trace stage) first.")
             return
+        folder = self.folder
         kw = self._ibl_kwargs()
 
         def job():
-            rc, _ = ibl_launch.run_bridge(["xyz_picks", str(self.folder)], **kw)
-            return rc
+            try:
+                from ..histology import ibl_bridge
+                written = ibl_bridge.compute_xyz_picks(
+                    folder / "probe_ccf.mat",
+                    folder,
+                    mode="fast",
+                )
+                return {"rc": 0, "mode": "fast", "count": len(written)}
+            except Exception as exc:
+                self.log_requested.emit(
+                    f"Fast xyz_picks failed ({exc}); falling back to exact IBL mode."
+                )
+                rc, _ = ibl_launch.run_bridge(
+                    ["xyz_picks", str(folder), "--mode", "ibl"],
+                    **kw,
+                )
+                return {"rc": rc, "mode": "ibl", "count": 0}
 
-        self._run_bg(job, lambda rc: self._log("xyz_picks done." if rc == 0 else "xyz_picks failed."),
-                     busy_msg="Generating xyz_picks via IBL bridge...")
+        def done(result):
+            rc = int(result.get("rc", 1))
+            if rc == 0:
+                mode = result.get("mode", "fast")
+                count = result.get("count", 0)
+                self._log(f"xyz_picks done ({mode}, {count} file(s)).")
+            else:
+                self._log("xyz_picks failed.")
+
+        self._run_bg(job, done, busy_msg="Generating xyz_picks locally...")
 
     def _gen_channels(self, alignment_override: Optional[str] = None) -> None:
         if self.folder is None:
@@ -2513,14 +3504,8 @@ class HistologyTab(QtWidgets.QWidget):
         ephys = self.ed_ephys.text().strip()
         if ks:
             args += ["--ks", ks]  # geometry reuse; extraction only if --ephys is added too
-        if self.ck_extract.isChecked():
-            if ks and ephys:
-                args += ["--ephys", ephys]
-                if self.ck_rms.isChecked():
-                    args += ["--rms"]  # opt-in to the slow RMS/QC map
-            else:
-                self._log("ALF extraction needs both Kilosort and ephys folders; "
-                          "skipping extraction and reusing existing geometry.")
+        if ks and ephys:
+            args += ["--ephys", ephys, "--rms", "--force-alf"]
         kw = self._ibl_kwargs()
         self._run_bg(lambda: ibl_launch.run_bridge(args, **kw)[0],
                      lambda rc: self._on_channels_done(rc),
