@@ -1082,6 +1082,26 @@ class HistologyTab(QtWidgets.QWidget):
             return
         self._hist_levels_by_stage.setdefault(stage, {})[idx] = (float(lo), float(hi))
 
+    def _remember_visible_histology_levels(self, stage: str) -> None:
+        """Persist the levels currently applied to a visible image item."""
+        canvas = self._histogram_canvases.get(stage)
+        if canvas is None:
+            return
+        levels = getattr(canvas.image_item(), "levels", None)
+        if levels is None:
+            widget = self._histogram_widgets.get(stage)
+            if widget is None:
+                return
+            try:
+                levels = widget.item.getLevels()
+            except Exception:
+                return
+        arr = np.asarray(levels, dtype=float).reshape(-1)
+        if arr.size < 2 or not np.isfinite(arr[:2]).all() or arr[1] <= arr[0]:
+            return
+        key = 0 if stage == "select" else self._current_histology_slice_index(stage)
+        self._hist_levels_by_stage.setdefault(stage, {})[key] = (float(arr[0]), float(arr[1]))
+
     def _apply_histology_levels(self, stage: str, lo: float, hi: float) -> None:
         """Apply contrast levels to the image and its linked histogram widget."""
         widget = self._histogram_widgets.get(stage)
@@ -1445,14 +1465,14 @@ class HistologyTab(QtWidgets.QWidget):
     # ---- Trace page ----
     def _build_trace_page(self) -> QtWidgets.QWidget:
         page, v = self._section(
-            "Trace probe tracks",
-            "Pick a probe number, create one editable line on each slice the probe "
+            "Trace shank tracks",
+            "Pick a shank number, create one editable line on each slice the shank "
             "crosses, then save probe_ccf.mat, CSV files, and the trajectory-area chart.",
         )
         body = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.canvas_trace = ImageCanvas()
         self.canvas_trace.clicked.connect(self._trace_click)
-        body.addWidget(self._titled("Histology probe line", self._histology_contrast_pane("trace", self.canvas_trace)))
+        body.addWidget(self._titled("Histology shank line", self._histology_contrast_pane("trace", self.canvas_trace)))
 
         trajectory_panel = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.trace_areas = pg.GraphicsLayoutWidget()
@@ -1472,7 +1492,7 @@ class HistologyTab(QtWidgets.QWidget):
         b_next.clicked.connect(lambda: self._trace_step(1))
         ctl.addWidget(b_prev)
         ctl.addWidget(b_next)
-        ctl.addWidget(QtWidgets.QLabel("Probe"))
+        ctl.addWidget(QtWidgets.QLabel("Shank"))
         self.sp_probe = QtWidgets.QSpinBox()
         self.sp_probe.setRange(1, 20)
         self.sp_probe.valueChanged.connect(self._trace_set_probe)
@@ -1480,7 +1500,7 @@ class HistologyTab(QtWidgets.QWidget):
         b_new = QtWidgets.QPushButton("New line")
         b_new.clicked.connect(self._trace_new_line)
         ctl.addWidget(b_new)
-        b_clear = QtWidgets.QPushButton("Clear probe on slice")
+        b_clear = QtWidgets.QPushButton("Clear shank on slice")
         b_clear.clicked.connect(self._trace_clear)
         ctl.addWidget(b_clear)
         self.btn_trace_build = QtWidgets.QPushButton("Build + Save probe_ccf")
@@ -1515,12 +1535,13 @@ class HistologyTab(QtWidgets.QWidget):
     def _build_channels_page(self) -> QtWidgets.QWidget:
         page, v = self._section(
             "Per-channel region map",
-            "Prepare the ALF, xyz_picks, RMS/QC maps, and per-channel regions for "
-            "the IBL Electrophysiology Atlas in one numbered workflow.",
+            "Prepare the ALF, xyz_picks, and per-channel regions for the IBL "
+            "Electrophysiology Atlas. RMS/QC maps are optional because they stream "
+            "the whole raw binary and are much slower.",
         )
         order = QtWidgets.QLabel(
-            "1 Prepare for IBL -> 2 Review unit distribution -> 3 Propose alignment -> "
-            "4 Refine in IBL GUI -> 5 Finalize regions."
+            "1 Prepare for IBL -> optional RMS/QC maps -> 2 Review unit distribution -> "
+            "3 Propose alignment -> 4 Refine in IBL GUI -> 5 Finalize regions."
         )
         order.setObjectName("SectionHint")
         order.setWordWrap(True)
@@ -1536,10 +1557,17 @@ class HistologyTab(QtWidgets.QWidget):
         btns = QtWidgets.QHBoxLayout()
         b_prepare = QtWidgets.QPushButton("1 Prepare for IBL")
         b_prepare.setToolTip(
-            "Run fast ALF extraction, RMS/QC map extraction, xyz_picks generation, "
-            "and the initial channel map. Needs Kilosort, ephys, and probe_ccf.mat."
+            "Run fast ALF extraction, xyz_picks generation, and the initial channel map. "
+            "Skips slow RMS/QC maps."
         )
         b_prepare.clicked.connect(self._prepare_for_ibl)
+        b_rms = QtWidgets.QPushButton("Optional RMS/QC maps")
+        b_rms.setProperty("role", "secondary")
+        b_rms.setToolTip(
+            "Slow: streams the complete raw AP/LF binary. Only needed for RMS/QC panels "
+            "inside the IBL GUI."
+        )
+        b_rms.clicked.connect(self._compute_rms_qc_maps)
         b_units = QtWidgets.QPushButton("2 Plot unit distribution")
         b_units.clicked.connect(self._plot_unit_distribution)
         b_prop = QtWidgets.QPushButton("3 Propose alignment (auto)")
@@ -1548,7 +1576,7 @@ class HistologyTab(QtWidgets.QWidget):
         b_final.setToolTip("Regenerate channel_locations_shankN.json from the latest "
                            "alignment you saved in the IBL GUI (per shank).")
         b_final.clicked.connect(self._finalize_channels)
-        for b in [b_prepare, b_units, b_prop, b_final]:
+        for b in [b_prepare, b_rms, b_units, b_prop, b_final]:
             btns.addWidget(b)
         btns.addStretch(1)
         v.addLayout(btns)
@@ -2887,6 +2915,7 @@ class HistologyTab(QtWidgets.QWidget):
 
     # ------------------------------------------------------ Trace actions
     def _trace_set_probe(self, v: int) -> None:
+        self._remember_visible_histology_levels("trace")
         self._trace_commit_roi()
         self._active_probe = int(v)
         self._pending_click = []
@@ -2895,6 +2924,7 @@ class HistologyTab(QtWidgets.QWidget):
     def _trace_step(self, d: int) -> None:
         if not self.slice_images:
             return
+        self._remember_visible_histology_levels("trace")
         self._trace_commit_roi()
         self._cur_trace_slice = int(np.clip(self._cur_trace_slice + d, 0, len(self.slice_images) - 1))
         self._pending_click = []
@@ -3089,12 +3119,28 @@ class HistologyTab(QtWidgets.QWidget):
                 if p == self._active_probe:
                     active_pts = np.asarray(pts, dtype=float)
                 else:
-                    self.canvas_trace.add_line(pts[:, 0], pts[:, 1], color, 3)
+                    self.canvas_trace.add_line(pts[:, 0], pts[:, 1], color, 4)
+                    self.canvas_trace.add_text(
+                        f"S{p}",
+                        float(pts[0, 0]) + 5.0,
+                        float(pts[0, 1]) - 5.0,
+                        color="w",
+                        fill=pg.mkBrush(color.red(), color.green(), color.blue(), 190),
+                        border=pg.mkPen(255, 255, 255, 160),
+                    )
         if active_pts is not None and len(active_pts) == 2:
             color = PROBE_QCOLORS[(self._active_probe - 1) % len(PROBE_QCOLORS)]
             self._trace_roi = self.canvas_trace.add_line_roi(active_pts, color, 3)
             self._trace_roi.sigRegionChanged.connect(self._trace_roi_changed)
             self._trace_roi.sigRegionChangeFinished.connect(self._trace_roi_finished)
+            self.canvas_trace.add_text(
+                f"S{self._active_probe}",
+                float(active_pts[0, 0]) + 5.0,
+                float(active_pts[0, 1]) - 5.0,
+                color="w",
+                fill=pg.mkBrush(color.red(), color.green(), color.blue(), 210),
+                border=pg.mkPen(255, 255, 255, 190),
+            )
             self._trace_update_controls(active_pts)
         else:
             self._trace_update_controls(None)
@@ -3107,7 +3153,7 @@ class HistologyTab(QtWidgets.QWidget):
         self.probe_points[key] = self._trace_default_line((x, y))
         self._save_probe_lines()
         self._trace_show()
-        self._log(f"Created editable probe {self._active_probe} line on slice {key[0] + 1}.")
+        self._log(f"Created editable shank {self._active_probe} line on slice {key[0] + 1}.")
 
     def _trace_new_line(self) -> None:
         if not self.slice_images:
@@ -3116,7 +3162,7 @@ class HistologyTab(QtWidgets.QWidget):
         self.probe_points[key] = self._trace_default_line()
         self._save_probe_lines()
         self._trace_show()
-        self._log(f"Created editable probe {self._active_probe} line on slice {key[0] + 1}.")
+        self._log(f"Created editable shank {self._active_probe} line on slice {key[0] + 1}.")
 
     def _trace_roi_changed(self, *_args) -> None:
         if self._trace_updating_roi:
@@ -3141,12 +3187,12 @@ class HistologyTab(QtWidgets.QWidget):
                 for key, val in vals.items():
                     self._trace_coord_spins[key].setValue(val)
                 self.lbl_trace_line.setText(
-                    f"probe {self._active_probe} on slice {self._cur_trace_slice + 1}"
+                    f"shank {self._active_probe} on slice {self._cur_trace_slice + 1}"
                 )
             else:
                 for spin in self._trace_coord_spins.values():
                     spin.setValue(0.0)
-                self.lbl_trace_line.setText("no line for selected probe")
+                self.lbl_trace_line.setText("no line for selected shank")
         finally:
             self._trace_updating_controls = False
 
@@ -3177,29 +3223,97 @@ class HistologyTab(QtWidgets.QWidget):
         self._save_probe_lines()
         self._trace_show()
 
+    @staticmethod
+    def _trace_slice_has_ccf_mapping(sl: Dict[str, np.ndarray]) -> bool:
+        """Return True when a matched atlas slice has every array needed for probe_ccf."""
+        needed = ("plane_ap", "plane_ml", "plane_dv", "tv_slices", "av_slices")
+        return all(k in sl and np.asarray(sl[k]).size for k in needed)
+
+    def _trace_build_inputs(
+        self,
+        at: hatlas.AllenCCFAtlas,
+    ) -> Optional[Tuple[Dict[Tuple[int, int], np.ndarray], List[Dict[str, np.ndarray]], List[np.ndarray], int]]:
+        """Validate traced shanks and build dense per-slice inputs for probe_ccf."""
+        if not self.probe_points:
+            self._log("Draw at least one shank track first.")
+            return None
+        if not self.tforms:
+            self._log("Need atlas2histology transforms first. Run Align and save tforms.")
+            return None
+
+        valid_points: Dict[Tuple[int, int], np.ndarray] = {}
+        stale_keys: List[Tuple[int, int]] = []
+        bad_keys: List[Tuple[int, int]] = []
+        missing_match_slices: List[int] = []
+
+        for (s, p), pts in sorted(self.probe_points.items()):
+            arr = np.asarray(pts, dtype=float)
+            if arr.shape != (2, 2) or not np.isfinite(arr).all():
+                bad_keys.append((s, p))
+                continue
+            if s < 0 or s >= len(self.slice_images):
+                stale_keys.append((s, p))
+                continue
+
+            if s >= len(self.histology_ccf) or not self._trace_slice_has_ccf_mapping(self.histology_ccf[s]):
+                if not self._ensure_histology_ccf_slice(at=at, idx=s, spacing=1, force=True):
+                    missing_match_slices.append(s)
+                    continue
+            if s >= len(self.histology_ccf) or not self._trace_slice_has_ccf_mapping(self.histology_ccf[s]):
+                missing_match_slices.append(s)
+                continue
+            valid_points[(s, p)] = arr.copy()
+
+        for key in stale_keys + bad_keys:
+            self.probe_points.pop(key, None)
+        if stale_keys or bad_keys:
+            self._save_probe_lines()
+            self._trace_show()
+        if stale_keys:
+            self._log(f"Removed {len(stale_keys)} stale shank line(s) outside the current slice list.")
+        if bad_keys:
+            self._log(f"Skipped {len(bad_keys)} invalid shank line(s).")
+        if missing_match_slices:
+            shown = ", ".join(str(i + 1) for i in sorted(set(missing_match_slices)))
+            self._log(f"Match atlas slices first for traced slice(s): {shown}.")
+            return None
+        if not valid_points:
+            self._log("No valid shank tracks remain to build probe_ccf.")
+            return None
+
+        max_slice = max(s for s, _p in valid_points)
+        while len(self.histology_ccf) <= max_slice:
+            self.histology_ccf.append({})
+        missing_tform_slices: List[int] = []
+        while len(self.tforms) <= max_slice:
+            self.tforms.append(np.eye(3))
+            missing_tform_slices.append(len(self.tforms) - 1)
+        if missing_tform_slices:
+            shown = ", ".join(str(i + 1) for i in missing_tform_slices)
+            self._log(f"Using identity alignment for slice(s) without saved tforms: {shown}.")
+
+        # tracing.build_probe_ccf indexes by absolute slice number, so the copied
+        # arrays must be dense up to the highest traced slice even when only a few
+        # slices contain shank lines.
+        pts0 = {(s, p - 1): arr for (s, p), arr in valid_points.items()}
+        histology_ccf = [dict(sl) for sl in self.histology_ccf[:max_slice + 1]]
+        tforms = [np.asarray(t, dtype=float).copy() for t in self.tforms[:max_slice + 1]]
+        n_probes = max(p for _s, p in valid_points)
+        return pts0, histology_ccf, tforms, n_probes
+
     def _trace_build(self) -> None:
         self._trace_commit_roi()
         if self.folder is None:
-            return
-        if not self.histology_ccf or not self.tforms:
-            self._log("Need histology_ccf and tforms first (Match + Align).")
-            return
-        if len(self.tforms) < len(self.histology_ccf):
-            self._log("Need one atlas2histology transform per matched slice. Save tforms first.")
-            return
-        if not self.probe_points:
-            self._log("Draw at least one probe track first.")
             return
         # Load the atlas on the GUI thread (mmap is instant) so the worker is pure
         # compute + save; this also caches it and surfaces a slow first load.
         at = self._ensure_atlas()
         if at is None:
             return
-        n_probes = max(p for _, p in self.probe_points)
-        # tracing uses 0-based probe indices
-        pts0 = {(s, p - 1): np.asarray(v, dtype=float).copy() for (s, p), v in self.probe_points.items()}
-        histology_ccf = list(self.histology_ccf)
-        tforms = [np.asarray(t, dtype=float).copy() for t in self.tforms]
+        inputs = self._trace_build_inputs(at)
+        if inputs is None:
+            return
+        pts0, histology_ccf, tforms, n_probes = inputs
         folder = self.folder
         emit_log = self.log_requested.emit  # thread-safe logging from the worker
         if hasattr(self, "btn_trace_build"):
@@ -3257,7 +3371,7 @@ class HistologyTab(QtWidgets.QWidget):
         ta = p.get("trajectory_areas")
         _crumb(f"draw_trajectory probe {i} addPlot")
         plt = self.trace_areas.addPlot(row=0, col=i)
-        plt.setTitle(f"Probe {i + 1}")
+        plt.setTitle(f"Shank {i + 1}")
         plt.invertY(True)
         plt.hideAxis("bottom")
         if ta is None or len(ta) == 0:
@@ -3289,7 +3403,7 @@ class HistologyTab(QtWidgets.QWidget):
             return
         if self._trajectory_3d_dialog is None:
             dlg = QtWidgets.QDialog(self)
-            dlg.setWindowTitle("Probe trajectories 3D")
+            dlg.setWindowTitle("Shank trajectories 3D")
             dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
             dlg.resize(760, 680)
 
@@ -3372,7 +3486,7 @@ class HistologyTab(QtWidgets.QWidget):
             "log": self.log_requested.emit,
         }
 
-    def _extract_alf(self, *, compute_rms: bool = True) -> None:
+    def _extract_alf(self, *, compute_rms: bool = False) -> None:
         if self.folder is None:
             self._log("Load a session folder first.")
             return
@@ -3399,6 +3513,10 @@ class HistologyTab(QtWidgets.QWidget):
 
         self._run_bg(job, done, busy_msg="Running fast ALF extraction via IBL bridge...")
 
+    def _compute_rms_qc_maps(self) -> None:
+        """Run only the optional slow RMS/QC extraction path for the IBL GUI."""
+        self._extract_alf(compute_rms=True)
+
     def _prepare_for_ibl(self) -> None:
         """Run the complete preparation pipeline needed before opening the IBL GUI."""
         if self.folder is None:
@@ -3420,8 +3538,6 @@ class HistologyTab(QtWidgets.QWidget):
             "--alignment", align,
             "--ks", ks,
             "--ephys", ephys,
-            "--rms",
-            "--force-alf",
         ]
         kw = self._ibl_kwargs()
 
@@ -3433,13 +3549,14 @@ class HistologyTab(QtWidgets.QWidget):
             if rc != 0:
                 self._log("Prepare for IBL failed.")
                 return
-            self._log("Prepare for IBL complete: ALF, RMS/QC, xyz_picks, and channel map are ready.")
+            self._log("Prepare for IBL complete: ALF, xyz_picks, and channel map are ready.")
+            self._log("RMS/QC maps were skipped for speed. Use 'Optional RMS/QC maps' only if you need those IBL GUI panels.")
             self._on_channels_done(0)
 
         self._run_bg(
             job,
             done,
-            busy_msg="Preparing IBL inputs (ALF + RMS/QC + xyz_picks + channel map)...",
+            busy_msg="Preparing IBL inputs (fast ALF + xyz_picks + channel map)...",
         )
 
     def _gen_xyz(self) -> None:
@@ -3505,7 +3622,7 @@ class HistologyTab(QtWidgets.QWidget):
         if ks:
             args += ["--ks", ks]  # geometry reuse; extraction only if --ephys is added too
         if ks and ephys:
-            args += ["--ephys", ephys, "--rms", "--force-alf"]
+            args += ["--ephys", ephys]
         kw = self._ibl_kwargs()
         self._run_bg(lambda: ibl_launch.run_bridge(args, **kw)[0],
                      lambda rc: self._on_channels_done(rc),

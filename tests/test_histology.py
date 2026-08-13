@@ -661,6 +661,102 @@ def test_trace_default_line_reuses_nearby_probe_geometry(tmp_path):
     assert np.all(pts[:, 1] <= 119)
 
 
+def test_trace_contrast_survives_shank_switch(tmp_path):
+    from PySide6 import QtCore, QtWidgets
+    from neuropyguin.tabs.histology_tab import HistologyTab
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    tab = HistologyTab(QtCore.QThreadPool.globalInstance())
+    tab.folder = tmp_path
+    tab.slice_images = [np.zeros((40, 60, 3), dtype=np.uint8)]
+    tab._cur_trace_slice = 0
+    tab._active_probe = 1
+
+    tab._trace_show()
+    tab.canvas_trace.image_item().setLevels((12.0, 180.0))
+    tab._trace_set_probe(2)
+
+    assert np.allclose(tab.canvas_trace.image_item().levels, (12.0, 180.0))
+
+
+def test_trace_show_keeps_all_drawn_shank_lines_visible(tmp_path):
+    from PySide6 import QtCore, QtWidgets
+    from neuropyguin.tabs.histology_tab import HistologyTab
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    tab = HistologyTab(QtCore.QThreadPool.globalInstance())
+    tab.folder = tmp_path
+    tab.slice_images = [np.zeros((80, 100, 3), dtype=np.uint8)]
+    tab._cur_trace_slice = 0
+    tab._active_probe = 2
+    tab.probe_points[(0, 1)] = np.array([[20.0, 20.0], [21.0, 60.0]])
+    tab.probe_points[(0, 2)] = np.array([[40.0, 20.0], [41.0, 60.0]])
+    tab.probe_points[(0, 3)] = np.array([[60.0, 20.0], [61.0, 60.0]])
+
+    tab._trace_show()
+
+    assert tab._trace_roi is not None
+    assert len(tab.canvas_trace._overlays) >= 6
+    assert tab.lbl_trace_line.text() == "shank 2 on slice 1"
+
+
+def test_trace_build_rebuilds_sparse_ccf_for_later_traced_slice(monkeypatch, tmp_path):
+    from PySide6 import QtCore, QtWidgets
+    from neuropyguin.tabs import histology_tab
+    from neuropyguin.tabs.histology_tab import HistologyTab
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    tab = HistologyTab(QtCore.QThreadPool.globalInstance())
+    tab.folder = tmp_path
+    tab.slice_images = [np.zeros((20, 20, 3), dtype=np.uint8) for _ in range(3)]
+    tab.slice_specs = [None, None, {"slice_point": np.array([1.0, 2.0, 3.0]), "camera_vector": np.array([1.0, 0.0, 0.0])}]
+    tab.histology_ccf = []
+    tab.tforms = [np.eye(3)]
+    tab.probe_points[(2, 1)] = np.array([[5.0, 6.0], [7.0, 8.0]])
+
+    rebuilt = {
+        "tv_slices": np.ones((10, 10)),
+        "av_slices": np.ones((10, 10)),
+        "plane_ap": np.ones((10, 10)),
+        "plane_ml": np.ones((10, 10)) * 2,
+        "plane_dv": np.ones((10, 10)) * 3,
+    }
+    calls = {}
+    probes = [{
+        "points": np.array([[1.0, 2.0, 3.0], [1.0, 4.0, 3.0]]),
+        "trajectory_coords": np.array([[1.0, 2.0, 3.0], [1.0, 4.0, 3.0]]),
+        "trajectory_areas": pd.DataFrame(),
+    }]
+
+    class FakeAtlas:
+        pass
+
+    def fake_build_probe(pts0, histology_ccf, tforms, atlas, n_probes):
+        calls["pts0"] = pts0
+        calls["histology_ccf"] = histology_ccf
+        calls["tforms"] = tforms
+        calls["n_probes"] = n_probes
+        return probes
+
+    tab.atlas = FakeAtlas()
+    monkeypatch.setattr(tab, "_ensure_atlas", lambda: tab.atlas)
+    monkeypatch.setattr(histology_tab.matching, "build_histology_ccf", lambda *_args, **_kwargs: [rebuilt])
+    monkeypatch.setattr(histology_tab.tracing, "build_probe_ccf", fake_build_probe)
+    monkeypatch.setattr(histology_tab.io_formats, "save_probe_ccf", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(histology_tab.io_formats, "export_probe_ccf_csv", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(tab, "_draw_trajectory_areas", lambda _probes: None)
+    monkeypatch.setattr(tab, "_save_trajectory_3d_gif", lambda _probes: None)
+    monkeypatch.setattr(tab, "_run_bg", lambda fn, done, *args, **kwargs: done(fn()))
+
+    tab._trace_build()
+
+    assert set(calls["pts0"]) == {(2, 0)}
+    assert calls["n_probes"] == 1
+    assert len(calls["histology_ccf"]) == 3
+    assert len(calls["tforms"]) == 3
+    assert np.array_equal(calls["histology_ccf"][2]["plane_dv"], rebuilt["plane_dv"])
+
+
 def test_image_selection_limits_preprocess_inputs(tmp_path):
     from PIL import Image
     from PySide6 import QtCore, QtWidgets
@@ -753,7 +849,7 @@ def test_preproc_save_removes_stale_app_slice_tiffs_but_keeps_png(tmp_path):
     assert (tmp_path / "slice_2.png").exists()
 
 
-def test_prepare_for_ibl_runs_full_pipeline_with_rms(monkeypatch, tmp_path):
+def test_prepare_for_ibl_runs_fast_required_pipeline_without_rms(monkeypatch, tmp_path):
     from PySide6 import QtCore, QtWidgets
     from neuropyguin.tabs import histology_tab
     from neuropyguin.tabs.histology_tab import HistologyTab
@@ -778,9 +874,27 @@ def test_prepare_for_ibl_runs_full_pipeline_with_rms(monkeypatch, tmp_path):
         "--alignment", "original",
         "--ks", str(tmp_path / "ks"),
         "--ephys", str(tmp_path / "ephys"),
-        "--rms",
-        "--force-alf",
     ]]
+
+
+def test_optional_rms_button_runs_rms_extraction(monkeypatch, tmp_path):
+    from PySide6 import QtCore, QtWidgets
+    from neuropyguin.tabs import histology_tab
+    from neuropyguin.tabs.histology_tab import HistologyTab
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    tab = HistologyTab(QtCore.QThreadPool.globalInstance())
+    tab.folder = tmp_path
+    tab.ed_ks.setText(str(tmp_path / "ks"))
+    tab.ed_ephys.setText(str(tmp_path / "ephys"))
+    seen = []
+
+    monkeypatch.setattr(histology_tab.ibl_launch, "run_bridge", lambda args, **kwargs: seen.append(args) or (0, ""))
+    monkeypatch.setattr(tab, "_run_bg", lambda fn, done, *args, **kwargs: done(fn()))
+
+    tab._compute_rms_qc_maps()
+
+    assert seen == [["extract_alf", str(tmp_path / "ks"), str(tmp_path / "ephys"), str(tmp_path), "--rms"]]
 
 
 def test_fast_extract_alf_exports_minimal_arrays(tmp_path):
@@ -878,7 +992,14 @@ def test_trace_build_updates_embedded_3d_without_popup(monkeypatch, tmp_path):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     tab = HistologyTab(QtCore.QThreadPool.globalInstance())
     tab.folder = tmp_path
-    tab.histology_ccf = [{"tv_slices": np.ones((10, 10)), "av_slices": np.ones((10, 10))}]
+    tab.slice_images = [np.zeros((10, 10, 3), dtype=np.uint8)]
+    tab.histology_ccf = [{
+        "tv_slices": np.ones((10, 10)),
+        "av_slices": np.ones((10, 10)),
+        "plane_ap": np.ones((10, 10)),
+        "plane_ml": np.ones((10, 10)) * 2,
+        "plane_dv": np.ones((10, 10)) * 3,
+    }]
     tab.tforms = [np.eye(3)]
     tab.probe_points[(0, 1)] = np.array([[1.0, 2.0], [3.0, 4.0]])
 
