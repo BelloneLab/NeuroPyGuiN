@@ -210,6 +210,8 @@ sudo apt install libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
 Then create the Linux environment and launch the app:
 
 ```bash
+git clone https://github.com/BelloneLab/NeuroPyGuiN.git
+cd NeuroPyGuiN
 conda env create -f environment-linux.yml
 conda activate neuropyguin
 python main.py
