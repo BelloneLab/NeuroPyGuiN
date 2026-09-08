@@ -35,6 +35,8 @@ tools/_pytest_tmp/
 /postprocessing.md
 /.codex_memory.md
 /.cli_memory.md
+/.claude_memory.md
+/Kilosort_Crash_Diagnostic_Report.txt
 
 # Large binary/runtime artifacts
 *.npy

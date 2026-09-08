@@ -71,5 +71,15 @@ def ecephys_subprocess_env() -> Dict[str, str]:
     # interpreter exit with code 1 after Kilosort has successfully saved every
     # result. Agg renders the same files without creating a GUI connection.
     env["MPLBACKEND"] = "Agg"
+    # MKL 2026.1.0 in this conda env is paired with llvm-openmp 22.1.8, whose
+    # libiomp5md.dll does not export __atomic_load / __atomic_compare_exchange.
+    # mkl_intel_thread.3.dll delay-loads both of them, so the first threaded
+    # LAPACK call (Kilosort's TruncatedSVD inside spikedetect.extract_wPCA_wTEMP)
+    # makes the Windows delay-load helper terminate the process with
+    # STATUS_ENTRYPOINT_NOT_FOUND (0xC06D007F, surfacing as exit code
+    # 3228369023) and no Python traceback. Routing MKL through TBB, which is
+    # already installed, avoids libiomp5md entirely. An explicit user setting wins.
+    if not env.get("MKL_THREADING_LAYER"):
+        env["MKL_THREADING_LAYER"] = "TBB"
     return env
 
