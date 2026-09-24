@@ -2,12 +2,51 @@ import numpy as np
 from contextlib import contextmanager
 import inspect
 
-from scipy.signal import correlate, find_peaks, cwt, ricker
+from scipy.signal import correlate, find_peaks
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeClassifier
 
 from scipy.interpolate import griddata
-from scipy.ndimage.filters import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d
+
+
+# ---------------------------------------------------------------------------
+# scipy.signal.cwt / scipy.signal.ricker were deprecated in SciPy 1.12 and
+# removed in SciPy 1.15. The two functions below are line-for-line ports of the
+# original SciPy implementations, so the wavelet feature (and therefore every
+# threshold tuned on it, e.g. min_wavelet_peak_height) is numerically unchanged.
+# ---------------------------------------------------------------------------
+def ricker(points, a):
+    """Ricker ("Mexican hat") wavelet sampled on `points` samples with width `a`.
+
+    Identical to the removed scipy.signal.ricker:
+        A * (1 - x^2 / a^2) * exp(-x^2 / (2 a^2)),  A = 2 / (sqrt(3a) * pi^(1/4))
+    with x centred on the middle sample.
+    """
+    A = 2 / (np.sqrt(3 * a) * (np.pi ** 0.25))
+    wsq = a ** 2
+    vec = np.arange(0, points) - (points - 1.0) / 2
+    xsq = vec ** 2
+    mod = 1 - xsq / wsq
+    gauss = np.exp(-xsq / (2 * wsq))
+    return A * mod * gauss
+
+
+def cwt(data, wavelet, widths):
+    """Continuous wavelet transform, identical to the removed scipy.signal.cwt.
+
+    For each width w the wavelet is sampled on N = min(10*w, len(data)) points,
+    time-reversed and conjugated, then convolved with `data` ('same' mode).
+    Returns an array of shape (len(widths), len(data)).
+    """
+    data = np.asarray(data)
+    dtype = np.complex128 if np.iscomplexobj(data) else np.float64
+    output = np.empty((len(widths), len(data)), dtype=dtype)
+    for ind, width in enumerate(widths):
+        N = int(np.min([10 * width, len(data)]))
+        wavelet_data = np.conj(wavelet(N, width)[::-1])
+        output[ind] = np.convolve(data, wavelet_data, mode='same')
+    return output
 
 from ...common.utils import printProgressBar
 
