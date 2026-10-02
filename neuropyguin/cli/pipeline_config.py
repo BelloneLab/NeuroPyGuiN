@@ -100,9 +100,9 @@ def default_pipeline_settings() -> Dict[str, Any]:
         "run_pybombcell": True,
         # Run identity (per-file values are re-parsed from each bin name)
         "ks_ver": "4",
-        "gate_string": "0",
-        "trigger_string": "0,0",
-        "probe_string": "0",
+        "gate_string": "current",
+        "trigger_string": "current",
+        "probe_string": "current",
         "region_name": "default",
         # CatGT / TPrime strings
         "ni_extract_string": "-xd=0,0,8,7,0 -xd=0,0,8,5,0 -xd=0,0,8,6,0 -xd=0,0,8,3,0",
@@ -181,6 +181,12 @@ def settings_pipeline_overrides(settings=None) -> Dict[str, Any]:
     put_str("gate_string", "preproc/gate_string")
     put_str("trigger_string", "preproc/trigger_string")
     put_str("probe_string", "preproc/probe_string")
+    if out.get("gate_string") == "0":
+        out["gate_string"] = "current"
+    if out.get("trigger_string") == "0,0":
+        out["trigger_string"] = "current"
+    if out.get("probe_string") == "0":
+        out["probe_string"] = "current"
     put_str("region_name", "preproc/region_name")
     put_str("ks_th", "preproc/ks_th")
     put_str("ni_extract_string", "preproc/ni_extract_string")

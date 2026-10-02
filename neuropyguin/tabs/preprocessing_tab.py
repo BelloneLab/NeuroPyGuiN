@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Dict, List
 import json
 import math
+import re
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -40,13 +41,8 @@ from ..preprocessing import (
 from ..flow_layout import FlowLayout
 from ..side_nav import SideNavStack
 from ..string_builders import (
-    BitFieldBuilderDialog,
-    CatGTStringBuilderDialog,
-    TPrimeStringBuilderDialog,
-    catgt_command_bf_extractors,
-    catgt_command_extractors,
-    merge_bitfields_into_catgt_command,
-    merge_extractors_into_catgt_command,
+    CatGTSetupDialog,
+    build_catgt_command_preview,
 )
 from ..tool_install_dialog import ToolInstallProgressDialog, ToolMaintenanceDialog, ToolStatus
 from ..tool_installer import (
@@ -745,6 +741,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._concatenating = False
         self._pending_concat_ni_extract: List[str] = []
         self._ks4_adv_params: Dict[str, object] = {}
+        self._catgt_probe_count = 1
+        self._catgt_probe_ids = "0"
         self._active_run_context: Dict[str, object] | None = None
         self._tool_install_worker: ToolInstallWorker | None = None
         self._tool_install_dialog: ToolInstallProgressDialog | None = None
@@ -922,11 +920,38 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_adv_ks4 = QtWidgets.QPushButton("Advanced sorting parameters")
         self.btn_adv_ks4.setProperty("role", "secondary")
 
-        self.ed_gate = QtWidgets.QLineEdit("0")
-        self.ed_trigger = QtWidgets.QLineEdit("0,0")
-        self.ed_probe = QtWidgets.QLineEdit("0")
+        self.ed_gate = QtWidgets.QLineEdit("current")
+        self.ed_trigger = QtWidgets.QLineEdit("current")
+        self.ed_probe = QtWidgets.QLineEdit("current")
+        for hidden_selector in [self.ed_gate, self.ed_trigger, self.ed_probe]:
+            hidden_selector.setVisible(False)
         self.ed_region = QtWidgets.QLineEdit("default")
         self.ed_ks_th = QtWidgets.QLineEdit("[8,9]")
+        self.ed_ks_th.setVisible(False)
+        self.sp_ks_th_universal = QtWidgets.QDoubleSpinBox()
+        self.sp_ks_th_universal.setRange(0.1, 50.0)
+        self.sp_ks_th_universal.setDecimals(1)
+        self.sp_ks_th_universal.setValue(8.0)
+        self.sp_ks_th_learned = QtWidgets.QDoubleSpinBox()
+        self.sp_ks_th_learned.setRange(0.1, 50.0)
+        self.sp_ks_th_learned.setDecimals(1)
+        self.sp_ks_th_learned.setValue(9.0)
+        self.sp_ks4_batch_size = QtWidgets.QSpinBox()
+        self.sp_ks4_batch_size.setRange(10000, 240000)
+        self.sp_ks4_batch_size.setSingleStep(10000)
+        self.sp_ks4_batch_size.setValue(60000)
+        self.sp_ks4_nblocks = QtWidgets.QSpinBox()
+        self.sp_ks4_nblocks.setRange(0, 20)
+        self.sp_ks4_nblocks.setValue(5)
+        self.sp_ks4_tmin = QtWidgets.QDoubleSpinBox()
+        self.sp_ks4_tmin.setRange(0.0, 86400.0)
+        self.sp_ks4_tmin.setDecimals(1)
+        self.sp_ks4_tmin.setSuffix(" s")
+        self.sp_ks4_tmax = QtWidgets.QDoubleSpinBox()
+        self.sp_ks4_tmax.setRange(-1.0, 86400.0)
+        self.sp_ks4_tmax.setDecimals(1)
+        self.sp_ks4_tmax.setSuffix(" s")
+        self.sp_ks4_tmax.setValue(-1.0)
         self.ed_qm_isi = QtWidgets.QDoubleSpinBox()
         self.ed_qm_isi.setRange(0.0001, 0.01)
         self.ed_qm_isi.setDecimals(4)
@@ -938,7 +963,10 @@ class PreprocessingTab(QtWidgets.QWidget):
 
         self.ed_ni_extract = QtWidgets.QLineEdit("-xd=0,0,8,7,0 -xd=0,0,8,5,0 -xd=0,0,8,6,0 -xd=0,0,8,3,0")
         self.ed_tostream = QtWidgets.QLineEdit("imec0")
+        self.ed_ni_extract.setReadOnly(True)
+        self.ed_tostream.setReadOnly(True)
         self.ed_catgt_cmd = QtWidgets.QLineEdit("-prb_fld -out_prb_fld -apfilter=butter,12,300,10000 -gfix=0.4,0.10,0.02")
+        self.ed_catgt_cmd.setReadOnly(True)
         self.cb_catgt_output_streams = QtWidgets.QComboBox()
         self.cb_catgt_output_streams.addItem("AP", "ap")
         self.cb_catgt_output_streams.addItem("LFP", "lfp")
@@ -954,16 +982,20 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.sp_catgt_lf_downsample = QtWidgets.QComboBox()
         self.sp_catgt_lf_downsample.addItems(["2", "3", "4", "5", "6", "10", "12", "15", "20", "25", "30"])
         self.sp_catgt_lf_downsample.setCurrentText("12")
-        self.btn_build_tprime = QtWidgets.QPushButton("Build")
-        self.btn_build_catgt = QtWidgets.QPushButton("Build")
-        self.btn_build_bitfield = QtWidgets.QPushButton("Bit-field")
-        self.btn_build_tprime.setProperty("role", "secondary")
-        self.btn_build_catgt.setProperty("role", "secondary")
-        self.btn_build_bitfield.setProperty("role", "ghost")
-        self.btn_build_tprime.setToolTip(
-            "Open the TPrime/CatGT extractor builder. Includes a guided preset for aligning NI analog channels "
-            "onto an imec stream such as imec0."
+        self.lbl_catgt_summary = QtWidgets.QLabel()
+        self.lbl_catgt_summary.setObjectName("SectionHint")
+        self.lbl_catgt_summary.setWordWrap(True)
+        self.txt_catgt_preview = QtWidgets.QPlainTextEdit()
+        self.txt_catgt_preview.setReadOnly(True)
+        self.txt_catgt_preview.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        self.txt_catgt_preview.setFixedHeight(94)
+        self.txt_catgt_preview.setFont(QtGui.QFont("Consolas", 9))
+        self.btn_configure_catgt = QtWidgets.QPushButton("Configure CatGT…")
+        self.btn_configure_catgt.setProperty("role", "secondary")
+        self.btn_configure_catgt.setToolTip(
+            "Choose gates, triggers, probe, AP/LFP filtering, event extraction, and synchronization in one guided window."
         )
+        self.btn_build_catgt = self.btn_configure_catgt
         self.cb_catgt_car_mode = QtWidgets.QComboBox()
         self.cb_catgt_car_mode.addItems(["gbldmx", "loccar", "none"])
         self.sp_loccar_min = QtWidgets.QDoubleSpinBox()
@@ -972,6 +1004,15 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.sp_loccar_max = QtWidgets.QDoubleSpinBox()
         self.sp_loccar_max.setRange(1.0, 1000.0)
         self.sp_loccar_max.setValue(160.0)
+        for generated_control in [
+            self.cb_catgt_output_streams,
+            self.sp_catgt_lf_lowpass,
+            self.sp_catgt_lf_downsample,
+            self.cb_catgt_car_mode,
+            self.sp_loccar_min,
+            self.sp_loccar_max,
+        ]:
+            generated_control.setVisible(False)
         self.sp_ks4_dup_ms = QtWidgets.QDoubleSpinBox()
         self.sp_ks4_dup_ms.setDecimals(3)
         self.sp_ks4_dup_ms.setRange(0.01, 2.0)
@@ -1019,18 +1060,16 @@ class PreprocessingTab(QtWidgets.QWidget):
         wrap_ks4_repo = QtWidgets.QWidget(); wrap_ks4_repo.setLayout(row_ks4_repo)
         wrap_ks_tmp = QtWidgets.QWidget(); wrap_ks_tmp.setLayout(row_ks_tmp)
 
-        row_tostream = QtWidgets.QHBoxLayout()
-        row_tostream.setContentsMargins(0, 0, 0, 0)
-        row_tostream.addWidget(self.ed_tostream, 1)
-        row_tostream.addWidget(self.btn_build_tprime, 0)
-        wrap_tostream = QtWidgets.QWidget()
-        wrap_tostream.setLayout(row_tostream)
+        row_catgt_setup = QtWidgets.QHBoxLayout()
+        row_catgt_setup.setContentsMargins(0, 0, 0, 0)
+        row_catgt_setup.addWidget(self.lbl_catgt_summary, 1)
+        row_catgt_setup.addWidget(self.btn_configure_catgt, 0)
+        wrap_catgt_setup = QtWidgets.QWidget()
+        wrap_catgt_setup.setLayout(row_catgt_setup)
 
         row_catgt_cmd = QtWidgets.QHBoxLayout()
         row_catgt_cmd.setContentsMargins(0, 0, 0, 0)
         row_catgt_cmd.addWidget(self.ed_catgt_cmd, 1)
-        row_catgt_cmd.addWidget(self.btn_build_catgt, 0)
-        row_catgt_cmd.addWidget(self.btn_build_bitfield, 0)
         wrap_catgt_cmd = QtWidgets.QWidget()
         wrap_catgt_cmd.setLayout(row_catgt_cmd)
 
@@ -1098,38 +1137,12 @@ class PreprocessingTab(QtWidgets.QWidget):
         right_column.setSpacing(12)
 
         acquisition_box, acquisition_grid = make_section(
-            "Run naming and sorter",
-            "Session identifiers and main sorter settings used to generate the pipeline inputs.",
-        )
-        ks_ver_row = QtWidgets.QHBoxLayout()
-        ks_ver_row.setContentsMargins(0, 0, 0, 0)
-        ks_ver_row.addWidget(self.cb_ks_ver, 1)
-        ks_ver_row.addWidget(self.btn_adv_ks4, 0)
-        ks_ver_wrap = QtWidgets.QWidget()
-        ks_ver_wrap.setLayout(ks_ver_row)
-        acquisition_grid.addWidget(
-            make_field("Kilosort version", ks_ver_wrap, "Select sorter backend version. Use 4 for Kilosort4 helper."),
-            0,
-            0,
-        )
-        acquisition_grid.addWidget(
-            make_field("Gate string", self.ed_gate, "Gate id used by CatGT naming convention (g#)."),
-            0,
-            1,
-        )
-        acquisition_grid.addWidget(
-            make_field("Trigger string", self.ed_trigger, "Trigger index (t#). Accepts single value or pair like 0,0."),
-            1,
-            0,
-        )
-        acquisition_grid.addWidget(
-            make_field("Probe string", self.ed_probe, "Probe id in SpikeGLX naming convention (imec#)."),
-            1,
-            1,
+            "Run metadata",
+            "Optional anatomy label carried into output metadata. CatGT run and probe choices are grouped in CatGT setup.",
         )
         acquisition_grid.addWidget(
             make_field("Region", self.ed_region, "Optional region label used in metadata outputs."),
-            2,
+            0,
             0,
             1,
             2,
@@ -1137,15 +1150,50 @@ class PreprocessingTab(QtWidgets.QWidget):
 
         metrics_box, metrics_grid = make_section(
             "Sorting and metrics",
-            "Thresholds and downstream quality settings that shape unit detection and validation.",
+            "Set the main Kilosort detection, drift, and timing controls here. Less common KS4 values remain in Advanced sorting parameters.",
+        )
+        sorter_row = QtWidgets.QHBoxLayout()
+        sorter_row.setContentsMargins(0, 0, 0, 0)
+        sorter_row.addWidget(self.cb_ks_ver, 1)
+        sorter_row.addWidget(self.btn_adv_ks4, 0)
+        sorter_wrap = QtWidgets.QWidget()
+        sorter_wrap.setLayout(sorter_row)
+        metrics_grid.addWidget(
+            make_field("Kilosort version and advanced controls", sorter_wrap, "Choose the sorter backend or open all supported KS4 parameters."),
+            0,
+            0,
+            1,
+            2,
         )
         metrics_grid.addWidget(
-            make_field(
-                "KS threshold [universal, learned]",
-                self.ed_ks_th,
-                "KS4 thresholds [Th_universal,Th_learned]. Lower values detect more spikes and more units.",
-            ),
+            make_field("Universal detection threshold", self.sp_ks_th_universal, "Lower thresholds detect more spikes and may increase false detections."),
+            1,
             0,
+        )
+        metrics_grid.addWidget(
+            make_field("Learned-template threshold", self.sp_ks_th_learned, "Controls detection around learned templates; lower values can recover weaker units."),
+            1,
+            1,
+        )
+        metrics_grid.addWidget(
+            make_field("Batch size (samples)", self.sp_ks4_batch_size, "Samples processed in each Kilosort4 batch. Larger batches use more GPU memory."),
+            2,
+            0,
+        )
+        metrics_grid.addWidget(
+            make_field("Drift correction blocks", self.sp_ks4_nblocks, "0 disables drift correction, 1 uses rigid correction, larger values allow non-rigid correction."),
+            2,
+            1,
+        )
+        time_window = QtWidgets.QWidget()
+        time_row = QtWidgets.QHBoxLayout(time_window)
+        time_row.setContentsMargins(0, 0, 0, 0)
+        time_row.addWidget(self.sp_ks4_tmin)
+        time_row.addWidget(QtWidgets.QLabel("to"))
+        time_row.addWidget(self.sp_ks4_tmax)
+        metrics_grid.addWidget(
+            make_field("Sort time window", time_window, "Choose the start and end in seconds. End time -1 means the full recording."),
+            3,
             0,
             1,
             2,
@@ -1156,7 +1204,7 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self.ed_qm_isi,
                 "Refractory-violation threshold used in the quality metrics module.",
             ),
-            1,
+            4,
             0,
         )
         metrics_grid.addWidget(
@@ -1165,7 +1213,7 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self.sp_ks4_dup_ms,
                 "Remove same-unit spikes within this interval as likely duplicates.",
             ),
-            1,
+            4,
             1,
         )
         metrics_grid.addWidget(
@@ -1174,7 +1222,7 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self.sp_ks4_min_template,
                 "Smallest Gaussian spatial envelope width for templates.",
             ),
-            2,
+            5,
             0,
         )
         metrics_grid.addWidget(
@@ -1183,13 +1231,13 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self.sp_cwaves_um,
                 "Radius used for waveform SNR calculations.",
             ),
-            2,
+            5,
             1,
         )
 
         sync_box, sync_grid = make_section(
             "Sync and CatGT",
-            "Synchronization inputs and CatGT-specific preprocessing values.",
+            "CatGT selection, filtering, and event extraction are configured together. TPrime sync period stays here.",
         )
         sync_grid.addWidget(
             make_field("TPrime sync period", self.ed_sync_period, "Period (s) for synchronization pulses in TPrime."),
@@ -1199,66 +1247,35 @@ class PreprocessingTab(QtWidgets.QWidget):
         sync_grid.addWidget(
             make_field(
                 "TPrime toStream",
-                wrap_tostream,
+                self.ed_tostream,
                 "Reference stream in TPrime nomenclature, for example ni, imec0, or obx0.",
             ),
             0,
             1,
         )
         sync_grid.addWidget(
-            make_field("CatGT CAR mode", self.cb_catgt_car_mode, "CAR mode for CatGT: gbldmx, loccar, or none."),
+            make_field("CatGT setup", wrap_catgt_setup, "Choose which gates, triggers, and probe to process. Set AP/LFP output, filters, reference, event extraction, and sync in the guided setup."),
             1,
             0,
+            1,
+            2,
         )
         sync_grid.addWidget(
-            make_field(
-                "CatGT neural output",
-                self.cb_catgt_output_streams,
-                "Write AP, LFP, or both. LFP output uses CatGT's low-pass filter and AP-to-LF downsampling.",
-            ),
-            1,
-            1,
-        )
-        sync_grid.addWidget(
-            make_field("LFP low-pass (Hz)", self.sp_catgt_lf_lowpass, "CatGT LF-band low-pass corner."),
+            make_field("CatGT flags", wrap_catgt_cmd, "Generated CatGT filtering and processing options."),
             2,
             0,
-        )
-        sync_grid.addWidget(
-            make_field(
-                "LFP downsample factor",
-                self.sp_catgt_lf_downsample,
-                "Must evenly divide 30000. Factor 12 produces 2500 Hz; factor 30 produces 1000 Hz.",
-            ),
-            2,
             1,
+            2,
         )
         sync_grid.addWidget(
-            make_field("CatGT command string", wrap_catgt_cmd, "Additional raw CatGT flags appended to command line."),
+            make_field("Event extractors", self.ed_ni_extract, "CatGT digital and analog event extractor flags used for event files and TPrime alignment."),
             3,
             0,
             1,
-            2,
         )
         sync_grid.addWidget(
-            make_field("CatGT loccar min (um)", self.sp_loccar_min, "Inner radius for loccar mode in microns."),
+            make_field("Full CatGT command preview", self.txt_catgt_preview, "Preview includes run selection, output bands, reference mode, filters, and event flags."),
             4,
-            0,
-        )
-        sync_grid.addWidget(
-            make_field("CatGT loccar max (um)", self.sp_loccar_max, "Outer radius for loccar mode in microns."),
-            4,
-            1,
-        )
-        sync_grid.addWidget(
-            make_field(
-                "TPrime/CatGT extractors",
-                self.ed_ni_extract,
-                "CatGT extractor flags used to generate TPrime-alignable event files. Supports NI, imec, and obx "
-                "streams with rising/falling digital edges (xd/xid) and rising/falling analog edges (xa/xia). "
-                "Use Build for a guided NI-analog-to-imec preset.",
-            ),
-            5,
             0,
             1,
             2,
@@ -1534,7 +1551,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             return page
 
         params_sections.add_page("Pipeline steps", _new_params_page(steps_box))
-        params_sections.add_page("Run naming", _new_params_page(acquisition_box))
+        params_sections.add_page("Run metadata", _new_params_page(acquisition_box))
         params_sections.add_page("Sorting and metrics", _new_params_page(metrics_box))
         params_sections.add_page("Sync and CatGT", _new_params_page(sync_box))
         params_sections.add_page("Tool and outputs", _new_params_page(paths_box))
@@ -1577,6 +1594,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_clear.clicked.connect(self._clear)
         self.btn_run.clicked.connect(self._run_queue)
         self.list_jobs.itemSelectionChanged.connect(self._update_concat_button_state)
+        self.list_jobs.itemSelectionChanged.connect(self._refresh_catgt_summary)
         self.btn_copy_log.clicked.connect(self._copy_log)
         self.btn_scan_completed_root.clicked.connect(self._scan_completed_root)
         self.list_jobs.filesDropped.connect(self._consume_drop)
@@ -1631,6 +1649,19 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.sp_ks4_dup_ms.valueChanged.connect(lambda _value: self._persist_settings())
         self.sp_ks4_min_template.valueChanged.connect(lambda _value: self._persist_settings())
         self.sp_cwaves_um.valueChanged.connect(lambda _value: self._persist_settings())
+        for sorter_widget in [
+            self.sp_ks_th_universal,
+            self.sp_ks_th_learned,
+            self.sp_ks4_batch_size,
+            self.sp_ks4_nblocks,
+            self.sp_ks4_tmin,
+            self.sp_ks4_tmax,
+        ]:
+            sorter_widget.valueChanged.connect(self._on_visible_sorter_setting_changed)
+        self.ed_catgt_cmd.textChanged.connect(lambda _text: self._refresh_catgt_summary())
+        self.ed_ni_extract.textChanged.connect(lambda _text: self._refresh_catgt_summary())
+        self.ed_tostream.textChanged.connect(lambda _text: self._refresh_catgt_summary())
+        self.cb_catgt_output_streams.currentIndexChanged.connect(lambda _index: self._refresh_catgt_summary())
         self.ed_catgt_path.editingFinished.connect(self._persist_settings)
         self.ed_tprime_path.editingFinished.connect(self._persist_settings)
         self.ed_cwaves_path.editingFinished.connect(self._persist_settings)
@@ -1640,9 +1671,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.ed_cwaves_path.editingFinished.connect(self._refresh_tool_status)
         self.ed_ks4_repo.editingFinished.connect(self._refresh_tool_status)
         self.ed_ks_tmp.editingFinished.connect(self._persist_settings)
-        self.btn_build_catgt.clicked.connect(self._open_catgt_builder)
-        self.btn_build_bitfield.clicked.connect(self._open_bitfield_builder)
-        self.btn_build_tprime.clicked.connect(self._open_tprime_builder)
+        self.btn_configure_catgt.clicked.connect(self._open_catgt_builder)
         self.btn_to_curation.clicked.connect(self._open_selected_curation)
         self.btn_to_histology.clicked.connect(self._open_selected_histology)
         self.btn_adv_ks4.clicked.connect(self._open_ks4_advanced)
@@ -1654,6 +1683,106 @@ class PreprocessingTab(QtWidgets.QWidget):
         """Return the selected output layout mode (see ``preprocessing.OUTPUT_LAYOUTS``)."""
         value = self.cb_output_layout.currentData()
         return normalize_output_layout(str(value or ""), mirror_raw_hierarchy=True)
+
+    def _sync_visible_ks4_settings(self) -> None:
+        """Copy the frequently used KS4 controls into the shared override map."""
+        universal = float(self.sp_ks_th_universal.value())
+        learned = float(self.sp_ks_th_learned.value())
+        self.ed_ks_th.setText(f"[{universal:g},{learned:g}]")
+        self._ks4_adv_params.update(
+            {
+                "Th_universal": universal,
+                "Th_learned": learned,
+                "batch_size": int(self.sp_ks4_batch_size.value()),
+                "nblocks": int(self.sp_ks4_nblocks.value()),
+                "tmin": float(self.sp_ks4_tmin.value()),
+                "tmax": float(self.sp_ks4_tmax.value()),
+            }
+        )
+
+    def _apply_ks4_values_to_visible_controls(self) -> None:
+        """Reflect restored or advanced-dialog KS4 values in the main form."""
+        try:
+            threshold_values = [float(value) for value in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", self.ed_ks_th.text())]
+        except ValueError:
+            threshold_values = []
+        defaults = {
+            "Th_universal": threshold_values[0] if len(threshold_values) > 0 else 8.0,
+            "Th_learned": threshold_values[1] if len(threshold_values) > 1 else 9.0,
+            "batch_size": 60000,
+            "nblocks": 5,
+            "tmin": 0.0,
+            "tmax": -1.0,
+        }
+        for key, default in defaults.items():
+            value = self._ks4_adv_params.get(key, default)
+            if value is None:
+                value = default
+            if key == "Th_universal":
+                self.sp_ks_th_universal.setValue(float(value))
+            elif key == "Th_learned":
+                self.sp_ks_th_learned.setValue(float(value))
+            elif key == "batch_size":
+                self.sp_ks4_batch_size.setValue(int(value))
+            elif key == "nblocks":
+                self.sp_ks4_nblocks.setValue(int(value))
+            elif key == "tmin":
+                self.sp_ks4_tmin.setValue(float(value))
+            elif key == "tmax":
+                self.sp_ks4_tmax.setValue(float(value))
+        self._sync_visible_ks4_settings()
+
+    def _on_visible_sorter_setting_changed(self, *_args) -> None:
+        self._sync_visible_ks4_settings()
+        self._persist_settings()
+
+    def _refresh_catgt_summary(self, *_args) -> None:
+        """Update the compact summary and complete command preview on the settings page."""
+        if not hasattr(self, "txt_catgt_preview"):
+            return
+        selected = self._selected_inqueue_jobs()
+        job = selected[0] if selected else (self.jobs[0] if self.jobs else {})
+        bin_path = Path(str(job.get("bin_file") or "")) if job.get("bin_file") else None
+        identity = parse_spikeglx_bin_name(str(bin_path)) if bin_path else {}
+        run_name = str(identity.get("run_name") or job.get("name") or "<run name>")
+        current_gate = str(identity.get("gate_string") or "0")
+        current_trigger = str(identity.get("trigger_string") or "0,0")
+        current_probe = str(identity.get("probe_string") or "0")
+        gate_mode = self.ed_gate.text().strip().lower()
+        trigger_mode = self.ed_trigger.text().strip().lower()
+        probe_mode = self.ed_probe.text().strip().lower()
+        gate = self._available_gate_range(bin_path, run_name, current_gate) if bin_path and gate_mode == "all" else (
+            current_gate if gate_mode == "current" else ("0,0" if gate_mode == "all" else self.ed_gate.text().strip())
+        )
+        trigger = "start,end" if trigger_mode == "all" else (
+            current_trigger if trigger_mode == "current" else self.ed_trigger.text().strip()
+        )
+        probe = current_probe if probe_mode == "current" else self.ed_probe.text().strip()
+        input_directory = "<input folder>"
+        if bin_path and len(bin_path.parents) > 1:
+            input_directory = str(bin_path.parents[2] if len(bin_path.parents) > 2 and "_imec" in bin_path.parent.name else bin_path.parents[1])
+        output_mode = str(self.cb_catgt_output_streams.currentData() or "ap")
+        mode_label = {"ap": "AP", "lfp": "LFP", "both": "AP + LFP"}.get(output_mode, "AP")
+        gate_label = {"current": f"input gate {current_gate}", "all": f"all gates ({gate})"}.get(gate_mode, f"gates {gate}")
+        trigger_label = {"current": f"input trigger {current_trigger}", "all": "all triggers"}.get(trigger_mode, f"triggers {trigger}")
+        probe_label = f"input probe {current_probe}" if probe_mode == "current" else f"probe {probe} of {self._catgt_probe_count} recorded"
+        self.lbl_catgt_summary.setText(f"{mode_label}. {gate_label}. {trigger_label}. {probe_label}.")
+        self.txt_catgt_preview.setPlainText(
+            build_catgt_command_preview(
+                run_name=run_name,
+                input_directory=input_directory,
+                output_directory="<configured output folder>",
+                gate_string=gate,
+                trigger_string=trigger,
+                probe_string=probe,
+                output_streams=output_mode,
+                car_mode=self.cb_catgt_car_mode.currentText(),
+                loccar_min_um=float(self.sp_loccar_min.value()),
+                loccar_max_um=float(self.sp_loccar_max.value()),
+                command_flags=self.ed_catgt_cmd.text().strip(),
+                extractor_flags=self.ed_ni_extract.text().strip(),
+            )
+        )
 
     def _on_catgt_output_mode_changed(self, *_args) -> None:
         """Enable LFP-specific controls only when CatGT will write LF data."""
@@ -2145,6 +2274,7 @@ class PreprocessingTab(QtWidgets.QWidget):
     def _refresh_queue_summary(self) -> None:
         # The output preview names the first queued run, so it follows the queue.
         self._refresh_output_preview()
+        self._refresh_catgt_summary()
         if not hasattr(self, "lbl_queue_summary"):
             return
         n_jobs = len(self.jobs)
@@ -2460,6 +2590,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._refresh_queue_summary()
 
     def _collect_cfg(self) -> EcephysPipelineConfig:
+        self._sync_visible_ks4_settings()
         return EcephysPipelineConfig(
             output_root=self.ed_output.text().strip(),
             json_root=self.ed_json.text().strip(),
@@ -3184,6 +3315,18 @@ class PreprocessingTab(QtWidgets.QWidget):
             self.ed_gate.setText(str(self.settings.value("preproc/gate_string", self.ed_gate.text())))
             self.ed_trigger.setText(str(self.settings.value("preproc/trigger_string", self.ed_trigger.text())))
             self.ed_probe.setText(str(self.settings.value("preproc/probe_string", self.ed_probe.text())))
+            if self.ed_gate.text().strip() == "0":
+                self.ed_gate.setText("current")
+            if self.ed_trigger.text().strip() == "0,0":
+                self.ed_trigger.setText("current")
+            if self.ed_probe.text().strip() == "0":
+                self.ed_probe.setText("current")
+            self._catgt_probe_count = max(
+                1, int(self.settings.value("preproc/catgt_probe_count", self._catgt_probe_count))
+            )
+            self._catgt_probe_ids = str(
+                self.settings.value("preproc/catgt_probe_ids", self._catgt_probe_ids)
+            )
             self.ed_region.setText(str(self.settings.value("preproc/region_name", self.ed_region.text())))
             self.ed_ks_th.setText(str(self.settings.value("preproc/ks_th", self.ed_ks_th.text())))
             self.ed_ni_extract.setText(str(self.settings.value("preproc/ni_extract_string", self.ed_ni_extract.text())))
@@ -3227,6 +3370,7 @@ class PreprocessingTab(QtWidgets.QWidget):
                 self._ks4_adv_params = json.loads(raw_adv) if raw_adv else {}
             except Exception:
                 self._ks4_adv_params = {}
+            self._apply_ks4_values_to_visible_controls()
             self._restore_completed_history()
         finally:
             self._restoring_settings = False
@@ -3249,6 +3393,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.settings.setValue("preproc/gate_string", self.ed_gate.text().strip())
         self.settings.setValue("preproc/trigger_string", self.ed_trigger.text().strip())
         self.settings.setValue("preproc/probe_string", self.ed_probe.text().strip())
+        self.settings.setValue("preproc/catgt_probe_count", int(self._catgt_probe_count))
+        self.settings.setValue("preproc/catgt_probe_ids", self._catgt_probe_ids)
         self.settings.setValue("preproc/region_name", self.ed_region.text().strip())
         self.settings.setValue("preproc/ks_th", self.ed_ks_th.text().strip())
         self.settings.setValue("preproc/qm_isi_thresh", float(self.ed_qm_isi.value()))
@@ -3368,50 +3514,97 @@ class PreprocessingTab(QtWidgets.QWidget):
         return bool(self._running or self._concatenating)
 
     def _open_ks4_advanced(self) -> None:
+        self._sync_visible_ks4_settings()
         dlg = Ks4AdvancedDialog(self._ks4_adv_params, self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         self._ks4_adv_params = dlg.values()
+        self._apply_ks4_values_to_visible_controls()
         self._persist_settings()
         n = len(self._ks4_adv_params)
         self._append_log(f"KS4 advanced parameters updated ({n} values).")
 
     def _open_catgt_builder(self) -> None:
-        dlg = CatGTStringBuilderDialog(self.ed_catgt_cmd.text().strip(), self)
+        selected = self._selected_inqueue_jobs()
+        job = selected[0] if selected else (self.jobs[0] if self.jobs else {})
+        bin_path = Path(str(job.get("bin_file") or "")) if job.get("bin_file") else None
+        identity = parse_spikeglx_bin_name(str(bin_path)) if bin_path else {}
+        run_name = str(identity.get("run_name") or job.get("name") or "")
+        if bin_path and len(bin_path.parents) > 1:
+            input_directory = str(bin_path.parents[2] if len(bin_path.parents) > 2 and "_imec" in bin_path.parent.name else bin_path.parents[1])
+        else:
+            input_directory = ""
+        current_gate = str(identity.get("gate_string") or "0")
+        current_trigger = str(identity.get("trigger_string") or "0,0")
+        current_probe = str(identity.get("probe_string") or "0")
+        all_gate_range = self._available_gate_range(bin_path, run_name, current_gate) if bin_path else f"{current_gate},{current_gate}"
+        dlg = CatGTSetupDialog(
+            initial_command=self.ed_catgt_cmd.text().strip(),
+            initial_to_stream=self.ed_tostream.text().strip(),
+            initial_extractors=self.ed_ni_extract.text().strip(),
+            initial_output_streams=str(self.cb_catgt_output_streams.currentData() or "ap"),
+            initial_gate=self.ed_gate.text().strip() or "current",
+            initial_trigger=self.ed_trigger.text().strip() or "current",
+            initial_probe=self.ed_probe.text().strip() or "current",
+            initial_probe_count=self._catgt_probe_count,
+            initial_probe_ids=self._catgt_probe_ids,
+            initial_lf_lowpass_hz=float(self.sp_catgt_lf_lowpass.value()),
+            initial_lf_downsample=int(self.sp_catgt_lf_downsample.currentText()),
+            initial_car_mode=self.cb_catgt_car_mode.currentText(),
+            initial_loccar_min_um=float(self.sp_loccar_min.value()),
+            initial_loccar_max_um=float(self.sp_loccar_max.value()),
+            run_name=run_name,
+            input_directory=input_directory,
+            output_directory="<configured output folder>",
+            current_gate=current_gate,
+            current_trigger=current_trigger,
+            current_probe=current_probe,
+            all_gate_range=all_gate_range,
+            parent=self,
+        )
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
-        self.ed_catgt_cmd.setText(dlg.value())
+        values = dlg.values()
+        self.ed_catgt_cmd.setText(str(values["catgt_cmd_string"]))
+        self.ed_ni_extract.setText(str(values["ni_extract_string"]))
+        self.ed_tostream.setText(str(values["tostream_sync_params"]))
+        self.ed_gate.setText(str(values["gate_string"]))
+        self.ed_trigger.setText(str(values["trigger_string"]))
+        self.ed_probe.setText(str(values["probe_string"]))
+        self._catgt_probe_count = int(values["probe_count"])
+        self._catgt_probe_ids = str(values["probe_ids"])
+        self.cb_catgt_output_streams.setCurrentIndex(
+            max(0, self.cb_catgt_output_streams.findData(values["catgt_output_streams"]))
+        )
+        self.sp_catgt_lf_lowpass.setValue(float(values["catgt_lf_lowpass_hz"]))
+        self.sp_catgt_lf_downsample.setCurrentText(str(values["catgt_lf_downsample"]))
+        self.cb_catgt_car_mode.setCurrentText(str(values["catgt_car_mode"]))
+        self.sp_loccar_min.setValue(float(values["catgt_loccar_min_um"]))
+        self.sp_loccar_max.setValue(float(values["catgt_loccar_max_um"]))
         self._persist_settings()
-        self._append_log("CatGT command string updated from builder.")
+        self._refresh_catgt_summary()
+        self._append_log("CatGT run selection, filters, events, and sync settings updated.")
+
+    @staticmethod
+    def _available_gate_range(bin_path: Path, run_name: str, fallback_gate: str) -> str:
+        """Find the first and last gate folders for the selected run."""
+        gates: List[int] = []
+        target = str(run_name).replace(" ", "_").lower()
+        for parent in list(bin_path.parents)[1:5]:
+            try:
+                children = list(parent.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if not child.is_dir():
+                    continue
+                match = re.fullmatch(r"(.+)_g(\d+)", child.name, re.IGNORECASE)
+                if match and match.group(1).replace(" ", "_").lower() == target:
+                    gates.append(int(match.group(2)))
+        if gates:
+            return f"{min(gates)},{max(gates)}"
+        return f"{fallback_gate},{fallback_gate}"
 
     def _open_tprime_builder(self) -> None:
-        # Labels are preserved only in the dedicated extractor field. The CatGT
-        # command stores the executable flags without label suffixes.
-        current_extractors = self.ed_ni_extract.text().strip()
-        if not current_extractors:
-            current_extractors = catgt_command_extractors(self.ed_catgt_cmd.text().strip())
-        dlg = TPrimeStringBuilderDialog(
-            self.ed_tostream.text().strip(),
-            current_extractors,
-            self,
-        )
-        if dlg.exec() != QtWidgets.QDialog.Accepted:
-            return
-        to_stream, extract_string = dlg.values()
-        self.ed_tostream.setText(to_stream)
-        self.ed_ni_extract.setText(extract_string)
-        self.ed_catgt_cmd.setText(
-            merge_extractors_into_catgt_command(self.ed_catgt_cmd.text().strip(), extract_string)
-        )
-        self._persist_settings()
-        self._append_log("TPrime sync and CatGT extractor strings updated from builder.")
-
-    def _open_bitfield_builder(self) -> None:
-        dlg = BitFieldBuilderDialog(catgt_command_bf_extractors(self.ed_catgt_cmd.text().strip()), self)
-        if dlg.exec() != QtWidgets.QDialog.Accepted:
-            return
-        self.ed_catgt_cmd.setText(
-            merge_bitfields_into_catgt_command(self.ed_catgt_cmd.text().strip(), dlg.value())
-        )
-        self._persist_settings()
-        self._append_log("CatGT bit-field extractor flags updated from builder.")
+        """Keep old internal call sites routed through the combined CatGT setup window."""
+        self._open_catgt_builder()

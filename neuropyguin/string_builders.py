@@ -42,6 +42,9 @@ class CatGTCommandSpec:
     ap_filter_order: int = 12
     ap_filter_highpass_hz: float = 300.0
     ap_filter_lowpass_hz: float = 10000.0
+    use_lfp_filter: bool = False
+    lfp_lowpass_hz: float = 300.0
+    lfp_downsample: int = 12
     use_gfix: bool = True
     gfix_amp_mv: float = 0.40
     gfix_slope_mv_per_sample: float = 0.10
@@ -145,6 +148,9 @@ def build_catgt_command_string(spec: CatGTCommandSpec) -> str:
             f"{_fmt_number(spec.ap_filter_highpass_hz)},"
             f"{_fmt_number(spec.ap_filter_lowpass_hz)}"
         )
+    if spec.use_lfp_filter:
+        parts.append(f"-lffilter=butter,12,0,{_fmt_number(spec.lfp_lowpass_hz)}")
+        parts.append(f"-ap2lf_dwnsmp={int(spec.lfp_downsample)}")
     if spec.use_gfix:
         parts.append(
             "-gfix="
@@ -182,6 +188,19 @@ def parse_catgt_command_string(raw: str) -> CatGTCommandSpec:
                 spec.ap_filter_highpass_hz = float(payload[2])
                 spec.ap_filter_lowpass_hz = float(payload[3])
             else:
+                extras.append(token)
+        elif token.startswith("-lffilter="):
+            payload = token.split("=", 1)[1].split(",")
+            if len(payload) >= 4:
+                spec.use_lfp_filter = True
+                spec.lfp_lowpass_hz = float(payload[3])
+            else:
+                extras.append(token)
+        elif token.startswith("-ap2lf_dwnsmp="):
+            try:
+                spec.lfp_downsample = int(float(token.split("=", 1)[1]))
+                spec.use_lfp_filter = True
+            except ValueError:
                 extras.append(token)
         elif token.startswith("-gfix="):
             spec.use_gfix = True
@@ -353,6 +372,52 @@ def build_bitfield_extractor_string(specs: Sequence[BitFieldExtractorSpec], extr
     if str(extra_flags).strip():
         parts.extend(_split_flags(extra_flags))
     return " ".join(parts)
+
+
+def build_catgt_command_preview(
+    *,
+    run_name: str,
+    input_directory: str,
+    output_directory: str,
+    gate_string: str,
+    trigger_string: str,
+    probe_string: str,
+    output_streams: str,
+    car_mode: str,
+    loccar_min_um: float,
+    loccar_max_um: float,
+    command_flags: str,
+    extractor_flags: str,
+) -> str:
+    """Render the full CatGT argument line shown by the combined builder."""
+    streams = list({"ap": ["-ap"], "lfp": ["-lf"], "both": ["-ap", "-lf"]}.get(
+        str(output_streams).strip().lower(), ["-ap"]
+    ))
+    event_tokens = _split_flags(extractor_flags)
+    if any(
+        re.match(r"-(?:xd|xid|xa|xia|bf)=0,", re.sub(r"\[[^\]]*\]$", "", token), re.IGNORECASE)
+        for token in event_tokens
+    ) and "-ni" not in streams:
+        streams.append("-ni")
+    car = str(car_mode).strip().lower()
+    if car == "loccar":
+        car_flag = f"-loccar_um={_fmt_number(loccar_min_um)},{_fmt_number(loccar_max_um)}"
+    elif car in {"gbldmx", "gblcar"}:
+        car_flag = f"-{car}"
+    else:
+        car_flag = ""
+    identity = [
+        f"-dir={input_directory or '<input folder>'}",
+        f"-run={run_name or '<run name>'}",
+        f"-g={gate_string}",
+        f"-t={trigger_string}",
+        f"-prb={probe_string}",
+        *streams,
+    ]
+    parts = [*identity, car_flag, str(command_flags).strip(), strip_extractor_labels(str(extractor_flags))]
+    parts = [part for part in parts if part]
+    parts.append(f"-dest={output_directory or '<output folder>'}")
+    return "runit.sh '" + " ".join(parts) + "'"
 
 
 def parse_bitfield_extractor_string(raw: str) -> Tuple[List[BitFieldExtractorSpec], str]:
@@ -554,13 +619,13 @@ class BitFieldBuilderDialog(QtWidgets.QDialog):
         return build_bitfield_extractor_string(specs, self.ed_extra.text().strip())
 
 
-class CatGTStringBuilderDialog(QtWidgets.QDialog):
-    """Dialog for building a CatGT command fragment from readable form fields."""
+class CatGTStringBuilderPanel(QtWidgets.QWidget):
+    """Reusable CatGT filtering and flag editor for standalone or combined dialogs."""
+
+    commandChanged = QtCore.Signal(str)
 
     def __init__(self, initial_command: str, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Build CatGT command string")
-        self.resize(760, 440)
         spec = parse_catgt_command_string(initial_command)
 
         main = QtWidgets.QVBoxLayout(self)
@@ -612,6 +677,20 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
         self.sp_ap_low.setRange(0.0, 40000.0)
         self.sp_ap_low.setDecimals(2)
         self.sp_ap_low.setValue(float(spec.ap_filter_lowpass_hz))
+        lfp_box = QtWidgets.QGroupBox("LFP filter")
+        lfp_form = QtWidgets.QFormLayout(lfp_box)
+        self.ck_lfp_filter = QtWidgets.QCheckBox("Create or filter LFP output")
+        self.ck_lfp_filter.setChecked(spec.use_lfp_filter)
+        self.sp_lfp_lowpass = QtWidgets.QDoubleSpinBox()
+        self.sp_lfp_lowpass.setRange(1.0, 1000.0)
+        self.sp_lfp_lowpass.setDecimals(1)
+        self.sp_lfp_lowpass.setValue(float(spec.lfp_lowpass_hz))
+        self.cb_lfp_downsample = QtWidgets.QComboBox()
+        self.cb_lfp_downsample.addItems(["2", "3", "4", "5", "6", "10", "12", "15", "20", "25", "30"])
+        self.cb_lfp_downsample.setCurrentText(str(spec.lfp_downsample))
+        lfp_form.addRow(self.ck_lfp_filter)
+        lfp_form.addRow("Low-pass corner (Hz)", self.sp_lfp_lowpass)
+        lfp_form.addRow("Downsample factor", self.cb_lfp_downsample)
         filter_form.addRow(self.ck_ap_filter)
         filter_form.addRow("Type", self.cb_ap_type)
         filter_form.addRow("Order", self.sp_ap_order)
@@ -639,6 +718,7 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
         gfix_form.addRow("Amplitude (mV)", self.sp_gfix_amp)
         gfix_form.addRow("Slope (mV / sample)", self.sp_gfix_slope)
         gfix_form.addRow("Noise (mV)", self.sp_gfix_noise)
+        options_row.addWidget(lfp_box, 1)
         options_row.addWidget(gfix_box, 1)
         main.addLayout(options_row)
 
@@ -652,11 +732,6 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
         main.addWidget(QtWidgets.QLabel("Generated command fragment"))
         main.addWidget(self.preview)
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        main.addWidget(buttons)
-
         for widget in [
             self.ck_probe_folders,
             self.ck_output_probe_folders,
@@ -668,6 +743,9 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
             self.sp_ap_order,
             self.sp_ap_high,
             self.sp_ap_low,
+            self.ck_lfp_filter,
+            self.sp_lfp_lowpass,
+            self.cb_lfp_downsample,
             self.ck_gfix,
             self.sp_gfix_amp,
             self.sp_gfix_slope,
@@ -681,6 +759,7 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
                 widget.valueChanged.connect(self._refresh_preview)
         self.ed_extra.textChanged.connect(self._refresh_preview)
         self.ck_ap_filter.stateChanged.connect(self._sync_enabled_state)
+        self.ck_lfp_filter.stateChanged.connect(self._sync_enabled_state)
         self.ck_gfix.stateChanged.connect(self._sync_enabled_state)
         self._sync_enabled_state()
         self._refresh_preview()
@@ -692,9 +771,14 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
         gfix_enabled = self.ck_gfix.isChecked()
         for widget in [self.sp_gfix_amp, self.sp_gfix_slope, self.sp_gfix_noise]:
             widget.setEnabled(gfix_enabled)
+        lfp_enabled = self.ck_lfp_filter.isChecked()
+        for widget in [self.sp_lfp_lowpass, self.cb_lfp_downsample]:
+            widget.setEnabled(lfp_enabled)
 
     def _refresh_preview(self) -> None:
-        self.preview.setPlainText(build_catgt_command_string(self.spec()))
+        value = build_catgt_command_string(self.spec())
+        self.preview.setPlainText(value)
+        self.commandChanged.emit(value)
 
     def spec(self) -> CatGTCommandSpec:
         """Collect the current widget values into a CatGTCommandSpec."""
@@ -709,6 +793,9 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
             ap_filter_order=int(self.sp_ap_order.value()),
             ap_filter_highpass_hz=float(self.sp_ap_high.value()),
             ap_filter_lowpass_hz=float(self.sp_ap_low.value()),
+            use_lfp_filter=self.ck_lfp_filter.isChecked(),
+            lfp_lowpass_hz=float(self.sp_lfp_lowpass.value()),
+            lfp_downsample=int(self.cb_lfp_downsample.currentText()),
             use_gfix=self.ck_gfix.isChecked(),
             gfix_amp_mv=float(self.sp_gfix_amp.value()),
             gfix_slope_mv_per_sample=float(self.sp_gfix_slope.value()),
@@ -721,8 +808,30 @@ class CatGTStringBuilderDialog(QtWidgets.QDialog):
         return build_catgt_command_string(self.spec())
 
 
-class TPrimeStringBuilderDialog(QtWidgets.QDialog):
-    """Dialog for building the TPrime reference stream and event-extractor strings."""
+class CatGTStringBuilderDialog(QtWidgets.QDialog):
+    """Compatibility dialog wrapper around :class:`CatGTStringBuilderPanel`."""
+
+    def __init__(self, initial_command: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Build CatGT command string")
+        self.resize(1120, 680)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.panel = CatGTStringBuilderPanel(initial_command, self)
+        layout.addWidget(self.panel, 1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def value(self) -> str:
+        """Return the generated CatGT command fragment."""
+        return self.panel.value()
+
+
+class TPrimeStringBuilderPanel(QtWidgets.QWidget):
+    """Reusable TPrime and CatGT event editor for standalone or combined dialogs."""
+
+    valuesChanged = QtCore.Signal(str, str)
 
     def __init__(
         self,
@@ -731,9 +840,6 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setProperty("compactDialog", True)
-        self.setWindowTitle("Build TPrime stream and extractor strings")
-        self.resize(1100, 760)
         stream_kind, stream_index = parse_tostream_sync_params(initial_to_stream)
         specs, extras = parse_tprime_extractor_string(initial_extractors)
         fixed_font = QtGui.QFont("Consolas", 9)
@@ -997,11 +1103,6 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         preview_page_layout.addWidget(preview_box, 1)
         self.section_nav.add_page("Generated values", preview_page)
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        main.addWidget(buttons)
-
         self.btn_add_digital.clicked.connect(lambda: self._add_row("xd"))
         self.btn_add_digital_fall.clicked.connect(lambda: self._add_row("xid"))
         self.btn_add_analog.clicked.connect(lambda: self._add_row("xa"))
@@ -1256,9 +1357,10 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         to_stream, ex_string = self.values()
         self.ed_to_stream_preview.setPlainText(to_stream)
         self.ed_extract_preview.setPlainText(ex_string)
+        self.valuesChanged.emit(to_stream, ex_string)
 
     def values(self) -> Tuple[str, str]:
-        """Return (toStream_sync_params, extractor_string) for the current dialog state."""
+        """Return (toStream_sync_params, extractor_string) for the current editor state."""
         specs: List[TPrimeExtractorSpec] = []
         for row in range(self.tbl.rowCount()):
             spec = self._row_spec(row)
@@ -1267,3 +1369,423 @@ class TPrimeStringBuilderDialog(QtWidgets.QDialog):
         to_stream = build_tostream_sync_params(self.cb_stream_kind.currentText(), int(self.sp_stream_index.value()))
         extractors = build_tprime_extractor_string(specs, self.ed_extra.text().strip())
         return to_stream, extractors
+
+
+class TPrimeStringBuilderDialog(QtWidgets.QDialog):
+    """Compatibility dialog wrapper around :class:`TPrimeStringBuilderPanel`."""
+
+    def __init__(
+        self,
+        initial_to_stream: str,
+        initial_extractors: str,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setProperty("compactDialog", True)
+        self.setWindowTitle("Build TPrime stream and extractor strings")
+        self.resize(1100, 760)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.panel = TPrimeStringBuilderPanel(initial_to_stream, initial_extractors, self)
+        layout.addWidget(self.panel, 1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> Tuple[str, str]:
+        """Return the built TPrime reference stream and CatGT extractor flags."""
+        return self.panel.values()
+
+
+class CatGTSetupDialog(QtWidgets.QDialog):
+    """One guided CatGT setup window for run selection, filtering, events, and preview."""
+
+    def __init__(
+        self,
+        *,
+        initial_command: str,
+        initial_to_stream: str,
+        initial_extractors: str,
+        initial_output_streams: str,
+        initial_gate: str,
+        initial_trigger: str,
+        initial_probe: str,
+        initial_probe_count: int,
+        initial_probe_ids: str,
+        initial_lf_lowpass_hz: float,
+        initial_lf_downsample: int,
+        initial_car_mode: str,
+        initial_loccar_min_um: float,
+        initial_loccar_max_um: float,
+        run_name: str = "",
+        input_directory: str = "",
+        output_directory: str = "",
+        current_gate: str = "0",
+        current_trigger: str = "0,0",
+        current_probe: str = "0",
+        all_gate_range: str = "0,0",
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setProperty("compactDialog", True)
+        self.setWindowTitle("CatGT setup")
+        self.resize(1320, 900)
+        self.run_name = str(run_name).strip()
+        self.input_directory = str(input_directory).strip()
+        self.output_directory = str(output_directory).strip()
+        self.current_gate = str(current_gate).strip() or "0"
+        self.current_trigger = str(current_trigger).strip() or "0,0"
+        self.current_probe = str(current_probe).strip() or "0"
+        self.all_gate_range = str(all_gate_range).strip() or "0,0"
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+        intro = QtWidgets.QLabel(
+            "Set which part of the recording CatGT should process, choose AP or LFP output, and configure filtering "
+            "and event extraction. The command preview updates as you edit."
+        )
+        intro.setObjectName("SectionHint")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.tabs, 1)
+        self._build_run_selection_tab(initial_gate, initial_trigger, initial_probe, initial_probe_count, initial_probe_ids)
+        self._build_processing_tab(
+            " ".join(
+                token for token in _split_flags(initial_command)
+                if not re.match(r"^-(?:xd|xid|xa|xia)=", re.sub(r"\[[^\]]*\]$", "", token), re.IGNORECASE)
+            ),
+            initial_output_streams,
+            initial_lf_lowpass_hz,
+            initial_lf_downsample,
+            initial_car_mode,
+            initial_loccar_min_um,
+            initial_loccar_max_um,
+        )
+        self.event_panel = TPrimeStringBuilderPanel(initial_to_stream, initial_extractors, self)
+        event_page = QtWidgets.QWidget()
+        event_layout = QtWidgets.QVBoxLayout(event_page)
+        event_layout.setContentsMargins(0, 0, 0, 0)
+        event_hint = QtWidgets.QLabel(
+            "Define digital or analog edges for CatGT. The TPrime reference stream is shown separately in the preview. "
+            "Use the extra flags field for CatGT bit-field (-bf) extraction."
+        )
+        event_hint.setObjectName("SectionHint")
+        event_hint.setWordWrap(True)
+        event_layout.addWidget(event_hint)
+        event_layout.addWidget(self.event_panel, 1)
+        self.tabs.addTab(event_page, "Events and sync")
+
+        preview_box = QtWidgets.QGroupBox("Full CatGT command preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_box)
+        self.command_preview = QtWidgets.QPlainTextEdit()
+        self.command_preview.setReadOnly(True)
+        self.command_preview.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        self.command_preview.setMinimumHeight(105)
+        self.command_preview.setMaximumHeight(145)
+        self.command_preview.setFont(QtGui.QFont("Consolas", 9))
+        preview_layout.addWidget(self.command_preview)
+        self.tprime_preview = QtWidgets.QLabel()
+        self.tprime_preview.setObjectName("SectionHint")
+        preview_layout.addWidget(self.tprime_preview)
+        layout.addWidget(preview_box)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Apply settings")
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.catgt_panel.commandChanged.connect(self._refresh_command_preview)
+        self.event_panel.valuesChanged.connect(self._refresh_command_preview_from_events)
+        self._refresh_command_preview()
+
+    def _build_run_selection_tab(
+        self,
+        initial_gate: str,
+        initial_trigger: str,
+        initial_probe: str,
+        initial_probe_count: int,
+        initial_probe_ids: str,
+    ) -> None:
+        page = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(page)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(12)
+
+        current_range = self._parse_pair(initial_gate, self.current_gate)
+        self.cb_gate_mode = QtWidgets.QComboBox()
+        self.cb_gate_mode.addItem("Use the gate in the input file", "current")
+        self.cb_gate_mode.addItem("All gates in this run", "all")
+        self.cb_gate_mode.addItem("Choose a gate range", "range")
+        initial_gate_mode = "all" if str(initial_gate).lower() == "all" else (
+            "range" if str(initial_gate).lower() not in {"current", ""} else "current"
+        )
+        self.cb_gate_mode.setCurrentIndex(max(0, self.cb_gate_mode.findData(initial_gate_mode)))
+        self.sp_gate_first = self._number_spin(current_range[0], 9999)
+        self.sp_gate_last = self._number_spin(current_range[1], 9999)
+        form.addRow("Gate selection", self.cb_gate_mode)
+        form.addRow("First gate / last gate", self._pair_widget(self.sp_gate_first, self.sp_gate_last))
+        gate_hint = QtWidgets.QLabel(
+            "Use the input file's gate for one gate, or let CatGT join all available gates in the run. "
+            "Choose a range to set the first and last gate explicitly."
+        )
+        gate_hint.setObjectName("SectionHint")
+        gate_hint.setWordWrap(True)
+        form.addRow("", gate_hint)
+
+        current_trigger_range = self._parse_pair(initial_trigger, self.current_trigger)
+        self.cb_trigger_mode = QtWidgets.QComboBox()
+        self.cb_trigger_mode.addItem("Use the trigger in the input file", "current")
+        self.cb_trigger_mode.addItem("All triggers in this run", "all")
+        self.cb_trigger_mode.addItem("Choose a trigger range", "range")
+        initial_trigger_mode = "all" if str(initial_trigger).lower() == "all" else (
+            "range" if str(initial_trigger).lower() not in {"current", ""} else "current"
+        )
+        self.cb_trigger_mode.setCurrentIndex(max(0, self.cb_trigger_mode.findData(initial_trigger_mode)))
+        self.sp_trigger_first = self._number_spin(current_trigger_range[0], 999999)
+        self.sp_trigger_last = self._number_spin(current_trigger_range[1], 999999)
+        form.addRow("Trigger selection", self.cb_trigger_mode)
+        form.addRow("First trigger / last trigger", self._pair_widget(self.sp_trigger_first, self.sp_trigger_last))
+        trigger_hint = QtWidgets.QLabel(
+            "All triggers maps to CatGT's start,end range. A selected range maps to the corresponding -t=first,last option."
+        )
+        trigger_hint.setObjectName("SectionHint")
+        trigger_hint.setWordWrap(True)
+        form.addRow("", trigger_hint)
+
+        self.sp_probe_count = self._number_spin(max(1, int(initial_probe_count)), 32, minimum=1)
+        self.ed_probe_ids = QtWidgets.QLineEdit(initial_probe_ids or "0")
+        self.ed_probe_ids.setPlaceholderText("Example: 0-3 or 0,2,5")
+        self.cb_probe_target = QtWidgets.QComboBox()
+        expected_ids = "0" if self.sp_probe_count.value() == 1 else f"0-{self.sp_probe_count.value() - 1}"
+        self._probe_ids_auto = not initial_probe_ids or str(initial_probe_ids).strip() == expected_ids
+        self._refresh_probe_targets(str(initial_probe))
+        form.addRow("Probes recorded at once", self.sp_probe_count)
+        form.addRow("Recorded probe IDs", self.ed_probe_ids)
+        form.addRow("Process this probe", self.cb_probe_target)
+        probe_hint = QtWidgets.QLabel(
+            "The sorter handles one probe per queued job. Choose the probe ID to process; the count helps populate the available IDs."
+        )
+        probe_hint.setObjectName("SectionHint")
+        probe_hint.setWordWrap(True)
+        form.addRow("", probe_hint)
+
+        for combo in [self.cb_gate_mode, self.cb_trigger_mode, self.cb_probe_target]:
+            combo.currentIndexChanged.connect(self._sync_selection_controls)
+            combo.currentIndexChanged.connect(self._refresh_command_preview)
+        for spin in [self.sp_gate_first, self.sp_gate_last, self.sp_trigger_first, self.sp_trigger_last]:
+            spin.valueChanged.connect(self._refresh_command_preview)
+        self.sp_probe_count.valueChanged.connect(self._on_probe_count_changed)
+        self.ed_probe_ids.textEdited.connect(self._on_probe_ids_edited)
+        self.ed_probe_ids.textChanged.connect(self._refresh_command_preview)
+        self._sync_selection_controls()
+        self.tabs.addTab(page, "Run and probes")
+
+    def _build_processing_tab(
+        self,
+        initial_command: str,
+        initial_output_streams: str,
+        initial_lf_lowpass_hz: float,
+        initial_lf_downsample: int,
+        initial_car_mode: str,
+        initial_loccar_min_um: float,
+        initial_loccar_max_um: float,
+    ) -> None:
+        page = QtWidgets.QWidget()
+        page_layout = QtWidgets.QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(10)
+        top = QtWidgets.QGridLayout()
+        self.cb_output_streams = QtWidgets.QComboBox()
+        for label, value in [("AP", "ap"), ("LFP", "lfp"), ("AP + LFP", "both")]:
+            self.cb_output_streams.addItem(label, value)
+        index = self.cb_output_streams.findData(initial_output_streams)
+        self.cb_output_streams.setCurrentIndex(index if index >= 0 else 0)
+        self.cb_car_mode = QtWidgets.QComboBox()
+        self.cb_car_mode.addItems(["gbldmx", "gblcar", "loccar", "none"])
+        self.cb_car_mode.setCurrentText(initial_car_mode or "gbldmx")
+        self.sp_loccar_min = QtWidgets.QDoubleSpinBox()
+        self.sp_loccar_min.setRange(10.0, 500.0)
+        self.sp_loccar_min.setDecimals(1)
+        self.sp_loccar_min.setValue(float(initial_loccar_min_um))
+        self.sp_loccar_max = QtWidgets.QDoubleSpinBox()
+        self.sp_loccar_max.setRange(10.0, 1000.0)
+        self.sp_loccar_max.setDecimals(1)
+        self.sp_loccar_max.setValue(float(initial_loccar_max_um))
+        top.addWidget(QtWidgets.QLabel("Neural output"), 0, 0)
+        top.addWidget(self.cb_output_streams, 0, 1)
+        top.addWidget(QtWidgets.QLabel("Common average reference"), 1, 0)
+        top.addWidget(self.cb_car_mode, 1, 1)
+        top.addWidget(QtWidgets.QLabel("Local reference radius (um), inner / outer"), 2, 0)
+        top.addWidget(self._pair_widget(self.sp_loccar_min, self.sp_loccar_max), 2, 1)
+        page_layout.addLayout(top)
+
+        self.catgt_panel = CatGTStringBuilderPanel(initial_command, self)
+        page_layout.addWidget(self.catgt_panel, 1)
+        self.cb_output_streams.currentIndexChanged.connect(self._sync_output_controls)
+        self.cb_car_mode.currentTextChanged.connect(self._refresh_command_preview)
+        self.sp_loccar_min.valueChanged.connect(self._refresh_command_preview)
+        self.sp_loccar_max.valueChanged.connect(self._refresh_command_preview)
+        self._sync_output_controls()
+        self.tabs.addTab(page, "AP/LFP processing")
+
+    @staticmethod
+    def _number_spin(value: int, maximum: int, minimum: int = 0) -> QtWidgets.QSpinBox:
+        spin = QtWidgets.QSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setValue(max(minimum, min(maximum, int(value))))
+        return spin
+
+    @staticmethod
+    def _pair_widget(first: QtWidgets.QWidget, last: QtWidgets.QWidget) -> QtWidgets.QWidget:
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(first)
+        row.addWidget(QtWidgets.QLabel("through"))
+        row.addWidget(last)
+        row.addStretch(1)
+        widget = QtWidgets.QWidget()
+        widget.setLayout(row)
+        return widget
+
+    @staticmethod
+    def _parse_pair(raw: str, fallback: str) -> Tuple[int, int]:
+        text = str(raw).strip()
+        if text.lower() in {"current", "all", "start,end"}:
+            text = fallback
+        try:
+            values = [int(part.strip()) for part in text.split(",", 1)]
+            return (values[0], values[-1])
+        except (TypeError, ValueError):
+            return (0, 0)
+
+    def _on_probe_count_changed(self, count: int) -> None:
+        if self._probe_ids_auto:
+            self.ed_probe_ids.setText("0" if count == 1 else f"0-{count - 1}")
+        self._refresh_probe_targets()
+
+    def _on_probe_ids_edited(self, _text: str) -> None:
+        self._probe_ids_auto = False
+        self._refresh_probe_targets()
+
+    def _refresh_probe_targets(self, preferred: str = "current") -> None:
+        if hasattr(self, "cb_probe_target"):
+            previous = str(self.cb_probe_target.currentData() or preferred or "current")
+            self.cb_probe_target.blockSignals(True)
+            self.cb_probe_target.clear()
+            self.cb_probe_target.addItem("Use probe from input file", "current")
+        else:
+            previous = str(preferred or "current")
+            self.cb_probe_target = QtWidgets.QComboBox()
+            self.cb_probe_target.addItem("Use probe from input file", "current")
+        try:
+            probe_ids = parse_channel_spec(self.ed_probe_ids.text().strip())
+        except (TypeError, ValueError):
+            probe_ids = []
+        for probe_id in probe_ids:
+            self.cb_probe_target.addItem(f"Probe {probe_id}", str(probe_id))
+        index = self.cb_probe_target.findData(previous)
+        if index < 0 and preferred not in {"", "current"}:
+            index = self.cb_probe_target.findData(str(preferred))
+        self.cb_probe_target.setCurrentIndex(index if index >= 0 else 0)
+        self.cb_probe_target.blockSignals(False)
+        self._refresh_command_preview()
+
+    def _sync_selection_controls(self, *_args) -> None:
+        gate_custom = self.cb_gate_mode.currentData() == "range"
+        self.sp_gate_first.setEnabled(gate_custom)
+        self.sp_gate_last.setEnabled(gate_custom)
+        trigger_custom = self.cb_trigger_mode.currentData() == "range"
+        self.sp_trigger_first.setEnabled(trigger_custom)
+        self.sp_trigger_last.setEnabled(trigger_custom)
+
+    def _sync_output_controls(self, *_args) -> None:
+        output_streams = str(self.cb_output_streams.currentData() or "ap")
+        use_lfp = output_streams in {"lfp", "both"}
+        self.catgt_panel.ck_lfp_filter.setChecked(use_lfp)
+        self.catgt_panel.ck_lfp_filter.setEnabled(use_lfp)
+        self.catgt_panel._sync_enabled_state()
+        self._refresh_command_preview()
+
+    def _resolved_gate(self) -> str:
+        mode = str(self.cb_gate_mode.currentData())
+        if mode == "all":
+            return self.all_gate_range
+        if mode == "range":
+            return f"{self.sp_gate_first.value()},{self.sp_gate_last.value()}"
+        return self.current_gate
+
+    def _resolved_trigger(self) -> str:
+        mode = str(self.cb_trigger_mode.currentData())
+        if mode == "all":
+            return "start,end"
+        if mode == "range":
+            return f"{self.sp_trigger_first.value()},{self.sp_trigger_last.value()}"
+        return self.current_trigger
+
+    def _refresh_command_preview_from_events(self, *_args) -> None:
+        self._refresh_command_preview()
+
+    def _refresh_command_preview(self, *_args) -> None:
+        if not hasattr(self, "command_preview"):
+            return
+        to_stream, event_flags = self.event_panel.values() if hasattr(self, "event_panel") else ("imec0", "")
+        selected_probe = str(self.cb_probe_target.currentData() or "current")
+        self.command_preview.setPlainText(
+            build_catgt_command_preview(
+                run_name=self.run_name,
+                input_directory=self.input_directory,
+                output_directory=self.output_directory,
+                gate_string=self._resolved_gate(),
+                trigger_string=self._resolved_trigger(),
+                probe_string=self.current_probe if selected_probe == "current" else selected_probe,
+                output_streams=str(self.cb_output_streams.currentData() or "ap"),
+                car_mode=self.cb_car_mode.currentText(),
+                loccar_min_um=float(self.sp_loccar_min.value()),
+                loccar_max_um=float(self.sp_loccar_max.value()),
+                command_flags=self.catgt_panel.value(),
+                extractor_flags=event_flags,
+            )
+        )
+        self.tprime_preview.setText(f"TPrime reference stream: {to_stream}")
+
+    def _accept_if_valid(self) -> None:
+        try:
+            ids = parse_channel_spec(self.ed_probe_ids.text().strip())
+            if not ids:
+                raise ValueError("Enter at least one recorded probe ID.")
+            selected_probe = str(self.cb_probe_target.currentData() or "current")
+            if selected_probe not in {"current", *[str(probe_id) for probe_id in ids]}:
+                raise ValueError("The selected probe is not in the recorded probe IDs list.")
+        except (TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Check run selection", str(exc))
+            return
+        self.accept()
+
+    def values(self) -> dict[str, object]:
+        """Return generated GUI settings and CatGT selectors for the preprocessing form."""
+        to_stream, extractors = self.event_panel.values()
+        gate_mode = str(self.cb_gate_mode.currentData())
+        trigger_mode = str(self.cb_trigger_mode.currentData())
+        gate = "current" if gate_mode == "current" else ("all" if gate_mode == "all" else self._resolved_gate())
+        trigger = "current" if trigger_mode == "current" else ("all" if trigger_mode == "all" else self._resolved_trigger())
+        return {
+            "catgt_cmd_string": self.catgt_panel.value(),
+            "ni_extract_string": extractors,
+            "tostream_sync_params": to_stream,
+            "catgt_output_streams": str(self.cb_output_streams.currentData() or "ap"),
+            "catgt_lf_lowpass_hz": float(self.catgt_panel.sp_lfp_lowpass.value()),
+            "catgt_lf_downsample": int(self.catgt_panel.cb_lfp_downsample.currentText()),
+            "catgt_car_mode": self.cb_car_mode.currentText(),
+            "catgt_loccar_min_um": float(self.sp_loccar_min.value()),
+            "catgt_loccar_max_um": float(self.sp_loccar_max.value()),
+            "gate_string": gate,
+            "trigger_string": trigger,
+            "probe_string": str(self.cb_probe_target.currentData() or "current"),
+            "probe_count": int(self.sp_probe_count.value()),
+            "probe_ids": self.ed_probe_ids.text().strip(),
+        }

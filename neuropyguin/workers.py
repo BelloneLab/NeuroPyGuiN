@@ -547,6 +547,31 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         return fallback_trials[:10]
 
     @staticmethod
+    def _resolve_gate_selection(selection: str, bin_file: Path, run_name: str, fallback_gate: str) -> str:
+        """Resolve the UI's current/all/range gate choice into CatGT's numeric range."""
+        value = str(selection or "current").strip().lower()
+        if value == "current":
+            return str(fallback_gate)
+        if value != "all":
+            return str(selection).strip()
+        target = str(run_name).replace(" ", "_").lower()
+        found: List[int] = []
+        for parent in list(bin_file.parents)[1:6]:
+            try:
+                children = list(parent.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if not child.is_dir():
+                    continue
+                match = re.fullmatch(r"(.+)_g(\d+)", child.name, re.IGNORECASE)
+                if match and match.group(1).replace(" ", "_").lower() == target:
+                    found.append(int(match.group(2)))
+        if not found:
+            return str(fallback_gate)
+        return f"{min(found)},{max(found)}"
+
+    @staticmethod
     def _find_recent_catgt_ap(job_out: Path, trial_start_time: float, probe_string: str) -> Path | None:
         patterns = [f"*.imec{probe_string}.ap.bin", "*.ap.bin"]
         matches: List[Path] = []
@@ -1134,9 +1159,16 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             ok_ap, reason_ap = validate_spikeglx_ap_bin(str(bin_file))
             if not ok_ap:
                 raise RuntimeError(f"Input not processable for ecephys spike sorting: {reason_ap}")
-            gate_string = self.job.get("gate_string", self.cfg.gate_string)
-            trigger_string = self.job.get("trigger_string", self.cfg.trigger_string)
-            probe_string = self.job.get("probe_string", self.cfg.probe_string)
+            job_gate = self.job.get("gate_string", "0")
+            job_trigger = self.job.get("trigger_string", "0,0")
+            job_probe = self.job.get("probe_string", "0")
+            gate_string = self._resolve_gate_selection(self.cfg.gate_string, bin_file, run_name, job_gate)
+            trigger_choice = str(self.cfg.trigger_string or "current").strip().lower()
+            trigger_string = job_trigger if trigger_choice == "current" else (
+                "start,end" if trigger_choice == "all" else self.cfg.trigger_string
+            )
+            probe_choice = str(self.cfg.probe_string or "current").strip().lower()
+            probe_string = job_probe if probe_choice == "current" else self.cfg.probe_string
 
             input_meta = Path(str(bin_file).replace(".ap.bin", ".ap.meta"))
             if not input_meta.exists():
