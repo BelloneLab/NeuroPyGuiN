@@ -8,6 +8,7 @@ template renders both themes. Callers use ``build_app_qss`` and
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict
 
 from PySide6 import QtGui
@@ -310,6 +311,18 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
 }
 QComboBox {
     padding-right: 28px;
+}
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 24px;
+    border: none;
+    background: transparent;
+}
+QComboBox::down-arrow {
+    image: url(%(combo_arrow)s);
+    width: 12px;
+    height: 12px;
 }
 QComboBox QAbstractItemView, QListView {
     background: %(window_elevated)s;
@@ -628,9 +641,16 @@ def _theme_tokens(theme: str) -> Dict[str, str]:
     return dict(_LIGHT_THEME)
 
 
+_ASSET_DIR = Path(__file__).resolve().parent / "assets"
+
+
 def build_app_qss(theme: str) -> str:
     """Render the application style sheet for ``theme`` as a QSS string."""
-    return _APP_QSS_TEMPLATE % _theme_tokens(theme)
+    tokens = _theme_tokens(theme)
+    # Combo-box chevron: a small SVG tinted to match the theme's soft text color.
+    variant = "dark" if str(theme).lower().startswith("dark") else "light"
+    tokens["combo_arrow"] = (_ASSET_DIR / f"chevron-down-{variant}.svg").as_posix()
+    return _APP_QSS_TEMPLATE % tokens
 
 
 def build_app_palette(theme: str) -> QtGui.QPalette:

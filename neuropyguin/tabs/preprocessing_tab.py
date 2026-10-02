@@ -37,6 +37,7 @@ from ..preprocessing import (
     validate_concat_inputs,
     validate_spikeglx_ap_bin,
 )
+from ..flow_layout import FlowLayout
 from ..side_nav import SideNavStack
 from ..string_builders import (
     BitFieldBuilderDialog,
@@ -150,6 +151,153 @@ class BinDropList(QtWidgets.QListWidget):
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+    # Quick-start steps painted in the empty drop zone: (title, detail).
+    _EMPTY_STEPS = (
+        ("Add recordings", "Drop *.imecX.ap.bin files here, or use Add AP .bin files / Add folder / Scan raw root."),
+        ("Choose the pipeline", "Open Settings on the left to pick CatGT, Kilosort, metrics and output folders."),
+        ("Run the queue", "Press Run queue, follow progress in Log, then open finished runs from Completed."),
+    )
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt API)
+        """Draw the list normally, plus a quick-start guide while it is empty."""
+        super().paintEvent(event)
+        if self.count() > 0:
+            return
+        painter = QtGui.QPainter(self.viewport())
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        self._paint_empty_state(painter, self.viewport().rect())
+        painter.end()
+
+    def _paint_empty_state(self, painter: QtGui.QPainter, area: QtCore.QRect) -> None:
+        """Paint a centred drop icon, a headline and three numbered steps.
+
+        Colors come from the widget palette so the guide follows the light and
+        dark themes. The block scales down gracefully: the column width is
+        capped at 620 px and shrinks with the viewport, and the icon is
+        omitted when the viewport is too short to fit everything.
+        """
+        pal = self.palette()
+        accent = pal.color(QtGui.QPalette.Highlight)
+        text = pal.color(QtGui.QPalette.Text)
+        muted = QtGui.QColor(text)
+        muted.setAlphaF(0.62)
+
+        col_w = min(620, max(260, area.width() - 48))
+        text_w = col_w - 40
+        fm = QtGui.QFontMetrics(self.font())
+        # Measure each wrapped step so nothing overlaps or is cut off.
+        detail_hs = [
+            fm.boundingRect(QtCore.QRect(0, 0, text_w, 10_000), QtCore.Qt.TextWordWrap, d).height()
+            for _, d in self._EMPTY_STEPS
+        ]
+        step_hs = [max(30, 22 + h) + 12 for h in detail_hs]
+        icon_d = 56
+        title_h = 30
+        sub_h = 22
+        steps_h = sum(step_hs)
+        block_h = icon_d + 16 + title_h + sub_h + 22 + steps_h
+        # On short viewports drop the icon first so the steps stay readable.
+        show_icon = block_h <= area.height() - 24
+        if not show_icon:
+            block_h -= icon_d + 16
+        x0 = area.center().x() - col_w // 2
+        y = max(area.top() + 12, area.center().y() - block_h // 2)
+
+        if show_icon:
+            self._paint_drop_icon(painter, QtCore.QPointF(area.center().x(), y + icon_d / 2), icon_d, accent)
+            y += icon_d + 16
+        self._paint_text_block(painter, x0, y, col_w, title_h, sub_h, step_hs, text, muted, accent)
+
+    @staticmethod
+    def _paint_drop_icon(painter: QtGui.QPainter, c: QtCore.QPointF, icon_d: int, accent: QtGui.QColor) -> None:
+        """Tinted disc of diameter ``icon_d`` centred at ``c`` with a down arrow into a tray."""
+        disc = QtCore.QRectF(c.x() - icon_d / 2, c.y() - icon_d / 2, icon_d, icon_d)
+        tint = QtGui.QColor(accent)
+        tint.setAlphaF(0.12)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(tint)
+        painter.drawEllipse(disc)
+        pen = QtGui.QPen(accent, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawLine(QtCore.QPointF(c.x(), c.y() - 16), QtCore.QPointF(c.x(), c.y() + 4))
+        painter.drawPolyline(
+            QtGui.QPolygonF(
+                [QtCore.QPointF(c.x() - 8, c.y() - 4), QtCore.QPointF(c.x(), c.y() + 4), QtCore.QPointF(c.x() + 8, c.y() - 4)]
+            )
+        )
+        painter.drawPolyline(
+            QtGui.QPolygonF(
+                [
+                    QtCore.QPointF(c.x() - 14, c.y() + 6),
+                    QtCore.QPointF(c.x() - 14, c.y() + 14),
+                    QtCore.QPointF(c.x() + 14, c.y() + 14),
+                    QtCore.QPointF(c.x() + 14, c.y() + 6),
+                ]
+            )
+        )
+
+    def _paint_text_block(
+        self,
+        painter: QtGui.QPainter,
+        x0: int,
+        y: int,
+        col_w: int,
+        title_h: int,
+        sub_h: int,
+        step_hs: list,
+        text: QtGui.QColor,
+        muted: QtGui.QColor,
+        accent: QtGui.QColor,
+    ) -> None:
+        """Headline, subtitle and numbered steps, starting at ``y``."""
+        pal = self.palette()
+        # Headline and one-line subtitle.
+        font = QtGui.QFont(self.font())
+        # The app stylesheet sizes fonts in px, so scale whichever unit is set.
+        if font.pixelSize() > 0:
+            font.setPixelSize(round(font.pixelSize() * 1.35))
+        else:
+            font.setPointSizeF(font.pointSizeF() * 1.35)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(text)
+        painter.drawText(QtCore.QRect(x0, y, col_w, title_h), QtCore.Qt.AlignCenter, "Drop SpikeGLX AP recordings here")
+        y += title_h
+        font = QtGui.QFont(self.font())
+        painter.setFont(font)
+        painter.setPen(muted)
+        painter.drawText(
+            QtCore.QRect(x0, y, col_w, sub_h), QtCore.Qt.AlignCenter, "Three steps from raw .bin files to sorted units"
+        )
+        y += sub_h + 22
+
+        # Numbered steps: accent badge, bold title, wrapped muted detail.
+        badge_font = QtGui.QFont(self.font())
+        badge_font.setBold(True)
+        title_font = QtGui.QFont(self.font())
+        title_font.setBold(True)
+        for i, ((title, detail), step_h) in enumerate(zip(self._EMPTY_STEPS, step_hs), start=1):
+            badge = QtCore.QRectF(x0, y + 2, 26, 26)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(accent)
+            painter.drawEllipse(badge)
+            painter.setFont(badge_font)
+            painter.setPen(pal.color(QtGui.QPalette.HighlightedText))
+            painter.drawText(badge, QtCore.Qt.AlignCenter, str(i))
+            tx = x0 + 40
+            painter.setFont(title_font)
+            painter.setPen(text)
+            painter.drawText(QtCore.QRect(tx, y, col_w - 40, 20), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, title)
+            painter.setFont(self.font())
+            painter.setPen(muted)
+            painter.drawText(
+                QtCore.QRect(tx, y + 20, col_w - 40, step_h - 22),
+                QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop | QtCore.Qt.TextWordWrap,
+                detail,
+            )
+            y += step_h
 
 
 class StepStatusItem(QtWidgets.QWidget):
@@ -663,8 +811,6 @@ class PreprocessingTab(QtWidgets.QWidget):
             layout.addLayout(grid)
             return box, grid
 
-        top = QtWidgets.QHBoxLayout()
-        top.setSpacing(8)
         self.btn_add_files = QtWidgets.QPushButton("Add AP .bin files")
         self.btn_add_folder = QtWidgets.QPushButton("Add folder")
         self.btn_scan_raw_root = QtWidgets.QPushButton("Scan raw root")
@@ -692,18 +838,36 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_remove.setProperty("role", "ghost")
         self.btn_clear.setProperty("role", "ghost")
         self.btn_run.setProperty("role", "primary")
-        top.addWidget(self.btn_add_files)
-        top.addWidget(self.btn_add_folder)
-        top.addWidget(self.btn_scan_raw_root)
-        top.addWidget(self.btn_recent_files)
-        top.addWidget(self.btn_recent_folders)
-        top.addStretch(1)
-        top.addWidget(QtWidgets.QLabel("Show"))
-        top.addWidget(self.cb_queue_filter)
-        top.addWidget(self.btn_concat)
-        top.addWidget(self.btn_remove)
-        top.addWidget(self.btn_clear)
-        top.addWidget(self.btn_run)
+        self.btn_add_files.setToolTip("Pick one or more SpikeGLX *.imecX.ap.bin files to queue.")
+        self.btn_add_folder.setToolTip("Queue every AP .bin file found inside a folder.")
+        self.btn_scan_raw_root.setToolTip("Scan the configured raw-data root and list every known run.")
+        self.btn_run.setToolTip("Process all queued recordings with the pipeline chosen in Settings.")
+        self.cb_queue_filter.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.cb_queue_filter.setToolTip("Show only runs that still need processing, or every known raw run.")
+
+        def make_cluster(*widgets: QtWidgets.QWidget) -> QtWidgets.QWidget:
+            """Group related controls so they stay together when the toolbar wraps."""
+            host = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(host)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            for w in widgets:
+                # Never let Qt squeeze a control below its label width.
+                w.ensurePolished()
+                w.setMinimumWidth(w.sizeHint().width())
+                row.addWidget(w)
+            return host
+
+        filter_label = QtWidgets.QLabel("Show")
+        filter_label.setObjectName("FieldTitle")
+        # FlowLayout wraps whole clusters onto a new row instead of clipping text
+        # when the window is narrower than the full toolbar.
+        toolbar = QtWidgets.QWidget()
+        top = FlowLayout(toolbar, h_spacing=14, v_spacing=8)
+        top.addWidget(make_cluster(self.btn_add_files, self.btn_add_folder, self.btn_scan_raw_root))
+        top.addWidget(make_cluster(self.btn_recent_files, self.btn_recent_folders))
+        top.addWidget(make_cluster(filter_label, self.cb_queue_filter))
+        top.addWidget(make_cluster(self.btn_concat, self.btn_remove, self.btn_clear, self.btn_run))
 
         self.list_jobs = BinDropList()
         self.list_jobs.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -1226,14 +1390,15 @@ class PreprocessingTab(QtWidgets.QWidget):
         queue_layout = QtWidgets.QVBoxLayout(queue_box)
         queue_layout.setSpacing(10)
         queue_hint = QtWidgets.QLabel(
-            "Build a queue from SpikeGLX AP recordings. Drag AP .bin files into the area below or add folders explicitly."
+            "Queue SpikeGLX AP recordings for spike sorting. Drag *.imecX.ap.bin files into the area below, "
+            "or use the buttons to add files, a folder, or scan your raw-data root."
         )
         queue_hint.setObjectName("SectionHint")
         queue_hint.setWordWrap(True)
         self.lbl_queue_summary = QtWidgets.QLabel()
         self.lbl_queue_summary.setObjectName("QueueSummary")
         queue_layout.addWidget(queue_hint)
-        queue_layout.addLayout(top)
+        queue_layout.addWidget(toolbar)
         queue_layout.addWidget(self.list_jobs, 1)
         queue_layout.addWidget(self.lbl_queue_summary)
 
