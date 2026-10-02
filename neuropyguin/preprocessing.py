@@ -276,16 +276,23 @@ def extractor_label_rename_map(
     return mapping
 
 
-def catgt_stream_string(catgt_command: str, ni_extract_string: str = "", include_ap: bool = True) -> str:
-    """Build the CatGT stream selector (``-ap``/``-ni``) for a full run.
+def catgt_stream_string(
+    catgt_command: str,
+    ni_extract_string: str = "",
+    include_ap: bool = True,
+    include_lf: bool = False,
+) -> str:
+    """Build the CatGT stream selector (``-ap``/``-lf``/``-ni``) for a full run.
 
-    Includes ``-ap`` unless ``include_ap`` is False, and adds ``-ni`` when the
-    command or ``ni_extract_string`` references the NI stream in any form.
+    AP and LF are selected explicitly. NI is added when the command or
+    ``ni_extract_string`` references the NI stream in any form.
     """
     tokens = _split_catgt_flags(catgt_command)
     parts: List[str] = []
     if include_ap:
         parts.append("-ap")
+    if include_lf:
+        parts.append("-lf")
     if (
         any(token.lower() == "-ni" for token in tokens)
         or any(_is_ni_catgt_extractor_flag(token) for token in tokens)
@@ -297,6 +304,21 @@ def catgt_stream_string(catgt_command: str, ni_extract_string: str = "", include
         if part not in out:
             out.append(part)
     return " ".join(out)
+
+
+def catgt_lfp_command_string(command: str, lowpass_hz: float, downsample: int) -> str:
+    """Set CatGT's LF filter and AP-to-LF downsample options in a command.
+
+    Existing LF-specific options are replaced so the visible preprocessing
+    settings remain authoritative when the user selects LFP output.
+    """
+    kept = [
+        token for token in _split_catgt_flags(command)
+        if not re.match(r"^-lffilter=", token, flags=re.IGNORECASE)
+        and not re.match(r"^-ap2lf_dwnsmp(?:=|$)", token, flags=re.IGNORECASE)
+    ]
+    kept.extend((f"-lffilter=butter,12,0,{float(lowpass_hz):g}", f"-ap2lf_dwnsmp={int(downsample)}"))
+    return " ".join(kept)
 
 
 def catgt_extract_only_stream_string(catgt_command: str, ni_extract_string: str = "") -> str:

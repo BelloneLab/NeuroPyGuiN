@@ -741,7 +741,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.ck_catgt_extract_only.setToolTip(
             "Run a CatGT extract-only pass to regenerate XA/XD/XIA/XID event text files without repeating filtering "
             "or gfix. Queue the raw *.imecX.ap.bin input for NI extraction or TPrime alignment because the NI "
-            "stream lives at the run root; existing *_tcat inputs are only suitable for probe/AP-only reruns."
+            "stream lives at the run root; existing *_tcat inputs are only suitable for probe/AP-only reruns. "
+            "Neural band output settings apply to the regular CatGT pass, not this event-only mode."
         )
         self.ck_save_catgt_ap_bin.setToolTip(
             "When enabled, raw-input CatGT extract-only reruns keep a real *_tcat.imecX.ap.bin in the CatGT folder "
@@ -774,6 +775,21 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.ed_ni_extract = QtWidgets.QLineEdit("-xd=0,0,8,7,0 -xd=0,0,8,5,0 -xd=0,0,8,6,0 -xd=0,0,8,3,0")
         self.ed_tostream = QtWidgets.QLineEdit("imec0")
         self.ed_catgt_cmd = QtWidgets.QLineEdit("-prb_fld -out_prb_fld -apfilter=butter,12,300,10000 -gfix=0.4,0.10,0.02")
+        self.cb_catgt_output_streams = QtWidgets.QComboBox()
+        self.cb_catgt_output_streams.addItem("AP", "ap")
+        self.cb_catgt_output_streams.addItem("LFP", "lfp")
+        self.cb_catgt_output_streams.addItem("AP + LFP", "both")
+        self.cb_catgt_output_streams.setToolTip(
+            "Choose which probe bands CatGT writes. LFP can be generated from full-band AP data, "
+            "including an existing CatGT AP output."
+        )
+        self.sp_catgt_lf_lowpass = QtWidgets.QDoubleSpinBox()
+        self.sp_catgt_lf_lowpass.setRange(1.0, 1000.0)
+        self.sp_catgt_lf_lowpass.setDecimals(1)
+        self.sp_catgt_lf_lowpass.setValue(300.0)
+        self.sp_catgt_lf_downsample = QtWidgets.QComboBox()
+        self.sp_catgt_lf_downsample.addItems(["2", "3", "4", "5", "6", "10", "12", "15", "20", "25", "30"])
+        self.sp_catgt_lf_downsample.setCurrentText("12")
         self.btn_build_tprime = QtWidgets.QPushButton("Build")
         self.btn_build_catgt = QtWidgets.QPushButton("Build")
         self.btn_build_bitfield = QtWidgets.QPushButton("Bit-field")
@@ -1031,18 +1047,43 @@ class PreprocessingTab(QtWidgets.QWidget):
             0,
         )
         sync_grid.addWidget(
-            make_field("CatGT command string", wrap_catgt_cmd, "Additional raw CatGT flags appended to command line."),
+            make_field(
+                "CatGT neural output",
+                self.cb_catgt_output_streams,
+                "Write AP, LFP, or both. LFP output uses CatGT's low-pass filter and AP-to-LF downsampling.",
+            ),
             1,
             1,
         )
         sync_grid.addWidget(
-            make_field("CatGT loccar min (um)", self.sp_loccar_min, "Inner radius for loccar mode in microns."),
+            make_field("LFP low-pass (Hz)", self.sp_catgt_lf_lowpass, "CatGT LF-band low-pass corner."),
             2,
             0,
         )
         sync_grid.addWidget(
-            make_field("CatGT loccar max (um)", self.sp_loccar_max, "Outer radius for loccar mode in microns."),
+            make_field(
+                "LFP downsample factor",
+                self.sp_catgt_lf_downsample,
+                "Must evenly divide 30000. Factor 12 produces 2500 Hz; factor 30 produces 1000 Hz.",
+            ),
             2,
+            1,
+        )
+        sync_grid.addWidget(
+            make_field("CatGT command string", wrap_catgt_cmd, "Additional raw CatGT flags appended to command line."),
+            3,
+            0,
+            1,
+            2,
+        )
+        sync_grid.addWidget(
+            make_field("CatGT loccar min (um)", self.sp_loccar_min, "Inner radius for loccar mode in microns."),
+            4,
+            0,
+        )
+        sync_grid.addWidget(
+            make_field("CatGT loccar max (um)", self.sp_loccar_max, "Outer radius for loccar mode in microns."),
+            4,
             1,
         )
         sync_grid.addWidget(
@@ -1053,7 +1094,7 @@ class PreprocessingTab(QtWidgets.QWidget):
                 "streams with rising/falling digital edges (xd/xid) and rising/falling analog edges (xa/xia). "
                 "Use Build for a guided NI-analog-to-imec preset.",
             ),
-            3,
+            5,
             0,
             1,
             2,
@@ -1403,7 +1444,12 @@ class PreprocessingTab(QtWidgets.QWidget):
             self.ck_pybomb,
         ]:
             checkbox.toggled.connect(lambda _checked=False: self._persist_settings())
+        self.ck_catgt_extract_only.toggled.connect(self._on_catgt_output_mode_changed)
         self.cb_ks_ver.currentTextChanged.connect(self._persist_settings)
+        self.cb_catgt_output_streams.currentIndexChanged.connect(self._on_catgt_output_mode_changed)
+        self.cb_catgt_output_streams.currentIndexChanged.connect(lambda _index: self._persist_settings())
+        self.sp_catgt_lf_lowpass.valueChanged.connect(lambda _value: self._persist_settings())
+        self.sp_catgt_lf_downsample.currentTextChanged.connect(lambda _value: self._persist_settings())
         self.ed_gate.editingFinished.connect(self._persist_settings)
         self.ed_trigger.editingFinished.connect(self._persist_settings)
         self.ed_probe.editingFinished.connect(self._persist_settings)
@@ -1437,11 +1483,20 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_adv_ks4.clicked.connect(self._open_ks4_advanced)
         self.btn_save_settings_file.clicked.connect(self.saveSettingsFileRequested.emit)
         self.btn_load_settings_file.clicked.connect(self.loadSettingsFileRequested.emit)
+        self._on_catgt_output_mode_changed()
 
     def output_layout(self) -> str:
         """Return the selected output layout mode (see ``preprocessing.OUTPUT_LAYOUTS``)."""
         value = self.cb_output_layout.currentData()
         return normalize_output_layout(str(value or ""), mirror_raw_hierarchy=True)
+
+    def _on_catgt_output_mode_changed(self, *_args) -> None:
+        """Enable LFP-specific controls only when CatGT will write LF data."""
+        regular_catgt = not self.ck_catgt_extract_only.isChecked()
+        self.cb_catgt_output_streams.setEnabled(regular_catgt)
+        use_lfp = regular_catgt and self.cb_catgt_output_streams.currentData() in {"lfp", "both"}
+        self.sp_catgt_lf_lowpass.setEnabled(use_lfp)
+        self.sp_catgt_lf_downsample.setEnabled(use_lfp)
 
     def _set_output_layout(self, mode: str) -> None:
         index = self.cb_output_layout.findData(normalize_output_layout(mode, mirror_raw_hierarchy=True))
@@ -2262,6 +2317,9 @@ class PreprocessingTab(QtWidgets.QWidget):
             region_name=self.ed_region.text().strip(),
             ni_extract_string=self.ed_ni_extract.text().strip(),
             catgt_cmd_string=self.ed_catgt_cmd.text().strip(),
+            catgt_output_streams=str(self.cb_catgt_output_streams.currentData() or "ap"),
+            catgt_lf_lowpass_hz=float(self.sp_catgt_lf_lowpass.value()),
+            catgt_lf_downsample=int(self.sp_catgt_lf_downsample.currentText()),
             sync_period=float(self.ed_sync_period.value()),
             tostream_sync_params=self.ed_tostream.text().strip(),
             ks_th=self.ed_ks_th.text().strip(),
@@ -2965,6 +3023,11 @@ class PreprocessingTab(QtWidgets.QWidget):
             self.ed_ks_th.setText(str(self.settings.value("preproc/ks_th", self.ed_ks_th.text())))
             self.ed_ni_extract.setText(str(self.settings.value("preproc/ni_extract_string", self.ed_ni_extract.text())))
             self.ed_catgt_cmd.setText(str(self.settings.value("preproc/catgt_cmd_string", self.ed_catgt_cmd.text())))
+            output_streams = str(self.settings.value("preproc/catgt_output_streams", "ap"))
+            output_stream_index = self.cb_catgt_output_streams.findData(output_streams)
+            self.cb_catgt_output_streams.setCurrentIndex(max(0, output_stream_index))
+            self.sp_catgt_lf_lowpass.setValue(float(self.settings.value("preproc/catgt_lf_lowpass_hz", 300.0)))
+            self.sp_catgt_lf_downsample.setCurrentText(str(self.settings.value("preproc/catgt_lf_downsample", "12")))
             self.ed_tostream.setText(str(self.settings.value("preproc/tostream_sync_params", self.ed_tostream.text())))
             car_mode = self.settings.value("preproc/catgt_car_mode", "gbldmx")
             idx = self.cb_catgt_car_mode.findText(str(car_mode))
@@ -3026,6 +3089,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.settings.setValue("preproc/qm_isi_thresh", float(self.ed_qm_isi.value()))
         self.settings.setValue("preproc/ni_extract_string", self.ed_ni_extract.text().strip())
         self.settings.setValue("preproc/catgt_cmd_string", self.ed_catgt_cmd.text().strip())
+        self.settings.setValue("preproc/catgt_output_streams", str(self.cb_catgt_output_streams.currentData() or "ap"))
+        self.settings.setValue("preproc/catgt_lf_lowpass_hz", float(self.sp_catgt_lf_lowpass.value()))
+        self.settings.setValue("preproc/catgt_lf_downsample", int(self.sp_catgt_lf_downsample.currentText()))
         self.settings.setValue("preproc/sync_period", float(self.ed_sync_period.value()))
         self.settings.setValue("preproc/tostream_sync_params", self.ed_tostream.text().strip())
         self.settings.setValue("preproc/catgt_car_mode", self.cb_catgt_car_mode.currentText())

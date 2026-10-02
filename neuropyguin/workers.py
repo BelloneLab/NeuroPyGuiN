@@ -22,7 +22,13 @@ from typing import Dict, List, Sequence, Tuple
 from PySide6 import QtCore
 from .ecephys_runtime import ecephys_subprocess_env, ensure_ecephys_on_sys_path
 from .ks_output_resolver import archive_output_dir, find_kilosort_output_dir, has_kilosort_output
-from .preprocessing import catgt_command_for_input_layout, catgt_input_layout
+from .preprocessing import (
+    catgt_command_for_input_layout,
+    catgt_input_layout,
+    catgt_lfp_command_string,
+    strip_catgt_extractor_flags,
+    strip_ni_catgt_extractor_flags,
+)
 from .processes import tracked_popen, unregister_process
 
 
@@ -236,6 +242,9 @@ class EcephysPipelineConfig:
     region_name: str
     ni_extract_string: str
     catgt_cmd_string: str
+    catgt_output_streams: str
+    catgt_lf_lowpass_hz: float
+    catgt_lf_downsample: int
     sync_period: float
     tostream_sync_params: str
     ks_th: str
@@ -556,6 +565,25 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         return matches[0]
 
     @staticmethod
+    def _find_recent_catgt_lf(job_out: Path, trial_start_time: float, probe_string: str) -> Path | None:
+        """Find an LF binary written by the current CatGT pass."""
+        patterns = [f"*.imec{probe_string}.lf.bin", "*.lf.bin"]
+        matches: List[Path] = []
+        for pattern in patterns:
+            for path in job_out.rglob(pattern):
+                if "catgt_" not in str(path).lower():
+                    continue
+                try:
+                    if path.stat().st_mtime >= trial_start_time - 1.0:
+                        matches.append(path)
+                except OSError:
+                    continue
+        if not matches:
+            return None
+        matches.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        return matches[0]
+
+    @staticmethod
     def _find_recent_text_outputs(root: Path, trial_start_time: float) -> List[Path]:
         matches: List[Path] = []
         for p in root.rglob("*.txt"):
@@ -813,6 +841,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         json_root: Path,
         catgt_cmd_string: str,
         catgt_stream_string: str,
+        output_mode: str = "ap",
     ) -> Tuple[Path, Path]:
         trials = self._build_catgt_trials(run_name, bin_file, gate_string, trigger_string, probe_string)
         if not trials:
@@ -872,7 +901,18 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 lines = self._run_module("catGT_helper", trial_in, trial_out, self.job["workdir"])
             except RuntimeError as exc:
                 lines = [str(exc)]
+            mode = str(output_mode).lower()
             catgt_ap = self._find_recent_catgt_ap(job_out, trial_start, probe_string)
+            catgt_lf = self._find_recent_catgt_lf(job_out, trial_start, probe_string) if mode in {"lfp", "both"} else None
+            if mode in {"lfp", "both"} and (
+                catgt_lf is None or not self._meta_for_bin(catgt_lf).exists()
+            ):
+                last_reason = "CatGT did not produce the requested LF binary"
+                _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT trial {idx} failed: {last_reason}")
+                continue
+            if mode == "lfp" and catgt_lf is not None:
+                _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT wrote LFP output: {catgt_lf}")
+                return bin_file, input_meta
             if catgt_ap is not None and catgt_ap.exists():
                 meta_path = self._meta_for_bin(catgt_ap)
                 if not meta_path.exists():
@@ -899,6 +939,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         catgt_cmd_string: str,
         catgt_stream_string: str,
         catgt_context: Dict[str, str],
+        expect_lf_output: bool = False,
     ) -> None:
         catgt_dir = self._normalize_tool_dir(self.cfg.catgt_path, ("CatGT",))
         tprime_dir = self._normalize_tool_dir(self.cfg.tprime_path, ("TPrime",))
@@ -939,12 +980,19 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         )
         trial_start = time.time()
         self._run_module("catGT_helper", extract_in, extract_out, self.job["workdir"])
-        fresh_txt = self._find_recent_text_outputs(Path(catgt_context["catgt_run_dir"]), trial_start)
-        if not fresh_txt:
-            raise RuntimeError("CatGT extract-only pass finished without producing any new text outputs.")
-        preview = ", ".join(p.name for p in fresh_txt[:4])
-        extra = "" if len(fresh_txt) <= 4 else f" (+{len(fresh_txt) - 4} more)"
-        _safe_emit(self.signals.log, f"[{self.job['name']}] Extract-only CatGT outputs: {preview}{extra}")
+        output_root = Path(catgt_context["catgt_run_dir"])
+        if expect_lf_output:
+            fresh_lf = self._find_recent_catgt_lf(output_root, trial_start, probe_string)
+            if fresh_lf is None or not self._meta_for_bin(fresh_lf).exists():
+                raise RuntimeError("CatGT did not produce a new LF binary from the existing AP output.")
+            _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT wrote LFP output: {fresh_lf}")
+        else:
+            fresh_txt = self._find_recent_text_outputs(output_root, trial_start)
+            if not fresh_txt:
+                raise RuntimeError("CatGT extract-only pass finished without producing any new text outputs.")
+            preview = ", ".join(p.name for p in fresh_txt[:4])
+            extra = "" if len(fresh_txt) <= 4 else f" (+{len(fresh_txt) - 4} more)"
+            _safe_emit(self.signals.log, f"[{self.job['name']}] Extract-only CatGT outputs: {preview}{extra}")
 
     def _run_has_ni_stream(self, bin_file: Path) -> bool:
         """Return True if a SpikeGLX nidq stream exists for this run.
@@ -1107,7 +1155,11 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 probe_string = catgt_context.get("probe_string") or probe_string
 
             run_catgt_extract_only = self.cfg.run_catgt_extract_only
-            run_catgt_effective = self.cfg.run_catgt and not run_catgt_extract_only and not catgt_processed_input
+            output_mode = str(self.cfg.catgt_output_streams).strip().lower()
+            if output_mode not in {"ap", "lfp", "both"}:
+                output_mode = "ap"
+            lfp_existing_reprocess = output_mode in {"lfp", "both"} and catgt_processed_input
+            run_catgt_effective = self.cfg.run_catgt and not run_catgt_extract_only and (not catgt_processed_input or lfp_existing_reprocess)
             # Concatenated runs merge several AP sessions into one bin with no nidq stream.
             # TPrime aligns event times to a reference stream via sync edges, which is
             # meaningless once sessions are spliced together (the sync is discontinuous and
@@ -1158,7 +1210,20 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     f"({dropped_preview}). Keeping AP-stream extractors only.",
                 )
 
-            full_catgt_stream = catgt_stream_string(effective_catgt_cmd)
+            if lfp_existing_reprocess:
+                effective_catgt_cmd = strip_ni_catgt_extractor_flags(effective_catgt_cmd)
+                effective_ni_extract_string = ""
+            if output_mode in {"lfp", "both"}:
+                effective_catgt_cmd = catgt_lfp_command_string(
+                    effective_catgt_cmd,
+                    self.cfg.catgt_lf_lowpass_hz,
+                    self.cfg.catgt_lf_downsample,
+                )
+            full_catgt_stream = catgt_stream_string(
+                effective_catgt_cmd,
+                include_ap=output_mode in {"ap", "both"},
+                include_lf=output_mode in {"lfp", "both"},
+            )
             extract_only_catgt_cmd = catgt_extract_command_string(
                 effective_catgt_cmd,
                 save_ap_bin=False,
@@ -1307,6 +1372,39 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             if run_catgt_effective:
                 def _run_catgt_step() -> None:
                     nonlocal processing_bin, processing_meta, catgt_context, ks_folder
+                    if lfp_existing_reprocess:
+                        if not catgt_context:
+                            raise RuntimeError("Could not resolve the existing CatGT folder for LFP extraction.")
+                        existing_lfp_cmd = strip_catgt_extractor_flags(effective_catgt_cmd)
+                        existing_lfp_stream = catgt_stream_string(
+                            existing_lfp_cmd,
+                            include_ap=False,
+                            include_lf=True,
+                        )
+                        _safe_emit(
+                            self.signals.log,
+                            f"[{self.job['name']}] CatGT stream selection for existing AP input: {existing_lfp_stream}",
+                        )
+                        self._run_catgt_extract_only(
+                            create_input_json_fn=createInputJson,
+                            processing_bin=processing_bin,
+                            processing_meta=processing_meta,
+                            extracted_data_root=extracted_data_root,
+                            ks_tag=ks_tag,
+                            session_run_name=run_name,
+                            gate_string=gate_string,
+                            probe_string=probe_string,
+                            json_root=json_root,
+                            catgt_cmd_string=existing_lfp_cmd,
+                            catgt_stream_string=existing_lfp_stream,
+                            catgt_context=catgt_context,
+                            expect_lf_output=True,
+                        )
+                        _safe_emit(
+                            self.signals.log,
+                            f"[{self.job['name']}] Kept existing AP input for downstream Kilosort: {processing_bin}",
+                        )
+                        return
                     _safe_emit(self.signals.log, f"[{self.job['name']}] CatGT stream selection: {full_catgt_stream}")
                     processing_bin, processing_meta = self._run_catgt_with_retries(
                         create_input_json_fn=createInputJson,
@@ -1321,6 +1419,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                         json_root=json_root,
                         catgt_cmd_string=effective_catgt_cmd,
                         catgt_stream_string=full_catgt_stream,
+                        output_mode=output_mode,
                     )
                     catgt_output_context = parse_catgt_processed_bin_context(str(processing_bin))
                     if catgt_output_context:

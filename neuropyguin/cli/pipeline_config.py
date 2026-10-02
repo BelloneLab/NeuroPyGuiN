@@ -107,6 +107,9 @@ def default_pipeline_settings() -> Dict[str, Any]:
         # CatGT / TPrime strings
         "ni_extract_string": "-xd=0,0,8,7,0 -xd=0,0,8,5,0 -xd=0,0,8,6,0 -xd=0,0,8,3,0",
         "catgt_cmd_string": "-prb_fld -out_prb_fld -apfilter=butter,12,300,10000 -gfix=0.4,0.10,0.02",
+        "catgt_output_streams": "ap",
+        "catgt_lf_lowpass_hz": 300.0,
+        "catgt_lf_downsample": 12,
         "catgt_car_mode": "gbldmx",
         "catgt_loccar_min_um": 40.0,
         "catgt_loccar_max_um": 160.0,
@@ -182,6 +185,7 @@ def settings_pipeline_overrides(settings=None) -> Dict[str, Any]:
     put_str("ks_th", "preproc/ks_th")
     put_str("ni_extract_string", "preproc/ni_extract_string")
     put_str("catgt_cmd_string", "preproc/catgt_cmd_string")
+    put_str("catgt_output_streams", "preproc/catgt_output_streams")
     put_str("tostream_sync_params", "preproc/tostream_sync_params")
     put_str("catgt_car_mode", "preproc/catgt_car_mode")
 
@@ -189,6 +193,12 @@ def settings_pipeline_overrides(settings=None) -> Dict[str, Any]:
     put_float("sync_period", "preproc/sync_period")
     put_float("catgt_loccar_min_um", "preproc/catgt_loccar_min_um")
     put_float("catgt_loccar_max_um", "preproc/catgt_loccar_max_um")
+    put_float("catgt_lf_lowpass_hz", "preproc/catgt_lf_lowpass_hz")
+    if store.contains("preproc/catgt_lf_downsample"):
+        try:
+            out["catgt_lf_downsample"] = int(store.value("preproc/catgt_lf_downsample"))
+        except (TypeError, ValueError):
+            pass
     put_float("ks4_duplicate_spike_ms", "preproc/ks4_duplicate_spike_ms")
     put_float("ks4_min_template_size_um", "preproc/ks4_min_template_size_um")
     put_float("c_waves_snr_um", "preproc/c_waves_snr_um")
@@ -269,6 +279,9 @@ def _apply_cli_overrides(values: Dict[str, Any], args) -> None:
         "region_name": "region",
         "ni_extract_string": "ni_extract",
         "catgt_cmd_string": "catgt_cmd",
+        "catgt_output_streams": "catgt_output_streams",
+        "catgt_lf_lowpass_hz": "catgt_lf_lowpass_hz",
+        "catgt_lf_downsample": "catgt_lf_downsample",
         "catgt_car_mode": "car_mode",
         "tostream_sync_params": "tostream",
         "ks_th": "ks_th",
@@ -448,6 +461,18 @@ def add_pipeline_arguments(parser) -> None:
 
     strings = parser.add_argument_group("CatGT and TPrime")
     strings.add_argument("--catgt-cmd", help="Raw CatGT flag string.")
+    strings.add_argument(
+        "--catgt-output-streams",
+        choices=["ap", "lfp", "both"],
+        help="CatGT neural output bands: AP, LFP, or both.",
+    )
+    strings.add_argument("--catgt-lf-lowpass-hz", type=float, help="CatGT LFP low-pass corner in Hz.")
+    strings.add_argument(
+        "--catgt-lf-downsample",
+        type=int,
+        choices=[2, 3, 4, 5, 6, 10, 12, 15, 20, 25, 30],
+        help="CatGT AP-to-LFP downsample factor (must divide 30000).",
+    )
     strings.add_argument("--ni-extract", help="CatGT/TPrime NI event extractor string.")
     strings.add_argument("--car-mode", choices=["gbldmx", "loccar", "none"], help="CatGT CAR mode.")
     strings.add_argument("--loccar-min", type=float, help="CatGT loccar inner radius (um).")
