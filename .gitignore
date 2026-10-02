@@ -45,3 +45,6 @@ tools/_pytest_tmp/
 *.dat
 *.log
 *.asv
+
+# Optional in-checkout one-click runtime
+/.neuropyguin/

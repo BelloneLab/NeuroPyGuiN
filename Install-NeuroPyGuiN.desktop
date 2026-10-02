@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install NeuroPyGuiN
+Comment=Download NeuroPyGuiN, install its runtime, and create shortcuts
+Exec="sh" "-c" "installer=\\$(mktemp /tmp/neuropyguin-install.XXXXXX.sh) || exit 1\nurl=https://raw.githubusercontent.com/BelloneLab/NeuroPyGuiN/main/Install-NeuroPyGuiN.sh\nif command -v curl >/dev/null; then\n  curl --fail --location --retry 3 \\"\\$url\\" -o \\"\\$installer\\"\nelif command -v wget >/dev/null; then\n  wget -O \\"\\$installer\\" \\"\\$url\\"\nelse\n  echo 'Install curl or wget, then try again.'\n  rm -f \\"\\$installer\\"\n  read -r answer\n  exit 1\nfi\nresult=\\$?\nif [ \\"\\$result\\" -eq 0 ]; then\n  bash \\"\\$installer\\" --terminal\n  result=\\$?\nelse\n  echo 'Download failed. Check the network connection and try again.'\n  read -r answer\nfi\nrm -f \\"\\$installer\\"\nexit \\"\\$result\\""
+Icon=system-software-install
+Terminal=true
+Categories=Science;

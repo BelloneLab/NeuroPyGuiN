@@ -173,6 +173,32 @@ with the original toolchain.
 
 ## 🚀 Installation
 
+### Easy install (recommended)
+
+The installer downloads Python and Git for you, installs the scientific packages,
+and creates **NeuroPyGuiN** and **Update NeuroPyGuiN** shortcuts on your desktop
+and in the applications menu (Start menu on Windows). Existing Conda installations
+are left alone. The app remains a normal GitHub checkout.
+
+| Platform | Install |
+| --- | --- |
+| **Windows 10/11, x64** | [Download Install-NeuroPyGuiN.bat](https://raw.githubusercontent.com/BelloneLab/NeuroPyGuiN/main/Install-NeuroPyGuiN.bat) (save the link as a `.bat` file), then double-click it. |
+| **Linux, x86_64** | Save [Install-NeuroPyGuiN.desktop](https://raw.githubusercontent.com/BelloneLab/NeuroPyGuiN/main/Install-NeuroPyGuiN.desktop) to your Desktop, right-click **Allow Launching** (or mark executable), then open it. Alternatively, download [Install-NeuroPyGuiN.sh](https://raw.githubusercontent.com/BelloneLab/NeuroPyGuiN/main/Install-NeuroPyGuiN.sh) and run `bash ~/Downloads/Install-NeuroPyGuiN.sh`. |
+
+Already cloned the repository? Double-click `Install-NeuroPyGuiN.bat` on Windows,
+or run `bash Install-NeuroPyGuiN.sh` on Linux. This uses your existing checkout.
+The first installation downloads several GB of scientific and CUDA dependencies.
+Keep the installer window open until it reports **Ready**.
+
+To update, close the app and use **Update NeuroPyGuiN**. It pulls `origin/main`
+with `--ff-only`, refreshes dependencies, and recreates shortcuts. It stops if
+tracked files have local edits or Git cannot fast-forward. Re-run the original
+installer without the update option to repair dependencies at the current revision.
+
+[Installer options, locations, shortcuts, and troubleshooting](install/README.md)
+
+### Classic GitHub and Conda installation
+
 NeuroPyGuiN has a separate Conda environment file for each supported operating
 system: [`environment-windows.yml`](./environment-windows.yml) and
 [`environment-linux.yml`](./environment-linux.yml). Both install Python 3.10,
@@ -180,7 +206,7 @@ the GUI, Kilosort 4 with CUDA-enabled PyTorch, the scientific stack, phy, and th
 histology dependencies. Use the file that matches the machine on which the app
 will run. Do not use the Windows file from WSL or the Linux file from Windows.
 
-### Windows 10 or 11
+#### Windows 10 or 11
 
 Requirements: 64-bit Windows, an NVIDIA GPU with a driver compatible with CUDA
 12.6, and [Miniconda](https://docs.conda.io/projects/miniconda/en/latest/) or
@@ -195,7 +221,7 @@ python main.py
 The Windows environment uses Windows builds of CatGT, TPrime, and C_Waves. Their
 installer may also require the Microsoft Visual C++ Redistributable.
 
-### Linux x86_64
+#### Linux x86_64
 
 Requirements: 64-bit Linux, an NVIDIA GPU with a driver compatible with CUDA
 12.6, and Miniconda or Anaconda. The PySide6 GUI also needs the following system
@@ -220,10 +246,15 @@ python main.py
 The Linux environment uses native Linux builds of CatGT, TPrime, and C_Waves.
 WSL is not a tested or supported GUI configuration.
 
-### Update or rebuild the environment
+#### Update or rebuild the environment
 
-To update an existing installation while removing dependencies that are no
-longer declared, use the matching file for your operating system:
+Close the app and pull the current source from inside your checkout:
+
+```bash
+git pull --ff-only origin main
+```
+
+Then update dependencies using the matching file for your operating system:
 
 ```powershell
 # Windows, in Anaconda Prompt

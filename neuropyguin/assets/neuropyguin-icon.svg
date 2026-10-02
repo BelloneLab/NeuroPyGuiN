@@ -16,19 +16,23 @@
     </linearGradient>
   </defs>
   <g id="penguin">
-    <!-- Broad flippers and feet keep the silhouette recognizable at small sizes. -->
-    <path d="M170 210 C133 226 98 270 82 320 C70 357 72 383 86 378 L144 332 Z" fill="#19485f"/>
-    <path d="M342 210 C379 226 414 270 430 320 C442 357 440 383 426 378 L368 332 Z" fill="#19485f"/>
-    <path d="M189 426 C168 432 139 452 147 462 C163 476 211 471 237 454 L231 429 Z" fill="url(#gold)" stroke="#173e54" stroke-width="11" stroke-linejoin="round"/>
-    <path d="M323 426 C344 432 373 452 365 462 C349 476 301 471 275 454 L281 429 Z" fill="url(#gold)" stroke="#173e54" stroke-width="11" stroke-linejoin="round"/>
-    <path d="M256 30 C194 30 152 77 152 137 C152 171 161 191 146 223 C127 261 122 286 126 331 C131 406 180 452 256 452 C332 452 381 406 386 331 C390 286 385 261 366 223 C351 191 360 171 360 137 C360 77 318 30 256 30 Z" fill="url(#body)"/>
-    <!-- Paired face lobes join a continuous white belly. -->
-    <path d="M256 190 C236 172 241 104 208 102 C178 99 169 134 177 169 C182 191 183 205 173 231 C157 269 147 297 154 341 C163 403 204 433 256 433 C308 433 349 403 358 341 C365 297 355 269 339 231 C329 205 330 191 335 169 C343 134 334 99 304 102 C271 104 276 172 256 190 Z" fill="url(#belly)"/>
-    <ellipse cx="208" cy="142" rx="12" ry="17" fill="#214c64"/>
-    <ellipse cx="304" cy="142" rx="12" ry="17" fill="#214c64"/>
-    <path d="M235 181 L256 164 L277 181 L256 202 Z" fill="url(#gold)" stroke="#286781" stroke-width="6" stroke-linejoin="round"/>
-    <!-- The signal is one continuous path with a white clearance stroke. -->
-    <path d="M28 312 H176 L205 239 L251 391 L287 269 L315 335 L335 312 H484" fill="none" stroke="#f7fcff" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M28 312 H176 L205 239 L251 391 L287 269 L315 335 L335 312 H484" fill="none" stroke="url(#signal)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- Soft, outward flippers frame a squat, pear-shaped silhouette. -->
+    <path d="M135 207 C97 215 58 259 52 292 C47 316 64 321 84 303 L132 267 Z" fill="#235a70"/>
+    <path d="M377 207 C415 215 454 259 460 292 C465 316 448 321 428 303 L380 267 Z" fill="#235a70"/>
+    <path d="M170 413 C140 420 117 442 131 455 C151 472 207 465 236 446 L223 416 Z" fill="url(#gold)" stroke="#173e54" stroke-width="9" stroke-linejoin="round"/>
+    <path d="M342 413 C372 420 395 442 381 455 C361 472 305 465 276 446 L289 416 Z" fill="url(#gold)" stroke="#173e54" stroke-width="9" stroke-linejoin="round"/>
+    <path d="M256 54 C171 54 125 104 124 170 C123 203 105 225 94 266 C66 370 125 449 256 449 C387 449 446 370 418 266 C407 225 389 203 388 170 C387 104 341 54 256 54 Z" fill="url(#body)"/>
+    <!-- A generous white belly and heart-shaped face make the expression gentle. -->
+    <path d="M256 183 C244 171 235 123 204 123 C163 122 143 163 158 199 C169 225 145 246 131 282 C107 354 153 426 256 426 C359 426 405 354 381 282 C367 246 343 225 354 199 C369 163 349 122 308 123 C277 123 268 171 256 183 Z" fill="url(#belly)"/>
+    <ellipse cx="199" cy="177" rx="15" ry="19" fill="#193f54"/>
+    <ellipse cx="313" cy="177" rx="15" ry="19" fill="#193f54"/>
+    <circle cx="194" cy="170" r="5.5" fill="#fff"/>
+    <circle cx="308" cy="170" r="5.5" fill="#fff"/>
+    <ellipse cx="175" cy="209" rx="19" ry="10" fill="#f4b8b6" opacity=".65"/>
+    <ellipse cx="337" cy="209" rx="19" ry="10" fill="#f4b8b6" opacity=".65"/>
+    <path d="M236 199 Q256 188 276 199 Q270 220 256 224 Q242 220 236 199 Z" fill="url(#gold)" stroke="#b57940" stroke-width="4" stroke-linejoin="round"/>
+    <!-- The signal remains legible on both light and dark backgrounds. -->
+    <path d="M28 316 H165 L199 259 L247 389 L287 281 L319 339 L343 316 H484" fill="none" stroke="#f7fcff" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M28 316 H165 L199 259 L247 389 L287 281 L319 339 L343 316 H484" fill="none" stroke="url(#signal)" stroke-width="17" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
 </svg>

@@ -1106,6 +1106,8 @@ def main() -> int:
     _install_global_excepthook()
     app.setApplicationName("NeuroPyGuiN")
     app.setApplicationDisplayName("NeuroPyGuiN")
+    # Match the installer desktop entry for application-menu and Wayland grouping.
+    app.setDesktopFileName("neuropyguin")
     app_icon = _load_app_icon()
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
