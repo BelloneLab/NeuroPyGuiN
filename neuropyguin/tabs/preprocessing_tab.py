@@ -1272,6 +1272,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             3,
             0,
             1,
+            2,
         )
         sync_grid.addWidget(
             make_field("Full CatGT command preview", self.txt_catgt_preview, "Preview includes run selection, output bands, reference mode, filters, and event flags."),
