@@ -393,13 +393,17 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(400, self._maybe_run_startup_doctor)
 
     def _build_actions(self) -> None:
-        self.act_add_ap_files = QtGui.QAction("Add AP Files to Queue...", self)
+        self.act_add_ap_files = self.pre_tab.act_add_files
+        self.act_add_ap_files.setText("Add AP files...")
         self.act_add_ap_files.setShortcut(QtGui.QKeySequence.Open)
-        self.act_add_ap_files.triggered.connect(self._open_ap_files)
 
-        self.act_add_folder = QtGui.QAction("Add Folder to Queue...", self)
+        self.act_add_folder = self.pre_tab.act_add_folder
+        self.act_add_folder.setText("Add folder...")
         self.act_add_folder.setShortcut("Ctrl+Shift+O")
-        self.act_add_folder.triggered.connect(self._open_preprocessing_folder)
+
+        self.act_scan_raw_root = self.pre_tab.act_scan_raw_root
+        self.act_scan_raw_root.setText("Scan raw data folder...")
+        self.act_clear_queue = self.pre_tab.act_clear_queue
 
         self.act_set_curation_folder = QtGui.QAction("Set Curation Folder...", self)
         self.act_set_curation_folder.setShortcut("Ctrl+Shift+C")
@@ -419,21 +423,21 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_export_units = QtGui.QAction("Export Units to H5...", self)
         self.act_export_units.triggered.connect(self._export_units_h5)
 
-        self.act_save_settings = QtGui.QAction("Save Settings", self)
+        self.act_save_settings = QtGui.QAction("Save as Default Settings", self)
         self.act_save_settings.setShortcut(QtGui.QKeySequence.Save)
         self.act_save_settings.triggered.connect(self._save_settings)
 
-        self.act_export_settings_file = QtGui.QAction("Save Settings to File...", self)
+        self.act_export_settings_file = QtGui.QAction("Export Settings Preset...", self)
         self.act_export_settings_file.triggered.connect(self._export_settings_file)
 
-        self.act_load_settings_file = QtGui.QAction("Load Settings from File...", self)
+        self.act_load_settings_file = QtGui.QAction("Import Settings Preset...", self)
         self.act_load_settings_file.triggered.connect(self._load_settings_file)
 
-        self.act_settings = QtGui.QAction("Settings...", self)
+        self.act_settings = QtGui.QAction("Application Settings...", self)
         self.act_settings.setShortcut("Ctrl+,")
         self.act_settings.triggered.connect(self._open_settings_dialog)
 
-        self.act_clear_history = QtGui.QAction("Clear Folder History and Recents...", self)
+        self.act_clear_history = QtGui.QAction("Clear Recent Locations and Completed History...", self)
         self.act_clear_history.triggered.connect(self._clear_folder_history)
 
         self.act_exit = QtGui.QAction("Exit", self)
@@ -489,18 +493,34 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 
     def _build_menu_bar(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
-        file_menu.addAction(self.act_add_ap_files)
-        file_menu.addAction(self.act_add_folder)
+        queue_menu = file_menu.addMenu("&Queue")
+        queue_menu.addAction(self.act_add_ap_files)
+        queue_menu.addAction(self.act_add_folder)
+        queue_menu.addAction(self.act_scan_raw_root)
         file_menu.addSeparator()
-        file_menu.addAction(self.act_set_curation_folder)
-        file_menu.addAction(self.act_open_post_folder)
+        recent_files = queue_menu.addMenu("Recent AP files")
+        recent_files.aboutToShow.connect(
+            lambda: self.pre_tab._populate_recent_menu(recent_files, "recent_files", "AP file")
+        )
+        recent_folders = queue_menu.addMenu("Recent folders")
+        recent_folders.aboutToShow.connect(
+            lambda: self.pre_tab._populate_recent_menu(recent_folders, "recent_folders", "folder")
+        )
+        queue_menu.addSeparator()
+        queue_menu.addAction(self.act_clear_queue)
+
+        paths_menu = file_menu.addMenu("Open workspace folder")
+        paths_menu.addAction(self.act_set_curation_folder)
+        paths_menu.addAction(self.act_open_post_folder)
         file_menu.addSeparator()
-        file_menu.addAction(self.act_export_current)
-        file_menu.addAction(self.act_save_bombcell)
-        file_menu.addAction(self.act_export_units)
-        file_menu.addAction(self.act_save_settings)
-        file_menu.addAction(self.act_export_settings_file)
-        file_menu.addAction(self.act_load_settings_file)
+        export_menu = file_menu.addMenu("&Export")
+        export_menu.addAction(self.act_export_current)
+        export_menu.addAction(self.act_save_bombcell)
+        export_menu.addAction(self.act_export_units)
+        settings_menu = file_menu.addMenu("Settings and &presets")
+        settings_menu.addAction(self.act_save_settings)
+        settings_menu.addAction(self.act_export_settings_file)
+        settings_menu.addAction(self.act_load_settings_file)
         file_menu.addSeparator()
         file_menu.addAction(self.act_settings)
         file_menu.addAction(self.act_clear_history)
@@ -649,14 +669,6 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         if folder:
             self.settings.setValue("paths/last_folder", folder)
         return folder
-
-    def _open_ap_files(self) -> None:
-        self.tabs.setCurrentWidget(self.pre_tab)
-        self.pre_tab._add_files()
-
-    def _open_preprocessing_folder(self) -> None:
-        self.tabs.setCurrentWidget(self.pre_tab)
-        self.pre_tab._add_folder()
 
     def _pick_curation_folder(self) -> None:
         folder = self._choose_folder("Select curated Kilosort folder")

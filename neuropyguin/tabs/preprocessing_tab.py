@@ -150,7 +150,7 @@ class BinDropList(QtWidgets.QListWidget):
 
     # Quick-start steps painted in the empty drop zone: (title, detail).
     _EMPTY_STEPS = (
-        ("Add recordings", "Drop *.imecX.ap.bin files here, or use Add AP .bin files / Add folder / Scan raw root."),
+        ("Add recordings", "Drop *.imecX.ap.bin files here, or open Add recordings for files, folders, raw scans, and recent locations."),
         ("Choose the pipeline", "Open Settings on the left to pick CatGT, Kilosort, metrics and output folders."),
         ("Run the queue", "Press Run queue, follow progress in Log, then open finished runs from Completed."),
     )
@@ -809,36 +809,48 @@ class PreprocessingTab(QtWidgets.QWidget):
             layout.addLayout(grid)
             return box, grid
 
-        self.btn_add_files = QtWidgets.QPushButton("Add AP .bin files")
-        self.btn_add_folder = QtWidgets.QPushButton("Add folder")
-        self.btn_scan_raw_root = QtWidgets.QPushButton("Scan raw root")
-        self.btn_recent_files = QtWidgets.QPushButton("Open recent file")
-        self.btn_recent_folders = QtWidgets.QPushButton("Open recent folder")
+        self.btn_add_recordings = QtWidgets.QPushButton()
+        self.btn_add_recordings.setText("Add recordings")
+        self.btn_add_recordings.setProperty("role", "secondary")
+        self.menu_add_recordings = QtWidgets.QMenu(self.btn_add_recordings)
+        self.act_add_files = self.menu_add_recordings.addAction("Add AP files...")
+        self.act_add_folder = self.menu_add_recordings.addAction("Add folder...")
+        self.act_scan_raw_root = self.menu_add_recordings.addAction("Scan raw data folder...")
+        self.menu_add_recordings.addSeparator()
+        self.menu_recent_files = self.menu_add_recordings.addMenu("Recent AP files")
+        self.menu_recent_folders = self.menu_add_recordings.addMenu("Recent folders")
+        self.act_clear_queue = QtGui.QAction("Clear queue and discovered runs", self)
+        self.menu_recent_files.aboutToShow.connect(
+            lambda: self._populate_recent_menu(self.menu_recent_files, "recent_files", "AP file")
+        )
+        self.menu_recent_folders.aboutToShow.connect(
+            lambda: self._populate_recent_menu(self.menu_recent_folders, "recent_folders", "folder")
+        )
+        self.btn_add_recordings.setMenu(self.menu_add_recordings)
+        self.act_add_files.triggered.connect(self._open_add_files)
+        self.act_add_folder.triggered.connect(self._open_add_folder)
+        self.act_scan_raw_root.triggered.connect(self._open_scan_raw_root)
+        self.act_clear_queue.triggered.connect(self._clear)
         self.cb_queue_filter = QtWidgets.QComboBox()
         self.cb_queue_filter.addItem("Non-processed", "non_processed")
         self.cb_queue_filter.addItem("All runs", "all")
         self.btn_concat = QtWidgets.QPushButton("Concatenate selected")
         self.btn_remove = QtWidgets.QPushButton("Remove selected")
-        self.btn_clear = QtWidgets.QPushButton("Clear")
         self.btn_run = QtWidgets.QPushButton("Run queue")
-        self.btn_add_files.setProperty("role", "secondary")
-        self.btn_add_folder.setProperty("role", "secondary")
-        self.btn_scan_raw_root.setProperty("role", "secondary")
-        self.btn_recent_files.setProperty("role", "ghost")
-        self.btn_recent_folders.setProperty("role", "ghost")
         self.btn_concat.setProperty("role", "secondary")
         self.btn_concat.setEnabled(False)
+        self.btn_concat.setVisible(False)
         self.btn_concat.setToolTip(
             "Fuse 2+ selected AP recordings into a single binary so Kilosort sorts them jointly and "
             "tracks the same units across sessions. Produces a new queued run plus a split-info map "
             "for separating spikes per session afterward."
         )
         self.btn_remove.setProperty("role", "ghost")
-        self.btn_clear.setProperty("role", "ghost")
+        self.btn_remove.setVisible(False)
         self.btn_run.setProperty("role", "primary")
-        self.btn_add_files.setToolTip("Pick one or more SpikeGLX *.imecX.ap.bin files to queue.")
-        self.btn_add_folder.setToolTip("Queue every AP .bin file found inside a folder.")
-        self.btn_scan_raw_root.setToolTip("Scan the configured raw-data root and list every known run.")
+        self.btn_add_recordings.setToolTip(
+            "Add AP files or folders, scan a raw data folder, or reopen a recent location."
+        )
         self.btn_run.setToolTip("Process all queued recordings with the pipeline chosen in Settings.")
         self.cb_queue_filter.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
         self.cb_queue_filter.setToolTip("Show only runs that still need processing, or every known raw run.")
@@ -862,10 +874,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         # when the window is narrower than the full toolbar.
         toolbar = QtWidgets.QWidget()
         top = FlowLayout(toolbar, h_spacing=14, v_spacing=8)
-        top.addWidget(make_cluster(self.btn_add_files, self.btn_add_folder, self.btn_scan_raw_root))
-        top.addWidget(make_cluster(self.btn_recent_files, self.btn_recent_folders))
+        top.addWidget(make_cluster(self.btn_add_recordings))
         top.addWidget(make_cluster(filter_label, self.cb_queue_filter))
-        top.addWidget(make_cluster(self.btn_concat, self.btn_remove, self.btn_clear, self.btn_run))
+        top.addWidget(make_cluster(self.btn_concat, self.btn_remove, self.btn_run))
 
         self.list_jobs = BinDropList()
         self.list_jobs.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -1584,15 +1595,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         main.addWidget(self.progress, 0)
         self._refresh_queue_summary()
 
-        self.btn_add_files.clicked.connect(self._add_files)
-        self.btn_add_folder.clicked.connect(self._add_folder)
-        self.btn_scan_raw_root.clicked.connect(self._scan_raw_root)
-        self.btn_recent_files.clicked.connect(self._open_recent_file_menu)
-        self.btn_recent_folders.clicked.connect(self._open_recent_folder_menu)
         self.cb_queue_filter.currentIndexChanged.connect(self._on_queue_filter_changed)
         self.btn_concat.clicked.connect(self._concatenate_selected)
         self.btn_remove.clicked.connect(self._remove_selected)
-        self.btn_clear.clicked.connect(self._clear)
         self.btn_run.clicked.connect(self._run_queue)
         self.list_jobs.itemSelectionChanged.connect(self._update_concat_button_state)
         self.list_jobs.itemSelectionChanged.connect(self._refresh_catgt_summary)
@@ -2276,6 +2281,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         # The output preview names the first queued run, so it follows the queue.
         self._refresh_output_preview()
         self._refresh_catgt_summary()
+        self._update_concat_button_state()
+        self.act_clear_queue.setEnabled(bool(self.jobs or self._raw_run_catalog))
+        self.btn_run.setEnabled(bool(self.jobs) and not (self._running or self._concatenating))
         if not hasattr(self, "lbl_queue_summary"):
             return
         n_jobs = len(self.jobs)
@@ -2291,7 +2299,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             remaining = len(self._queue)
             msg = f"{n_jobs} recording(s) loaded. Queue running with {remaining} remaining after the active job."
         elif n_jobs == 0:
-            msg = "Queue is empty. Add AP .bin files or folders to begin."
+            msg = "Queue is empty. Use Add recordings or drop AP .bin files here to begin."
         elif n_jobs == 1:
             msg = "1 recording queued and ready to run."
         else:
@@ -2356,7 +2364,11 @@ class PreprocessingTab(QtWidgets.QWidget):
         if not hasattr(self, "btn_concat"):
             return
         busy = self._running or self._concatenating
-        self.btn_concat.setEnabled(len(self._selected_inqueue_jobs()) >= 2 and not busy)
+        selected_count = len(self._selected_inqueue_jobs())
+        self.btn_concat.setVisible(selected_count >= 2 and not busy)
+        self.btn_concat.setEnabled(selected_count >= 2 and not busy)
+        self.btn_remove.setVisible(selected_count >= 1 and not busy)
+        self.btn_remove.setEnabled(selected_count >= 1 and not busy)
 
     def _prepare_concat_status_panel(self, run_name: str, n_files: int) -> None:
         self._clear_step_status_panel()
@@ -3461,29 +3473,42 @@ class PreprocessingTab(QtWidgets.QWidget):
         rec.insert(0, p)
         self.settings.setValue(key, rec[:max_items])
 
-    def _open_recent_file_menu(self) -> None:
-        rec = [p for p in self._get_recent("recent_files") if Path(p).exists()]
-        menu = QtWidgets.QMenu(self)
-        if not rec:
-            act = menu.addAction("No recent files")
-            act.setEnabled(False)
-        else:
-            for p in rec:
-                act = menu.addAction(p)
-                act.triggered.connect(lambda checked=False, path=p: self._add_paths([path]))
-        menu.exec(self.btn_recent_files.mapToGlobal(self.btn_recent_files.rect().bottomLeft()))
+    def _activate_preprocessing(self) -> None:
+        """Bring this tab forward before a File-menu queue action opens a dialog."""
+        tabs = getattr(self.window(), "tabs", None)
+        if isinstance(tabs, QtWidgets.QTabWidget):
+            tabs.setCurrentWidget(self)
 
-    def _open_recent_folder_menu(self) -> None:
-        rec = [p for p in self._get_recent("recent_folders") if Path(p).exists()]
-        menu = QtWidgets.QMenu(self)
-        if not rec:
-            act = menu.addAction("No recent folders")
-            act.setEnabled(False)
-        else:
-            for p in rec:
-                act = menu.addAction(p)
-                act.triggered.connect(lambda checked=False, path=p: self._add_paths([path]))
-        menu.exec(self.btn_recent_folders.mapToGlobal(self.btn_recent_folders.rect().bottomLeft()))
+    def _open_add_files(self) -> None:
+        self._activate_preprocessing()
+        self._add_files()
+
+    def _open_add_folder(self) -> None:
+        self._activate_preprocessing()
+        self._add_folder()
+
+    def _open_scan_raw_root(self) -> None:
+        self._activate_preprocessing()
+        self._scan_raw_root()
+
+    def _populate_recent_menu(self, menu: QtWidgets.QMenu, key: str, item_name: str) -> None:
+        """Refresh a recent locations submenu immediately before it opens."""
+        menu.clear()
+        recent_paths = [path for path in self._get_recent(key) if Path(path).exists()]
+        if not recent_paths:
+            empty = menu.addAction(f"No recent {item_name}s")
+            empty.setEnabled(False)
+            return
+        for path in recent_paths:
+            action = menu.addAction(Path(path).name or path)
+            action.setToolTip(path)
+            action.triggered.connect(
+                lambda checked=False, selected=path: self._open_recent_path(selected)
+            )
+
+    def _open_recent_path(self, path: str) -> None:
+        self._activate_preprocessing()
+        self._add_paths([path])
 
     def _open_selected_curation(self, item: QtWidgets.QListWidgetItem | None = None) -> None:
         entries = self._selected_completed_entries(item)
