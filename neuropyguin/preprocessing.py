@@ -12,11 +12,23 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Sequence, Tuple
+
+
+def absolute_path(path: str | Path) -> Path:
+    """Absolute, normalized path that does *not* follow file symlinks.
+
+    ``Path.resolve()`` would turn a staged ``*.ap.bin`` symlink (see
+    :mod:`neuropyguin.openephys`) into its raw ``continuous.dat`` target, losing
+    the SpikeGLX name and the ``.ap.meta`` sidecar next to it. ``abspath`` keeps
+    the link's own location; for regular files the two are identical.
+    """
+    return Path(os.path.abspath(Path(path).expanduser()))
 
 
 def discover_bin_files(paths: List[str]) -> List[str]:
@@ -35,7 +47,7 @@ def discover_bin_files(paths: List[str]) -> List[str]:
             for fp in path.rglob("*.bin"):
                 if ap_pat.match(fp.name):
                     found.append(fp)
-    unique = sorted({str(p.resolve()) for p in found})
+    unique = sorted({str(absolute_path(p)) for p in found})
     return unique
 
 
@@ -423,12 +435,11 @@ def parse_kilosort_params_dat_path(params_file: str | Path) -> str:
     raw = match.group(1).strip()
     if not raw:
         return ""
-    dat_path = Path(raw.replace("/", "\\")).expanduser()
+    # pathlib accepts both separators on Windows; never rewrite "/" (that broke Linux paths).
+    dat_path = Path(raw).expanduser()
     if not dat_path.is_absolute():
-        dat_path = (path.parent / dat_path).resolve()
-    else:
-        dat_path = dat_path.resolve()
-    return str(dat_path)
+        dat_path = path.parent / dat_path
+    return str(absolute_path(dat_path))
 
 
 def infer_completed_run_name(ks_folder: str | Path) -> str:
@@ -519,11 +530,11 @@ def default_kilosort_output_name(ks_tag: str, probe_string: str) -> str:
 
 def default_local_ks_output_dir(bin_file: str, ks_tag: str, probe_string: str) -> Path:
     """KS output folder placed directly beside the source binary."""
-    return Path(bin_file).resolve().parent / default_kilosort_output_name(ks_tag, probe_string)
+    return absolute_path(bin_file).parent / default_kilosort_output_name(ks_tag, probe_string)
 
 
 def _session_root_for_spikeglx_bin(bin_file: str) -> Path:
-    path = Path(bin_file).resolve()
+    path = absolute_path(bin_file)
     parents = list(path.parents)
     if len(parents) >= 3:
         return parents[2]
@@ -650,7 +661,7 @@ def parse_catgt_processed_bin_context(bin_file: str) -> Dict[str, str]:
     and a ``trigger_string`` of ``"cat"``. Returns an empty dict when the bin is
     not inside a ``catgt_`` folder.
     """
-    path = Path(bin_file).resolve()
+    path = absolute_path(bin_file)
     probe_match = re.search(r"\.imec(?P<probe>\d+)\.ap\.bin$", path.name, flags=re.IGNORECASE)
     probe_string = probe_match.group("probe") if probe_match else ""
     catgt_dir = next((parent for parent in path.parents if parent.name.lower().startswith("catgt_")), None)

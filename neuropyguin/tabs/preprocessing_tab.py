@@ -39,6 +39,7 @@ from ..preprocessing import (
     validate_spikeglx_ap_bin,
 )
 from ..flow_layout import FlowLayout
+from ..openephys import discover_openephys_recordings, is_openephys_staged_bin, stage_openephys_recording
 from ..side_nav import SideNavStack
 from ..string_builders import (
     CatGTSetupDialog,
@@ -150,7 +151,7 @@ class BinDropList(QtWidgets.QListWidget):
 
     # Quick-start steps painted in the empty drop zone: (title, detail).
     _EMPTY_STEPS = (
-        ("Add recordings", "Drop *.imecX.ap.bin files here, or open Add recordings for files, folders, raw scans, and recent locations."),
+        ("Add recordings", "Drop SpikeGLX *.imecX.ap.bin files or Open Ephys recording folders here, or use Add recordings."),
         ("Choose the pipeline", "Open Settings on the left to pick CatGT, Kilosort, metrics and output folders."),
         ("Run the queue", "Press Run queue, follow progress in Log, then open finished runs from Completed."),
     )
@@ -259,13 +260,13 @@ class BinDropList(QtWidgets.QListWidget):
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(text)
-        painter.drawText(QtCore.QRect(x0, y, col_w, title_h), QtCore.Qt.AlignCenter, "Drop SpikeGLX AP recordings here")
+        painter.drawText(QtCore.QRect(x0, y, col_w, title_h), QtCore.Qt.AlignCenter, "Drop SpikeGLX or Open Ephys recordings here")
         y += title_h
         font = QtGui.QFont(self.font())
         painter.setFont(font)
         painter.setPen(muted)
         painter.drawText(
-            QtCore.QRect(x0, y, col_w, sub_h), QtCore.Qt.AlignCenter, "Three steps from raw .bin files to sorted units"
+            QtCore.QRect(x0, y, col_w, sub_h), QtCore.Qt.AlignCenter, "Three steps from raw recordings to sorted units"
         )
         y += sub_h + 22
 
@@ -813,7 +814,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.btn_add_recordings.setText("Add recordings")
         self.btn_add_recordings.setProperty("role", "secondary")
         self.menu_add_recordings = QtWidgets.QMenu(self.btn_add_recordings)
-        self.act_add_files = self.menu_add_recordings.addAction("Add AP files...")
+        self.act_add_files = self.menu_add_recordings.addAction("Add recording files (SpikeGLX / Open Ephys)...")
         self.act_add_folder = self.menu_add_recordings.addAction("Add folder...")
         self.act_scan_raw_root = self.menu_add_recordings.addAction("Scan raw data folder...")
         self.menu_add_recordings.addSeparator()
@@ -880,7 +881,10 @@ class PreprocessingTab(QtWidgets.QWidget):
 
         self.list_jobs = BinDropList()
         self.list_jobs.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.list_jobs.setToolTip("Drop SpikeGLX AP files here: *.imecX.ap.bin")
+        self.list_jobs.setToolTip(
+            "Drop SpikeGLX AP files (*.imecX.ap.bin) or Open Ephys recordings "
+            "(a session / Record Node folder, structure.oebin, or continuous.dat)"
+        )
         self.list_jobs.setProperty("dropZone", True)
         self.list_jobs.setAlternatingRowColors(True)
         self.list_jobs.setSpacing(4)
@@ -1419,8 +1423,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         queue_layout = QtWidgets.QVBoxLayout(queue_box)
         queue_layout.setSpacing(10)
         queue_hint = QtWidgets.QLabel(
-            "Queue SpikeGLX AP recordings for spike sorting. Drag *.imecX.ap.bin files into the area below, "
-            "or use the buttons to add files, a folder, or scan your raw-data root."
+            "Queue SpikeGLX (*.imecX.ap.bin) or Open Ephys Neuropixels recordings for spike sorting. Drag files "
+            "or folders into the area below, or use Add recordings. Open Ephys streams are staged under the "
+            "output root as SpikeGLX-named runs (hard link, no data copy)."
         )
         queue_hint.setObjectName("SectionHint")
         queue_hint.setWordWrap(True)
@@ -2113,7 +2118,8 @@ class PreprocessingTab(QtWidgets.QWidget):
             self,
             "Select AP .bin files",
             str(start),
-            "SpikeGLX AP BIN (*.ap.bin);;BIN files (*.bin)",
+            "Recordings (*.ap.bin structure.oebin continuous.dat settings.xml);;"
+            "SpikeGLX AP BIN (*.ap.bin);;Open Ephys (structure.oebin continuous.dat settings.xml);;BIN files (*.bin)",
         )
         if files:
             self._set_last_file_dir(files[0])
@@ -2173,6 +2179,8 @@ class PreprocessingTab(QtWidgets.QWidget):
         base = (
             f"{job['name']}  |  g{job['gate_string']} t{job['trigger_string']} p{job['probe_string']}  |  {job['bin_file']}"
         )
+        if job.get("source_format") == "openephys":
+            base = f"[Open Ephys]  {base}"
         overrides = job.get("cfg_overrides")
         if isinstance(overrides, dict) and overrides.get("run_catgt_extract_only") and not overrides.get("run_kilosort", True):
             base = f"{base}  |  NI events only"
@@ -2236,6 +2244,7 @@ class PreprocessingTab(QtWidgets.QWidget):
                 "gate_string": parsed["gate_string"],
                 "trigger_string": parsed["trigger_string"],
                 "probe_string": parsed["probe_string"],
+                "source_format": "openephys" if is_openephys_staged_bin(b) else "spikeglx",
             }
             norm_bin = self._normalized_path(b)
             if norm_bin not in self._raw_run_catalog:
@@ -2253,10 +2262,76 @@ class PreprocessingTab(QtWidgets.QWidget):
             queued += 1
         return added_catalog, queued, completed
 
+    def _stage_openephys_paths(self, paths: List[str]) -> List[str]:
+        """Find Open Ephys Neuropixels streams under ``paths`` and stage them.
+
+        Each AP stream becomes a SpikeGLX-named run under the output root (see
+        :mod:`neuropyguin.openephys`), so the rest of the queue treats it like any
+        SpikeGLX recording. Returns the staged ``*.ap.bin`` paths.
+        """
+        if not paths:
+            return []
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            recordings, skipped = discover_openephys_recordings(paths)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        for where, reason in skipped:
+            self._append_log(f"Open Ephys: skipped {where}: {reason}")
+        if not recordings:
+            return []
+        stage_root = self.ed_output.text().strip()
+        if not stage_root:
+            self._append_log("Open Ephys: set an Output root in Settings first; recordings are staged there.")
+            return []
+
+        progress_dialog: QtWidgets.QProgressDialog | None = None
+
+        def on_copy_progress(done: int, total: int) -> None:
+            # Only reached when neither a hard link nor a symlink was possible.
+            nonlocal progress_dialog
+            if progress_dialog is None:
+                progress_dialog = QtWidgets.QProgressDialog(
+                    "Copying Open Ephys data (linking was not possible)...", "", 0, 1000, self
+                )
+                progress_dialog.setCancelButton(None)
+                progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
+                progress_dialog.show()
+            progress_dialog.setValue(int(1000 * done / max(total, 1)))
+            QtWidgets.QApplication.processEvents()
+
+        staged_bins: List[str] = []
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for rec in recordings:
+                try:
+                    staged = stage_openephys_recording(rec, stage_root, progress=on_copy_progress)
+                except Exception as exc:
+                    self._append_log(f"Open Ephys: could not stage {rec.describe()}: {exc}")
+                    continue
+                staged_bins.append(str(staged.ap_bin))
+                self._append_log(
+                    f"Open Ephys: staged {rec.ap.label} ({rec.ap.num_channels} ch, {rec.ap.sample_rate:g} Hz) "
+                    f"as {staged.ap_bin.name} [{staged.link_mode}]"
+                    + (f"; events: {staged.events_csv.name}" if staged.events_csv else "")
+                )
+                for warning in staged.warnings:
+                    self._append_log(f"Open Ephys warning ({rec.run_name}): {warning}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            if progress_dialog is not None:
+                progress_dialog.close()
+        return staged_bins
+
     def _add_paths(self, paths: List[str]) -> None:
         bins = discover_bin_files(paths)
+        oe_bins = self._stage_openephys_paths(paths)
+        bins = bins + [b for b in oe_bins if b not in bins]
         if not bins and paths:
-            self._append_log("No valid AP files found. Expected names like *.imec0.ap.bin")
+            self._append_log(
+                "No recordings found. Expected SpikeGLX *.imec0.ap.bin files or an Open Ephys recording "
+                "(folder containing structure.oebin)."
+            )
         _added_catalog, queued, completed = self._ingest_bins(bins, queue_completed=True)
         if paths:
             first = paths[0]
@@ -2299,7 +2374,7 @@ class PreprocessingTab(QtWidgets.QWidget):
             remaining = len(self._queue)
             msg = f"{n_jobs} recording(s) loaded. Queue running with {remaining} remaining after the active job."
         elif n_jobs == 0:
-            msg = "Queue is empty. Use Add recordings or drop AP .bin files here to begin."
+            msg = "Queue is empty. Use Add recordings or drop SpikeGLX .ap.bin files / Open Ephys folders here to begin."
         elif n_jobs == 1:
             msg = "1 recording queued and ready to run."
         else:
@@ -2971,8 +3046,10 @@ class PreprocessingTab(QtWidgets.QWidget):
             bins = discover_bin_files([folder])
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
+        oe_bins = self._stage_openephys_paths([folder])
+        bins = bins + [b for b in oe_bins if b not in bins]
         if not bins:
-            self._append_log(f"No raw SpikeGLX AP bins found under {folder}")
+            self._append_log(f"No raw SpikeGLX AP bins or Open Ephys recordings found under {folder}")
             return
         added_catalog, queued, completed = self._ingest_bins(bins, queue_completed=False)
         self._refresh_job_list_view()

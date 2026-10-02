@@ -35,11 +35,14 @@ def _resolve_phy_dat_file(dat_path, dat_name):
         raw_name = raw_name[0] if raw_name else ""
     name_path = Path(str(raw_name)).expanduser()
 
+    # abspath (not resolve) so a symlinked/staged *.ap.bin keeps its own path and
+    # its .ap.meta sidecar stays discoverable from params.py.
     if name_path.suffix.lower() == ".bin":
-        return name_path.resolve() if name_path.is_absolute() else (base_path / name_path).resolve()
+        target = name_path if name_path.is_absolute() else (base_path / name_path)
+        return Path(os.path.abspath(target))
     if base_path.suffix.lower() == ".bin":
-        return base_path.resolve()
-    return (base_path / name_path).resolve()
+        return Path(os.path.abspath(base_path))
+    return Path(os.path.abspath(base_path / name_path))
 
 def _string_as_list_param(dict, param, default_val):
     v = dict.get(param, default_val)
@@ -59,17 +62,20 @@ def _get_ks_params(meta_file, settings_from_json, b_seed):
     # in run_kilosort, the settings dictionary is merged with the dictionary
     # DEFAULT_SETTINGS. Here, only set settings passed from the pipeline params
     # and read from metadata.
-    settings = DEFAULT_SETTINGS
-    settings['n_chan_bin'] = int(probe_meta.get('nSavedChans'))
-    settings['fs'] = float(probe_meta.get('imSampRate')) # sample rate
+    settings = dict(DEFAULT_SETTINGS)
     # all other user setting coming from the json
     settings = {**settings, **settings_from_json}
+    # The binary layout is a property of the file, so the meta always wins.
+    # The JSON schema defaults n_chan_bin to 385; merging it last used to make
+    # every non-385-channel recording (Open Ephys, channel subsets) unreadable.
+    settings['n_chan_bin'] = int(probe_meta.get('nSavedChans'))
+    settings['fs'] = float(probe_meta.get('imSampRate')) # sample rate
     if settings['tmax'] < 0:
         settings['tmax'] = np.inf
     if not(b_seed):
         # remove seed settings from ks4 settings
-        settings.pop('template_seed')
-        settings.pop('cluster_seed')
+        settings.pop('template_seed', None)
+        settings.pop('cluster_seed', None)
 
     return dict(settings)
 

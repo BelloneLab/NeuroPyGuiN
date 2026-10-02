@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ from PySide6 import QtCore
 from .ecephys_runtime import ecephys_subprocess_env, ensure_ecephys_on_sys_path
 from .ks_output_resolver import archive_output_dir, find_kilosort_output_dir, has_kilosort_output
 from .preprocessing import (
+    absolute_path,
     catgt_command_for_input_layout,
     catgt_input_layout,
     catgt_lfp_command_string,
@@ -822,9 +824,9 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         for candidate in raw_candidates:
             path = Path(candidate).expanduser()
             if not path.is_absolute():
-                path = (ks_folder / path).resolve()
+                path = absolute_path(ks_folder / path)
             if path.exists():
-                return path.resolve()
+                return absolute_path(path)
             if path.name and path.name not in basenames:
                 basenames.append(path.name)
 
@@ -835,9 +837,9 @@ class EcephysPipelineWorker(QtCore.QRunnable):
         for name in basenames:
             direct = ks_folder.parent / name
             if direct.exists():
-                return direct.resolve()
+                return absolute_path(direct)
         if len(sibling_bins) == 1:
-            return sibling_bins[0].resolve()
+            return absolute_path(sibling_bins[0])
 
         search_roots = [ks_folder.parent, ks_folder.parent.parent, ks_folder.parent.parent.parent]
         for root in search_roots:
@@ -846,10 +848,10 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             for name in basenames:
                 matches = sorted(root.rglob(name))
                 if matches:
-                    return matches[0].resolve()
+                    return absolute_path(matches[0])
 
         if sibling_bins:
-            return sibling_bins[0].resolve()
+            return absolute_path(sibling_bins[0])
         return None
 
     def _run_catgt_with_retries(
@@ -1115,6 +1117,34 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             )
 
     @QtCore.Slot()
+    def _finalize_openephys_catgt_outputs(self, staged_bin: Path, processing_bin: Path) -> None:
+        """Tidy CatGT outputs of an Open Ephys run and keep its sidecars nearby.
+
+        With no SYNC channel declared, CatGT still writes an imec sync-edge file
+        for the last AP channel (``*.ap.xd_<N-1>_6_0.txt``); it is neural data,
+        not sync, so it is removed to avoid misleading event files. The exported
+        ``openephys_events.csv`` and ``openephys_source.json`` are copied beside
+        the CatGT bin so they sit next to the Kilosort folder.
+        """
+        from .openephys import OE_EVENTS_CSV_NAME, OE_PROVENANCE_NAME
+
+        out_dir = processing_bin.parent
+        if out_dir.resolve() == staged_bin.parent.resolve():
+            return
+        for bogus in out_dir.glob("*.ap.xd_*_6_0.txt"):
+            try:
+                bogus.unlink()
+                _safe_emit(self.signals.log, f"[{self.job['name']}] Removed sync-less CatGT edge file {bogus.name}")
+            except OSError:
+                pass
+        for name in (OE_EVENTS_CSV_NAME, OE_PROVENANCE_NAME):
+            src = staged_bin.parent / name
+            if src.exists():
+                try:
+                    shutil.copy2(src, out_dir / name)
+                except OSError as exc:
+                    _safe_emit(self.signals.log, f"[{self.job['name']}] Could not copy {name}: {exc}")
+
     def run(self) -> None:
         repo = ensure_ecephys_on_sys_path()
         try:
@@ -1139,6 +1169,7 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 strip_ni_catgt_extractor_flags,
                 validate_spikeglx_ap_bin,
             )
+            from .openephys import is_openephys_staged_bin, openephys_catgt_command
         except Exception as exc:
             _safe_emit(self.signals.error, f"Failed importing ecephys_spike_sorting: {exc}")
             _safe_emit(self.signals.error, f"Expected local repo at: {repo}")
@@ -1197,8 +1228,30 @@ class EcephysPipelineWorker(QtCore.QRunnable):
             # meaningless once sessions are spliced together (the sync is discontinuous and
             # there is no NI stream to map), so TPrime is disabled by default for these.
             is_concat_run = is_concatenated_run_bin(bin_file)
-            run_tprime_effective = self.cfg.run_tprime and not is_concat_run
-            if self.cfg.run_tprime and not run_tprime_effective:
+            # Open Ephys recordings are staged as SpikeGLX-shaped runs whose meta
+            # carries an oeSourceDat key (kept by CatGT in its _tcat outputs). They
+            # have no imec SYNC channel and no nidq stream: their TTL edges were
+            # already exported on the AP clock at staging time, so TPrime and the
+            # CatGT extractors have nothing to work on.
+            is_openephys_run = is_openephys_staged_bin(bin_file)
+            if is_openephys_run and run_catgt_extract_only:
+                run_catgt_extract_only = False
+                # Extract-only normally replaces the full CatGT pass; with it off,
+                # honour the plain CatGT checkbox again.
+                run_catgt_effective = self.cfg.run_catgt and (not catgt_processed_input or lfp_existing_reprocess)
+                _safe_emit(
+                    self.signals.log,
+                    f"[{self.job['name']}] Open Ephys recording; CatGT extract-only is not applicable "
+                    "(TTL events were exported to openephys_events.csv when the recording was queued).",
+                )
+            run_tprime_effective = self.cfg.run_tprime and not is_concat_run and not is_openephys_run
+            if self.cfg.run_tprime and is_openephys_run:
+                _safe_emit(
+                    self.signals.log,
+                    f"[{self.job['name']}] Open Ephys recording; skipping TPrime. TTL edges are already on the "
+                    "AP sample clock in openephys_events.csv (use it in Post Processing).",
+                )
+            if self.cfg.run_tprime and is_concat_run:
                 _safe_emit(
                     self.signals.log,
                     f"[{self.job['name']}] Concatenated run; skipping TPrime alignment "
@@ -1217,11 +1270,16 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     f"[{self.job['name']}] Merged extractor field into CatGT command: {effective_catgt_cmd}",
                 )
 
+            if is_openephys_run:
+                effective_catgt_cmd, oe_notes = openephys_catgt_command(effective_catgt_cmd)
+                for note in oe_notes:
+                    _safe_emit(self.signals.log, f"[{self.job['name']}] {note}")
+
             # Probe-only / concatenated runs have no nidq stream. Asking CatGT for the
             # NI stream (-ni) or NI-stream extractors (js=0) makes it abort instantly with
             # "Meta file not found ...nidq.meta". Detect the absence and drop NI extraction
             # gracefully, keeping AP-stream extractors (e.g. the imec sync on word 384).
-            effective_ni_extract_string = self.cfg.ni_extract_string
+            effective_ni_extract_string = "" if is_openephys_run else self.cfg.ni_extract_string
             if (
                 (run_catgt_effective or run_catgt_extract_only)
                 and not catgt_processed_input
@@ -1482,6 +1540,8 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                     )
 
                 execute_step("catgt", "CatGT", _run_catgt_step)
+                if is_openephys_run:
+                    self._finalize_openephys_catgt_outputs(bin_file, processing_bin)
             elif run_catgt_extract_only:
                 def _run_catgt_extract_only_step() -> None:
                     nonlocal catgt_context, processing_bin, processing_meta, ks_folder
@@ -1710,7 +1770,20 @@ class EcephysPipelineWorker(QtCore.QRunnable):
                 external_kilosort_output_tmp=self.cfg.kilosort_output_tmp,
             )
             if self.cfg.ks_ver == "4":
-                self._apply_ks4_overrides(module_in, self.cfg.ks4_advanced_params)
+                # The binary layout (channel count, sample rate) is a property of the
+                # file and is read from its meta by the KS4 helper. A saved advanced
+                # override (the dialog defaults n_chan_bin to 385) must never replace
+                # it, or 384-channel Open Ephys / channel-subset recordings would be
+                # read with the wrong stride.
+                ks4_overrides = dict(self.cfg.ks4_advanced_params or {})
+                for layout_key in ("n_chan_bin", "fs"):
+                    if ks4_overrides.pop(layout_key, None) is not None:
+                        _safe_emit(
+                            self.signals.log,
+                            f"[{self.job['name']}] Ignoring KS4 advanced '{layout_key}' override; "
+                            f"using the value from {processing_meta.name}.",
+                        )
+                self._apply_ks4_overrides(module_in, ks4_overrides)
 
             for step_key, step_label, module_name in module_steps:
                 execute_step(

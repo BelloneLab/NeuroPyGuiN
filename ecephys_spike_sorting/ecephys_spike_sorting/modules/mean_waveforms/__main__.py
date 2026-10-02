@@ -20,6 +20,40 @@ from .waveform_metrics import calculate_waveform_metrics
 from .metrics_from_file import metrics_from_file
 
 
+def _measure_uv_per_count(mean_waveforms, data, spike_times, spike_clusters, pre_samples,
+                          n_units=6, n_spikes=400, seed=0):
+    """Estimate the uV-per-count scale C_Waves applied to its mean waveforms.
+
+    C_Waves converts counts to uV with built-in per-probe gains rather than the
+    meta's gain fields. That is right for SpikeGLX data but wrong for recordings
+    whose counts use another scale (e.g. Open Ephys, 0.195 uV/bit, staged as
+    SpikeGLX). For the largest units, regress C_Waves' peak-channel waveform on
+    a mean waveform computed directly from the raw counts; the slope is the
+    scale. Returns NaN when it cannot be estimated.
+    """
+    rng = np.random.default_rng(seed)
+    n_clu, _n_ch, n_t = mean_waveforms.shape
+    counts = np.bincount(spike_clusters.astype(np.int64), minlength=n_clu)[:n_clu]
+    slopes = []
+    for clu in np.argsort(counts)[::-1][:n_units]:
+        wave_uv = mean_waveforms[clu]
+        if counts[clu] < 50 or not np.isfinite(wave_uv).all():
+            continue
+        peak = int(np.argmax(wave_uv.max(axis=1) - wave_uv.min(axis=1)))
+        times = spike_times[spike_clusters == clu].astype(np.int64)
+        times = times[(times >= pre_samples) & (times + n_t - pre_samples < data.shape[0])]
+        if len(times) < 50:
+            continue
+        pick = rng.choice(times, size=min(n_spikes, len(times)), replace=False)
+        snippets = np.stack([data[t - pre_samples:t - pre_samples + n_t, peak] for t in pick]).astype(float)
+        wave_counts = snippets.mean(axis=0)
+        x = wave_counts - wave_counts.mean()
+        y = wave_uv[peak] - wave_uv[peak].mean()
+        if np.dot(x, x) > 0:
+            slopes.append(float(np.dot(x, y) / np.dot(x, x)))
+    return float(np.median(slopes)) if slopes else float('nan')
+
+
 def _parse_phy_dat_path(params_path):
     if not os.path.exists(params_path):
         return None
@@ -246,6 +280,27 @@ def calculate_mean_waveforms(args):
         
         # C_Waves writes out files of the waveforms and snr
         # call version of calculate_waveform_metrics that will use these files
+
+        # Make sure the C_Waves waveforms are on the meta's uV scale (see
+        # _measure_uv_per_count); SNR is scale-free and needs no correction.
+        try:
+            bit_volts = float(args['ephys_params']['bit_volts'])
+            raw = np.memmap(spikeglx_bin, dtype='int16', mode='r')
+            n_saved = int(args['ephys_params']['num_channels'])
+            raw = raw[: (raw.size // n_saved) * n_saved].reshape(-1, n_saved)
+            st = np.load(os.path.join(output_dir, 'spike_times.npy')).ravel()
+            sc = np.load(os.path.join(output_dir, 'spike_clusters.npy')).ravel()
+            mw = np.load(mean_waveform_fullpath)
+            measured = _measure_uv_per_count(mw, raw, st, sc, int(args['mean_waveform_params']['pre_samples']))
+            if np.isfinite(measured) and measured > 0 and abs(measured / bit_volts - 1.0) > 0.02:
+                factor = bit_volts / measured
+                np.save(mean_waveform_fullpath, (mw * factor).astype(mw.dtype))
+                print('C_Waves scale {:.5f} uV/count differs from meta bit_volts {:.5f}; '
+                      'rescaled mean waveforms by {:.5f}'.format(measured, bit_volts, factor))
+            else:
+                print('C_Waves scale check: {:.5f} uV/count (meta bit_volts {:.5f})'.format(measured, bit_volts))
+        except Exception as exc:  # never fail the module over the sanity check
+            print('C_Waves scale check skipped: ' + repr(exc))
         
         print('Loading kilosort outputs and whitening matrix...')
         # load in kilosort output needed for these calculations

@@ -40,20 +40,63 @@ from .pipeline_config import (
 # ---------------------------------------------------------------------------
 
 
-def _discover_bins(paths: List[str], reporter: Reporter) -> List[str]:
-    """Expand files and folders into a sorted list of SpikeGLX AP binaries."""
+def _discover_inputs(paths: List[str], reporter: Reporter):
+    """Expand files and folders into SpikeGLX AP binaries and Open Ephys AP streams.
+
+    Returns ``(spikeglx_bins, openephys_recordings)``; raises when both are empty.
+    """
+    from ..openephys import discover_openephys_recordings
     from ..preprocessing import discover_bin_files
 
     expanded = [str(Path(p).expanduser()) for p in paths]
     missing = [p for p in expanded if not Path(p).exists()]
     for path in missing:
         reporter.warn(f"Path does not exist: {path}")
-    found = discover_bin_files([p for p in expanded if Path(p).exists()])
-    if not found:
+    existing = [p for p in expanded if Path(p).exists()]
+    found = discover_bin_files(existing)
+    recordings, skipped = discover_openephys_recordings(existing)
+    for where, reason in skipped:
+        reporter.warn(f"Open Ephys: skipped {where}: {reason}")
+    if not found and not recordings:
         raise CommandError(
-            "No SpikeGLX AP binaries (*.imecN.ap.bin) found in the given paths."
+            "No SpikeGLX AP binaries (*.imecN.ap.bin) or Open Ephys recordings "
+            "(structure.oebin) found in the given paths."
         )
-    return found
+    return found, recordings
+
+
+def _discover_bins(
+    paths: List[str],
+    reporter: Reporter,
+    *,
+    stage_root: str | None = None,
+    plan_only: bool = False,
+) -> List[str]:
+    """SpikeGLX AP binaries plus Open Ephys streams staged as SpikeGLX-named runs.
+
+    With ``stage_root`` each Open Ephys AP stream is staged there (hard link +
+    synthesized meta, see :mod:`neuropyguin.openephys`). ``plan_only`` predicts
+    the staged paths without writing anything.
+    """
+    from ..openephys import stage_openephys_recording, staged_ap_bin_path
+
+    found, recordings = _discover_inputs(paths, reporter)
+    if not recordings:
+        return found
+    if not stage_root:
+        reporter.warn(f"{len(recordings)} Open Ephys recording(s) ignored: no output root to stage them in.")
+        return found
+    staged: List[str] = []
+    for rec in recordings:
+        if plan_only:
+            staged.append(str(staged_ap_bin_path(rec, stage_root)))
+            continue
+        result = stage_openephys_recording(rec, stage_root)
+        reporter.log(f"Open Ephys: staged {rec.ap.label} as {result.ap_bin} [{result.link_mode}]")
+        for warning in result.warnings:
+            reporter.warn(f"Open Ephys ({rec.run_name}): {warning}")
+        staged.append(str(result.ap_bin))
+    return found + [b for b in staged if b not in found]
 
 
 def cmd_discover(args, reporter: Reporter) -> int:
@@ -65,8 +108,22 @@ def cmd_discover(args, reporter: Reporter) -> int:
         validate_spikeglx_ap_bin,
     )
 
-    bins = _discover_bins(args.paths, reporter)
+    bins, oe_recordings = _discover_inputs(args.paths, reporter)
     rows: List[Dict[str, Any]] = []
+    for rec in oe_recordings:
+        rows.append(
+            {
+                "run_name": rec.run_name,
+                "gate": "0",
+                "trigger": "0,0",
+                "probe": str(rec.probe_index),
+                "catgt_processed": False,
+                "concatenated": False,
+                "valid": True,
+                "reason": f"Open Ephys {rec.ap.label}; staged under the output root at run time",
+                "bin_file": str(rec.ap.dat_path),
+            }
+        )
     for bin_file in bins:
         parsed = parse_spikeglx_bin_name(bin_file)
         ok, reason = validate_spikeglx_ap_bin(bin_file)
@@ -130,7 +187,7 @@ def cmd_runs(args, reporter: Reporter) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _build_jobs(bins: List[str], cfg, reporter: Reporter) -> List[Dict[str, str]]:
+def _build_jobs(bins: List[str], cfg, reporter: Reporter, *, planned: bool = False) -> List[Dict[str, str]]:
     """Turn validated AP binaries into the job dicts the worker expects.
 
     Gate/trigger/probe come from each file name (exactly as the queue does), and
@@ -142,6 +199,8 @@ def _build_jobs(bins: List[str], cfg, reporter: Reporter) -> List[Dict[str, str]
     jobs: List[Dict[str, str]] = []
     for bin_file in bins:
         ok, reason = validate_spikeglx_ap_bin(bin_file)
+        if not ok and planned and not Path(bin_file).exists():
+            ok = True  # predicted Open Ephys staging path (plan mode writes nothing)
         if not ok:
             reporter.warn(f"Skipping {bin_file}: {reason}")
             continue
@@ -207,8 +266,8 @@ def _plan_rows(jobs: List[Dict[str, str]], cfg) -> List[Dict[str, Any]]:
 def cmd_plan(args, reporter: Reporter) -> int:
     """Show the resolved configuration and the output paths without running."""
     cfg = build_pipeline_config(args, reporter)
-    bins = _discover_bins(args.paths, reporter)
-    jobs = _build_jobs(bins, cfg, reporter)
+    bins = _discover_bins(args.paths, reporter, stage_root=cfg.output_root, plan_only=True)
+    jobs = _build_jobs(bins, cfg, reporter, planned=True)
     rows = _plan_rows(jobs, cfg)
     problems = validate_config_for_run(cfg)
 
@@ -246,7 +305,7 @@ def cmd_run(args, reporter: Reporter) -> int:
 
     ensure_qt_core_app()
     cfg = build_pipeline_config(args, reporter)
-    bins = _discover_bins(args.paths, reporter)
+    bins = _discover_bins(args.paths, reporter, stage_root=cfg.output_root)
     jobs = _build_jobs(bins, cfg, reporter)
 
     problems = validate_config_for_run(cfg)
@@ -629,7 +688,7 @@ def register(subparsers) -> None:
     )
     commands = group.add_subparsers(dest="command", required=True)
 
-    p = commands.add_parser("discover", help="List SpikeGLX AP binaries under the given paths.")
+    p = commands.add_parser("discover", help="List SpikeGLX AP binaries and Open Ephys AP streams under the given paths.")
     p.add_argument("paths", nargs="+", help="Files or folders to search recursively.")
     p.add_argument("--valid-only", action="store_true", help="Hide recordings that fail validation.")
     p.set_defaults(func=cmd_discover)

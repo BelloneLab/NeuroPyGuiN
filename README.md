@@ -33,9 +33,9 @@ project:
 
 ### 1. Preprocessing: build a queue, press go
 
-Drag your SpikeGLX `.bin` files in (or scan a folder), pick your steps, and let
-the queue run CatGT, Kilosort4, quality metrics, and friends while you get a
-coffee. Recorded the same neurons across several sessions? Select them, hit
+Drag your SpikeGLX `.bin` files or Open Ephys recordings in (or scan a folder),
+pick your steps, and let the queue run CatGT, Kilosort4, quality metrics, and
+friends while you get a coffee. Recorded the same neurons across several sessions? Select them, hit
 **Concatenate selected**, and sort them together so units keep the same identity
 across days.
 
@@ -334,7 +334,8 @@ rebuilding or packaging the app.
 
 ## Good to know
 
-- Preprocessing expects SpikeGLX-style AP files (`*.imecX.ap.bin`).
+- Preprocessing accepts SpikeGLX AP files (`*.imecX.ap.bin`) **and Open Ephys GUI recordings**
+  (binary format, GUI 0.5.x and 0.6+/1.x, Neuropix-PXI or OneBox). See *Open Ephys recordings* below.
 - **Output layout is your choice** (Preprocessing > Settings > Tool and outputs). Mirroring the
   rawData tree is still the default and stays the best option for batches, but you can also send
   every run to its own folder under the Output root, or write straight into the Output root you
@@ -346,6 +347,42 @@ rebuilding or packaging the app.
 - Settings, recents, and window layout are remembered between sessions.
 - Cell-type classification: **C4** (cerebellar) runs in a separate `npyx_c4` env via subprocess; **Bombcell** (cortex/striatum) runs in the main env. Both write `cell_types_*.csv` and a phy-compatible `cluster_*_cell_type.tsv` into the dataset folder.
 - "Export waveforms" writes a single `good_units_waveform_acg.pdf` plus per-unit PNGs for every good unit.
+
+## 🔌 Open Ephys recordings
+
+Drop a session folder, a `Record Node` folder, a `structure.oebin`, or a
+`continuous.dat` into the queue (or point `neuropyguin preprocess run` at it).
+Every Neuropixels AP stream is **staged** under the Output root as a
+SpikeGLX-named run, so the whole pipeline treats it like any SpikeGLX recording:
+
+```
+<Output root>/<session>/<session>_e1r1_g0/<session>_e1r1_g0_imec0/
+    <session>_e1r1_g0_t0.imec0.ap.bin    hard link to continuous.dat (no copy)
+    <session>_e1r1_g0_t0.imec0.ap.meta   synthesized SpikeGLX meta
+    <session>_e1r1_g0_t0.imec0.lf.bin    LFP stream, when recorded separately (NP1)
+    openephys_events.csv                 every TTL edge, in seconds on the AP clock
+    openephys_source.json                provenance (sources, geometry, link mode, warnings)
+```
+
+- **Geometry** comes from the probe's `ELECTRODE_XPOS/YPOS` in `settings.xml`
+  (multi-shank aware). If those are missing, the default bank-0 layout is used and
+  the log warns you, because drift correction and depths depend on it.
+- **Amplitudes stay in true µV**: the meta's gain fields are solved so ecephys and
+  BombCell recover Open Ephys' `bit_volts` (0.195 µV/bit) exactly. C_Waves uses
+  built-in SpikeGLX gains, so the Mean Waveforms step measures C_Waves' actual
+  µV-per-count on the largest units and rescales its output when it disagrees
+  with the meta by more than 2% (a no-op for SpikeGLX data).
+- **CatGT filters and common-average-references** the data as usual, which matters
+  for wideband NP2 data. Two CatGT features are switched off for Open Ephys runs:
+  the event extractors (Open Ephys has no SYNC channel or nidq stream) and `-gfix`
+  (its mV thresholds use CatGT's built-in SpikeGLX gains, so on Open Ephys' finer
+  0.195 µV/bit counts it would blank real spikes). **TPrime is skipped**: `openephys_events.csv` already maps every TTL
+  edge onto the AP sample clock using the synchronized `timestamps.npy` (linear
+  drift correction, like TPrime), so you can load it straight into Post Processing.
+- Run names are `<session>_e<experiment>r<recording>`, probe index from `ProbeA`→`imec0`.
+  Hard links need the Output root on the same drive as the raw data; otherwise a
+  symlink (Linux) or a full copy is made, and the log says which.
+- Non-Neuropixels streams (e.g. the Intan acquisition board) are listed as skipped.
 
 ## ⌨️ Drive it from the terminal
 
