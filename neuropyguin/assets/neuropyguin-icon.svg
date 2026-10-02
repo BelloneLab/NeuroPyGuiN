@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">NeuroPyGuiN app icon</title>
+  <desc id="desc">A teal penguin crossed by a purple and cyan neural waveform. Transparent, scalable vector artwork.</desc>
+  <defs>
+    <linearGradient id="body" x1="120" y1="45" x2="360" y2="455" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#46b7ca"/><stop offset=".48" stop-color="#237b98"/><stop offset="1" stop-color="#153b54"/>
+    </linearGradient>
+    <linearGradient id="belly" x1="195" y1="150" x2="310" y2="437" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/><stop offset=".75" stop-color="#f5fbff"/><stop offset="1" stop-color="#b9dce9"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="28" y1="300" x2="484" y2="300" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6556a6"/><stop offset=".55" stop-color="#527da9"/><stop offset="1" stop-color="#39b4c5"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#ffd077"/><stop offset="1" stop-color="#e5a04b"/>
+    </linearGradient>
+  </defs>
+  <g id="penguin">
+    <!-- Broad flippers and feet keep the silhouette recognizable at small sizes. -->
+    <path d="M170 210 C133 226 98 270 82 320 C70 357 72 383 86 378 L144 332 Z" fill="#19485f"/>
+    <path d="M342 210 C379 226 414 270 430 320 C442 357 440 383 426 378 L368 332 Z" fill="#19485f"/>
+    <path d="M189 426 C168 432 139 452 147 462 C163 476 211 471 237 454 L231 429 Z" fill="url(#gold)" stroke="#173e54" stroke-width="11" stroke-linejoin="round"/>
+    <path d="M323 426 C344 432 373 452 365 462 C349 476 301 471 275 454 L281 429 Z" fill="url(#gold)" stroke="#173e54" stroke-width="11" stroke-linejoin="round"/>
+    <path d="M256 30 C194 30 152 77 152 137 C152 171 161 191 146 223 C127 261 122 286 126 331 C131 406 180 452 256 452 C332 452 381 406 386 331 C390 286 385 261 366 223 C351 191 360 171 360 137 C360 77 318 30 256 30 Z" fill="url(#body)"/>
+    <!-- Paired face lobes join a continuous white belly. -->
+    <path d="M256 190 C236 172 241 104 208 102 C178 99 169 134 177 169 C182 191 183 205 173 231 C157 269 147 297 154 341 C163 403 204 433 256 433 C308 433 349 403 358 341 C365 297 355 269 339 231 C329 205 330 191 335 169 C343 134 334 99 304 102 C271 104 276 172 256 190 Z" fill="url(#belly)"/>
+    <ellipse cx="208" cy="142" rx="12" ry="17" fill="#214c64"/>
+    <ellipse cx="304" cy="142" rx="12" ry="17" fill="#214c64"/>
+    <path d="M235 181 L256 164 L277 181 L256 202 Z" fill="url(#gold)" stroke="#286781" stroke-width="6" stroke-linejoin="round"/>
+    <!-- The signal is one continuous path with a white clearance stroke. -->
+    <path d="M28 312 H176 L205 239 L251 391 L287 269 L315 335 L335 312 H484" fill="none" stroke="#f7fcff" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M28 312 H176 L205 239 L251 391 L287 269 L315 335 L335 312 H484" fill="none" stroke="url(#signal)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

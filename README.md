@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./neuropyguin/assets/big.jpg" alt="NeuroPyGuiN" width="720">
+<img src="./neuropyguin/assets/neuropyguin-logo.svg" alt="NeuroPyGuiN" width="720">
 
 # NeuroPyGuiN
 

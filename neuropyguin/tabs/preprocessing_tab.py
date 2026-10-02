@@ -1008,7 +1008,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         )
         self.btn_build_catgt = self.btn_configure_catgt
         self.cb_catgt_car_mode = QtWidgets.QComboBox()
-        self.cb_catgt_car_mode.addItems(["gbldmx", "loccar", "none"])
+        self.cb_catgt_car_mode.addItems(["gbldmx", "gblcar", "loccar", "none"])
         self.sp_loccar_min = QtWidgets.QDoubleSpinBox()
         self.sp_loccar_min.setRange(1.0, 500.0)
         self.sp_loccar_min.setValue(40.0)

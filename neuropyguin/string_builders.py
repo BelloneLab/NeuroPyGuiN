@@ -629,12 +629,8 @@ class CatGTStringBuilderPanel(QtWidgets.QWidget):
         spec = parse_catgt_command_string(initial_command)
 
         main = QtWidgets.QVBoxLayout(self)
-        note = QtWidgets.QLabel(
-            "Build the CatGT command fragment from readable fields. "
-            "CAR mode and loccar radius stay controlled by the main preprocessing settings."
-        )
-        note.setWordWrap(True)
-        main.addWidget(note)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(16)
 
         flags_box = QtWidgets.QGroupBox("Common flags")
         flags_layout = QtWidgets.QGridLayout(flags_box)
@@ -653,9 +649,10 @@ class CatGTStringBuilderPanel(QtWidgets.QWidget):
         flags_layout.addWidget(self.ck_missing_probes, 1, 0)
         flags_layout.addWidget(self.ck_missing_trials, 1, 1)
         flags_layout.addWidget(self.ck_no_auto_sync, 2, 0, 1, 2)
-        main.addWidget(flags_box)
-
-        options_row = QtWidgets.QHBoxLayout()
+        self.filter_cards = QtWidgets.QWidget()
+        self.filter_grid = QtWidgets.QGridLayout(self.filter_cards)
+        self.filter_grid.setContentsMargins(0, 0, 0, 0)
+        self.filter_grid.setSpacing(16)
 
         filter_box = QtWidgets.QGroupBox("AP filter")
         filter_form = QtWidgets.QFormLayout(filter_box)
@@ -696,7 +693,6 @@ class CatGTStringBuilderPanel(QtWidgets.QWidget):
         filter_form.addRow("Order", self.sp_ap_order)
         filter_form.addRow("High-pass corner (Hz)", self.sp_ap_high)
         filter_form.addRow("Low-pass corner (Hz)", self.sp_ap_low)
-        options_row.addWidget(filter_box, 1)
 
         gfix_box = QtWidgets.QGroupBox("Artifact suppression")
         gfix_form = QtWidgets.QFormLayout(gfix_box)
@@ -718,18 +714,46 @@ class CatGTStringBuilderPanel(QtWidgets.QWidget):
         gfix_form.addRow("Amplitude (mV)", self.sp_gfix_amp)
         gfix_form.addRow("Slope (mV / sample)", self.sp_gfix_slope)
         gfix_form.addRow("Noise (mV)", self.sp_gfix_noise)
-        options_row.addWidget(lfp_box, 1)
-        options_row.addWidget(gfix_box, 1)
-        main.addLayout(options_row)
+        self._cards = [filter_box, lfp_box, gfix_box]
+        self._card_columns = 0
+        for form in [filter_form, lfp_form, gfix_form]:
+            # Labels above editors keep units readable at both laptop and desktop widths.
+            form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+            form.setContentsMargins(16, 20, 16, 16)
+            form.setVerticalSpacing(8)
+            form.setFormAlignment(QtCore.Qt.AlignTop)
+        for card in self._cards:
+            card.setMinimumWidth(220)
+            card.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self._reflow_filter_cards(1000)
+        main.addWidget(self.filter_cards)
+
+        self.btn_more_options = QtWidgets.QToolButton()
+        self.btn_more_options.setText("Folder layout and extra flags")
+        self.btn_more_options.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.btn_more_options.setArrowType(QtCore.Qt.RightArrow)
+        self.btn_more_options.setCheckable(True)
+        main.addWidget(self.btn_more_options)
+        self.more_options = QtWidgets.QWidget()
+        extra_layout = QtWidgets.QVBoxLayout(self.more_options)
+        extra_layout.setContentsMargins(0, 0, 0, 0)
+        extra_layout.setSpacing(10)
+        extra_layout.addWidget(flags_box)
 
         self.ed_extra = QtWidgets.QLineEdit(spec.extra_flags)
-        main.addWidget(QtWidgets.QLabel("Extra CatGT flags"))
-        main.addWidget(self.ed_extra)
+        self.ed_extra.setPlaceholderText("Optional additional CatGT arguments")
+        extra_layout.addWidget(QtWidgets.QLabel("Extra CatGT flags"))
+        extra_layout.addWidget(self.ed_extra)
+        main.addWidget(self.more_options)
+        self.more_options.hide()
+        self.btn_more_options.toggled.connect(self._toggle_more_options)
 
         self.preview = QtWidgets.QPlainTextEdit()
         self.preview.setReadOnly(True)
         self.preview.setMaximumHeight(84)
-        main.addWidget(QtWidgets.QLabel("Generated command fragment"))
+        self.preview_label = QtWidgets.QLabel("Generated command fragment")
+        main.addWidget(self.preview_label)
         main.addWidget(self.preview)
 
         for widget in [
@@ -763,6 +787,29 @@ class CatGTStringBuilderPanel(QtWidgets.QWidget):
         self.ck_gfix.stateChanged.connect(self._sync_enabled_state)
         self._sync_enabled_state()
         self._refresh_preview()
+
+    def _toggle_more_options(self, expanded: bool) -> None:
+        """Keep uncommon processing arguments available without crowding the filters."""
+        self.more_options.setVisible(expanded)
+        self.btn_more_options.setArrowType(QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
+
+    def _reflow_filter_cards(self, width: int) -> None:
+        """Stack filter cards when three readable columns no longer fit."""
+        columns = 3 if width >= 820 else 1
+        if columns == self._card_columns:
+            return
+        self._card_columns = columns
+        for card in self._cards:
+            self.filter_grid.removeWidget(card)
+        for column in range(3):
+            self.filter_grid.setColumnStretch(column, 1 if column < columns else 0)
+        for index, card in enumerate(self._cards):
+            self.filter_grid.addWidget(card, index // columns, index % columns)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        """Adapt the filter layout to the available tab width."""
+        super().resizeEvent(event)
+        self._reflow_filter_cards(event.size().width())
 
     def _sync_enabled_state(self) -> None:
         ap_enabled = self.ck_ap_filter.isChecked()
@@ -1429,7 +1476,10 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setProperty("compactDialog", True)
         self.setWindowTitle("CatGT setup")
-        self.resize(1320, 900)
+        self.setObjectName("CatGTSetupDialog")
+        self.setMinimumSize(720, 580)
+        screen = self.screen().availableGeometry()
+        self.resize(min(1120, screen.width() - 40), min(880, screen.height() - 60))
         self.run_name = str(run_name).strip()
         self.input_directory = str(input_directory).strip()
         self.output_directory = str(output_directory).strip()
@@ -1467,7 +1517,7 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         self.event_panel = TPrimeStringBuilderPanel(initial_to_stream, initial_extractors, self)
         event_page = QtWidgets.QWidget()
         event_layout = QtWidgets.QVBoxLayout(event_page)
-        event_layout.setContentsMargins(0, 0, 0, 0)
+        event_layout.setContentsMargins(20, 20, 20, 20)
         event_hint = QtWidgets.QLabel(
             "Define digital or analog edges for CatGT. The TPrime reference stream is shown separately in the preview. "
             "Use the extra flags field for CatGT bit-field (-bf) extraction."
@@ -1476,20 +1526,34 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         event_hint.setWordWrap(True)
         event_layout.addWidget(event_hint)
         event_layout.addWidget(self.event_panel, 1)
-        self.tabs.addTab(event_page, "Events and sync")
+        self._add_scroll_tab(event_page, "Events and sync")
 
         preview_box = QtWidgets.QGroupBox("Full CatGT command preview")
         preview_layout = QtWidgets.QVBoxLayout(preview_box)
+        preview_layout.setContentsMargins(16, 20, 16, 12)
+        preview_layout.setSpacing(8)
         self.command_preview = QtWidgets.QPlainTextEdit()
         self.command_preview.setReadOnly(True)
         self.command_preview.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
-        self.command_preview.setMinimumHeight(105)
-        self.command_preview.setMaximumHeight(145)
-        self.command_preview.setFont(QtGui.QFont("Consolas", 9))
+        self.command_preview.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.command_preview.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.command_preview.setFixedHeight(112)
+        command_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        self.command_preview.setFont(command_font)
+        self.command_preview.setStyleSheet(f"font-family: '{command_font.family()}'; font-size: 12px;")
         preview_layout.addWidget(self.command_preview)
+        preview_footer = QtWidgets.QHBoxLayout()
         self.tprime_preview = QtWidgets.QLabel()
         self.tprime_preview.setObjectName("SectionHint")
-        preview_layout.addWidget(self.tprime_preview)
+        self.tprime_preview.setWordWrap(True)
+        preview_footer.addWidget(self.tprime_preview, 1)
+        self.btn_copy_command = QtWidgets.QPushButton("Copy command")
+        self.btn_copy_command.setProperty("role", "ghost")
+        self.btn_copy_command.clicked.connect(
+            lambda: QtWidgets.QApplication.clipboard().setText(self.command_preview.toPlainText())
+        )
+        preview_footer.addWidget(self.btn_copy_command)
+        preview_layout.addLayout(preview_footer)
         layout.addWidget(preview_box)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -1502,6 +1566,29 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         self.event_panel.valuesChanged.connect(self._refresh_command_preview_from_events)
         self._refresh_command_preview()
 
+    def _add_scroll_tab(self, page: QtWidgets.QWidget, title: str) -> None:
+        """Let settings scroll independently while preview and Apply remain accessible."""
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setMinimumSize(0, 0)
+        scroll.setWidget(page)
+        self.tabs.addTab(scroll, title)
+
+    @staticmethod
+    def _field(title: str, editor: QtWidgets.QWidget) -> QtWidgets.QWidget:
+        """Place a wrapping label above its editor with consistent spacing."""
+        field = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(field)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        label = QtWidgets.QLabel(title)
+        label.setObjectName("FieldTitle")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        layout.addWidget(editor)
+        return field
+
     def _build_run_selection_tab(
         self,
         initial_gate: str,
@@ -1512,6 +1599,8 @@ class CatGTSetupDialog(QtWidgets.QDialog):
     ) -> None:
         page = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(page)
+        form.setContentsMargins(24, 24, 24, 24)
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
         form.setHorizontalSpacing(16)
         form.setVerticalSpacing(12)
@@ -1528,7 +1617,8 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         self.sp_gate_first = self._number_spin(current_range[0], 9999)
         self.sp_gate_last = self._number_spin(current_range[1], 9999)
         form.addRow("Gate selection", self.cb_gate_mode)
-        form.addRow("First gate / last gate", self._pair_widget(self.sp_gate_first, self.sp_gate_last))
+        self.gate_range_row = self._pair_widget(self.sp_gate_first, self.sp_gate_last)
+        form.addRow("First gate / last gate", self.gate_range_row)
         gate_hint = QtWidgets.QLabel(
             "Use the input file's gate for one gate, or let CatGT join all available gates in the run. "
             "Choose a range to set the first and last gate explicitly."
@@ -1549,7 +1639,9 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         self.sp_trigger_first = self._number_spin(current_trigger_range[0], 999999)
         self.sp_trigger_last = self._number_spin(current_trigger_range[1], 999999)
         form.addRow("Trigger selection", self.cb_trigger_mode)
-        form.addRow("First trigger / last trigger", self._pair_widget(self.sp_trigger_first, self.sp_trigger_last))
+        self.trigger_range_row = self._pair_widget(self.sp_trigger_first, self.sp_trigger_last)
+        form.addRow("First trigger / last trigger", self.trigger_range_row)
+        self.selection_form = form
         trigger_hint = QtWidgets.QLabel(
             "All triggers maps to CatGT's start,end range. A selected range maps to the corresponding -t=first,last option."
         )
@@ -1583,7 +1675,7 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         self.ed_probe_ids.textEdited.connect(self._on_probe_ids_edited)
         self.ed_probe_ids.textChanged.connect(self._refresh_command_preview)
         self._sync_selection_controls()
-        self.tabs.addTab(page, "Run and probes")
+        self._add_scroll_tab(page, "Run and probes")
 
     def _build_processing_tab(
         self,
@@ -1597,17 +1689,29 @@ class CatGTSetupDialog(QtWidgets.QDialog):
     ) -> None:
         page = QtWidgets.QWidget()
         page_layout = QtWidgets.QVBoxLayout(page)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-        page_layout.setSpacing(10)
-        top = QtWidgets.QGridLayout()
+        page_layout.setContentsMargins(20, 20, 20, 20)
+        page_layout.setSpacing(16)
+        output_box = QtWidgets.QGroupBox("Output and referencing")
+        top = QtWidgets.QGridLayout(output_box)
+        top.setContentsMargins(16, 20, 16, 16)
+        top.setHorizontalSpacing(20)
+        top.setVerticalSpacing(12)
+        top.setColumnStretch(0, 1)
+        top.setColumnStretch(1, 1)
         self.cb_output_streams = QtWidgets.QComboBox()
-        for label, value in [("AP", "ap"), ("LFP", "lfp"), ("AP + LFP", "both")]:
+        for label, value in [("Action potentials (AP)", "ap"), ("Local field potential (LFP)", "lfp"), ("AP + LFP", "both")]:
             self.cb_output_streams.addItem(label, value)
         index = self.cb_output_streams.findData(initial_output_streams)
         self.cb_output_streams.setCurrentIndex(index if index >= 0 else 0)
         self.cb_car_mode = QtWidgets.QComboBox()
-        self.cb_car_mode.addItems(["gbldmx", "gblcar", "loccar", "none"])
-        self.cb_car_mode.setCurrentText(initial_car_mode or "gbldmx")
+        for label, value in [
+            ("Global, demultiplexed (gbldmx)", "gbldmx"),
+            ("Global average (gblcar)", "gblcar"),
+            ("Local average (loccar)", "loccar"),
+            ("No referencing", "none"),
+        ]:
+            self.cb_car_mode.addItem(label, value)
+        self.cb_car_mode.setCurrentIndex(max(0, self.cb_car_mode.findData(initial_car_mode)))
         self.sp_loccar_min = QtWidgets.QDoubleSpinBox()
         self.sp_loccar_min.setRange(10.0, 500.0)
         self.sp_loccar_min.setDecimals(1)
@@ -1616,22 +1720,31 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         self.sp_loccar_max.setRange(10.0, 1000.0)
         self.sp_loccar_max.setDecimals(1)
         self.sp_loccar_max.setValue(float(initial_loccar_max_um))
-        top.addWidget(QtWidgets.QLabel("Neural output"), 0, 0)
-        top.addWidget(self.cb_output_streams, 0, 1)
-        top.addWidget(QtWidgets.QLabel("Common average reference"), 1, 0)
-        top.addWidget(self.cb_car_mode, 1, 1)
-        top.addWidget(QtWidgets.QLabel("Local reference radius (um), inner / outer"), 2, 0)
-        top.addWidget(self._pair_widget(self.sp_loccar_min, self.sp_loccar_max), 2, 1)
-        page_layout.addLayout(top)
+        top.addWidget(self._field("Neural output", self.cb_output_streams), 0, 0)
+        top.addWidget(self._field("Common average reference", self.cb_car_mode), 0, 1)
+        self.local_reference_field = self._field(
+            "Local reference radius (µm): inner to outer",
+            self._pair_widget(self.sp_loccar_min, self.sp_loccar_max),
+        )
+        top.addWidget(self.local_reference_field, 1, 0, 1, 2)
+        page_layout.addWidget(output_box)
 
         self.catgt_panel = CatGTStringBuilderPanel(initial_command, self)
-        page_layout.addWidget(self.catgt_panel, 1)
+        # The persistent full preview replaces the panel's standalone fragment preview.
+        self.catgt_panel.preview.hide()
+        self.catgt_panel.preview_label.hide()
+        self.catgt_panel.sp_lfp_lowpass.setValue(initial_lf_lowpass_hz)
+        self.catgt_panel.cb_lfp_downsample.setCurrentText(str(initial_lf_downsample))
+        page_layout.addWidget(self.catgt_panel)
+        page_layout.addStretch(1)
         self.cb_output_streams.currentIndexChanged.connect(self._sync_output_controls)
+        self.cb_car_mode.currentIndexChanged.connect(self._sync_reference_controls)
         self.cb_car_mode.currentTextChanged.connect(self._refresh_command_preview)
         self.sp_loccar_min.valueChanged.connect(self._refresh_command_preview)
         self.sp_loccar_max.valueChanged.connect(self._refresh_command_preview)
         self._sync_output_controls()
-        self.tabs.addTab(page, "AP/LFP processing")
+        self._sync_reference_controls()
+        self._add_scroll_tab(page, "AP/LFP processing")
 
     @staticmethod
     def _number_spin(value: int, maximum: int, minimum: int = 0) -> QtWidgets.QSpinBox:
@@ -1642,6 +1755,9 @@ class CatGTSetupDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _pair_widget(first: QtWidgets.QWidget, last: QtWidgets.QWidget) -> QtWidgets.QWidget:
+        """Give numeric ranges enough room to show their values and spin controls."""
+        first.setMinimumWidth(110)
+        last.setMinimumWidth(110)
         row = QtWidgets.QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(first)
@@ -1702,6 +1818,12 @@ class CatGTSetupDialog(QtWidgets.QDialog):
         trigger_custom = self.cb_trigger_mode.currentData() == "range"
         self.sp_trigger_first.setEnabled(trigger_custom)
         self.sp_trigger_last.setEnabled(trigger_custom)
+        self.selection_form.setRowVisible(self.gate_range_row, gate_custom)
+        self.selection_form.setRowVisible(self.trigger_range_row, trigger_custom)
+
+    def _sync_reference_controls(self, *_args) -> None:
+        """Show local radius controls only when local referencing is selected."""
+        self.local_reference_field.setVisible(self.cb_car_mode.currentData() == "loccar")
 
     def _sync_output_controls(self, *_args) -> None:
         output_streams = str(self.cb_output_streams.currentData() or "ap")
@@ -1744,7 +1866,7 @@ class CatGTSetupDialog(QtWidgets.QDialog):
                 trigger_string=self._resolved_trigger(),
                 probe_string=self.current_probe if selected_probe == "current" else selected_probe,
                 output_streams=str(self.cb_output_streams.currentData() or "ap"),
-                car_mode=self.cb_car_mode.currentText(),
+                car_mode=str(self.cb_car_mode.currentData()),
                 loccar_min_um=float(self.sp_loccar_min.value()),
                 loccar_max_um=float(self.sp_loccar_max.value()),
                 command_flags=self.catgt_panel.value(),
@@ -1780,7 +1902,7 @@ class CatGTSetupDialog(QtWidgets.QDialog):
             "catgt_output_streams": str(self.cb_output_streams.currentData() or "ap"),
             "catgt_lf_lowpass_hz": float(self.catgt_panel.sp_lfp_lowpass.value()),
             "catgt_lf_downsample": int(self.catgt_panel.cb_lfp_downsample.currentText()),
-            "catgt_car_mode": self.cb_car_mode.currentText(),
+            "catgt_car_mode": str(self.cb_car_mode.currentData()),
             "catgt_loccar_min_um": float(self.sp_loccar_min.value()),
             "catgt_loccar_max_um": float(self.sp_loccar_max.value()),
             "gate_string": gate,

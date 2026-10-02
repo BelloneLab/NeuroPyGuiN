@@ -153,27 +153,39 @@ TAB_TITLES = ["Preprocessing", "Curation", "Post Processing", "Histology"]
 STARTUP_TAB_OPTIONS = ["Last Used", *TAB_TITLES]
 PLOT_THEME_OPTIONS = ["Light", "Dark"]
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
-SMALL_APP_ICON_PATH = ASSET_DIR / "small.jpg"
-BIG_SPLASH_IMAGE_PATH = ASSET_DIR / "big.jpg"
+SMALL_APP_ICON_PATH = ASSET_DIR / "neuropyguin-icon.svg"
+BIG_SPLASH_IMAGE_PATH = ASSET_DIR / "neuropyguin-logo.svg"
 WINDOWS_APP_ID = "BelloneLab.NeuroPyGuiN"
 
 
 def _load_app_icon() -> QtGui.QIcon:
-    """Return the window/taskbar icon, or an empty icon if the asset is missing."""
-    pixmap = QtGui.QPixmap(str(SMALL_APP_ICON_PATH))
-    if pixmap.isNull():
+    """Keep the SVG icon vector-backed so Qt can render every taskbar size sharply."""
+    if not SMALL_APP_ICON_PATH.is_file():
         return QtGui.QIcon()
-    return QtGui.QIcon(pixmap)
+    return QtGui.QIcon(str(SMALL_APP_ICON_PATH))
 
 
 def _load_splash_pixmap() -> QtGui.QPixmap:
-    """Return the splash image, downscaled to at most 960 px wide if larger."""
-    pixmap = QtGui.QPixmap(str(BIG_SPLASH_IMAGE_PATH))
-    if pixmap.isNull():
+    """Render the vector logo directly at the display's physical pixel density."""
+    from PySide6 import QtSvg
+
+    renderer = QtSvg.QSvgRenderer(str(BIG_SPLASH_IMAGE_PATH))
+    if not renderer.isValid():
         return QtGui.QPixmap()
-    max_width = min(960, pixmap.width())
-    if max_width > 0 and pixmap.width() > max_width:
-        return pixmap.scaledToWidth(max_width, QtCore.Qt.SmoothTransformation)
+    screen = QtGui.QGuiApplication.primaryScreen()
+    ratio = screen.devicePixelRatio() if screen else 1.0
+    available = screen.availableGeometry().size() if screen else QtCore.QSize(1200, 800)
+    logical_size = renderer.defaultSize().scaled(
+        min(960, int(available.width() * 0.8)),
+        int(available.height() * 0.8),
+        QtCore.Qt.KeepAspectRatio,
+    )
+    pixmap = QtGui.QPixmap(round(logical_size.width() * ratio), round(logical_size.height() * ratio))
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    pixmap.setDevicePixelRatio(ratio)
     return pixmap
 
 

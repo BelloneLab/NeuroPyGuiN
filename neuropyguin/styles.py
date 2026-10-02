@@ -456,6 +456,44 @@ QWidget[compactDialog="true"] QLabel#FieldTitle {
 QWidget[compactDialog="true"] QLabel#SectionHint {
     font-size: 12px;
 }
+/* These cards have explicit layout margins; avoid adding a second layer of padding. */
+QDialog#CatGTSetupDialog QGroupBox {
+    padding: 0px;
+    margin-top: 12px;
+    border-radius: 12px;
+}
+QDialog#CatGTSetupDialog QSpinBox,
+QDialog#CatGTSetupDialog QDoubleSpinBox {
+    padding-right: 28px;
+}
+QDialog#CatGTSetupDialog QSpinBox::up-button,
+QDialog#CatGTSetupDialog QDoubleSpinBox::up-button {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 24px;
+    border: none;
+    background: transparent;
+}
+QDialog#CatGTSetupDialog QSpinBox::down-button,
+QDialog#CatGTSetupDialog QDoubleSpinBox::down-button {
+    subcontrol-origin: padding;
+    subcontrol-position: bottom right;
+    width: 24px;
+    border: none;
+    background: transparent;
+}
+QDialog#CatGTSetupDialog QSpinBox::up-arrow,
+QDialog#CatGTSetupDialog QDoubleSpinBox::up-arrow {
+    image: url(%(spin_up_arrow)s);
+    width: 10px;
+    height: 10px;
+}
+QDialog#CatGTSetupDialog QSpinBox::down-arrow,
+QDialog#CatGTSetupDialog QDoubleSpinBox::down-arrow {
+    image: url(%(combo_arrow)s);
+    width: 10px;
+    height: 10px;
+}
 QLabel#QueueSummary {
     color: %(text_soft)s;
     font-size: 13px;
@@ -650,6 +688,7 @@ def build_app_qss(theme: str) -> str:
     # Combo-box chevron: a small SVG tinted to match the theme's soft text color.
     variant = "dark" if str(theme).lower().startswith("dark") else "light"
     tokens["combo_arrow"] = (_ASSET_DIR / f"chevron-down-{variant}.svg").as_posix()
+    tokens["spin_up_arrow"] = (_ASSET_DIR / f"chevron-up-{variant}.svg").as_posix()
     return _APP_QSS_TEMPLATE % tokens
 
 
