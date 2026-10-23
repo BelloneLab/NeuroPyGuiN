@@ -1185,7 +1185,16 @@ class HistologyTab(QtWidgets.QWidget):
         self.ed_atlas = QtWidgets.QLineEdit(hatlas.DEFAULT_ATLAS_PATH)
         b_atlas = QtWidgets.QPushButton("Browse...")
         b_atlas.clicked.connect(lambda: self._pick_into(self.ed_atlas, "Allen CCF atlas folder"))
-        form.addRow("Atlas folder", self._with_button(self.ed_atlas, b_atlas))
+        self.btn_dl_atlas = QtWidgets.QPushButton("Download atlas")
+        self.btn_dl_atlas.setToolTip(
+            "Download the Allen CCF 10um files (~4.8 GB, resumable) from https://osf.io/fv7ed/ "
+            "into the Atlas folder."
+        )
+        self.btn_dl_atlas.clicked.connect(self._download_atlas)
+        form.addRow("Atlas folder", self._with_button(self.ed_atlas, b_atlas, self.btn_dl_atlas))
+        self.lbl_atlas_dl = QtWidgets.QLabel("")
+        self.lbl_atlas_dl.setObjectName("SectionHint")
+        form.addRow("", self.lbl_atlas_dl)
 
         self.ed_ks = QtWidgets.QLineEdit()
         b_ks = QtWidgets.QPushButton("Browse...")
@@ -1622,12 +1631,13 @@ class HistologyTab(QtWidgets.QWidget):
 
     # ------------------------------------------------------------- helpers
     @staticmethod
-    def _with_button(edit: QtWidgets.QLineEdit, button: QtWidgets.QPushButton) -> QtWidgets.QWidget:
+    def _with_button(edit: QtWidgets.QLineEdit, *buttons: QtWidgets.QPushButton) -> QtWidgets.QWidget:
         host = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(host)
         h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(edit, 1)
-        h.addWidget(button, 0)
+        for button in buttons:
+            h.addWidget(button, 0)
         return host
 
     @staticmethod
@@ -1765,13 +1775,74 @@ class HistologyTab(QtWidgets.QWidget):
             return self.atlas
         path = self.ed_atlas.text().strip() or None
         if not hatlas.atlas_files_present(path):
-            self._log("Atlas files not found. Download from https://osf.io/fv7ed/overview "
-                      "and set the atlas folder.")
+            self._log("Atlas files not found in the Atlas folder.")
+            self._offer_atlas_download()
             return None
         self._log("Loading Allen CCF atlas (first use)...")
         self.atlas = hatlas.AllenCCFAtlas(path)
         self._log(f"Atlas loaded: shape {self.atlas.shape}.")
         return self.atlas
+
+    # ------------------------------------------------ Atlas download
+    def _offer_atlas_download(self) -> None:
+        """Ask once whether to fetch the atlas when a histology step needs it."""
+        if getattr(self, "_atlas_dl_active", False):
+            return
+        ans = QtWidgets.QMessageBox.question(
+            self, "Allen CCF atlas missing",
+            "The Allen CCF atlas files were not found in the Atlas folder.\n\n"
+            "Download them now from https://osf.io/fv7ed/ (about 4.8 GB, resumable)?",
+        )
+        if ans == QtWidgets.QMessageBox.Yes:
+            self._download_atlas()
+
+    def _download_atlas(self) -> None:
+        """Download the atlas into the Atlas folder on a worker thread."""
+        if getattr(self, "_atlas_dl_active", False):
+            return
+        dest = self.ed_atlas.text().strip()
+        if not dest or (not Path(dest).exists() and not Path(dest).parent.exists()):
+            dest = str(hatlas.default_download_folder())
+            self.ed_atlas.setText(dest)
+        if hatlas.atlas_files_present(dest):
+            self._log("Atlas files already present.")
+            return
+        self._atlas_dl_active = True
+        self._atlas_dl_state = ("", 0, 0)
+        self.btn_dl_atlas.setEnabled(False)
+
+        def progress(name: str, done: int, total: int) -> None:
+            self._atlas_dl_state = (name, done, total)  # read by the GUI-thread timer
+
+        def job():
+            return str(hatlas.download_atlas(dest, progress=progress))
+
+        timer = QtCore.QTimer(self)
+
+        def tick() -> None:
+            name, done, total = self._atlas_dl_state
+            if name:
+                pct = f" ({100 * done / total:.0f}%)" if total else ""
+                self.lbl_atlas_dl.setText(f"Downloading {name}: {done / 1e9:.2f} GB{pct}")
+
+        timer.timeout.connect(tick)
+        timer.start(500)
+
+        def done_ok(path) -> None:
+            self.atlas = None
+            self.lbl_atlas_dl.setText(f"Atlas ready in {path}")
+            self._log(f"Atlas downloaded to {path}.")
+            self._persist_settings()
+
+        def finished(payload: dict) -> None:
+            timer.stop()
+            self._atlas_dl_active = False
+            self.btn_dl_atlas.setEnabled(True)
+            if not payload.get("ok"):
+                self.lbl_atlas_dl.setText("Download failed or interrupted. Click again to resume.")
+
+        self._run_bg(job, done_ok, busy_msg=f"Downloading Allen CCF atlas to {dest} ...",
+                     on_finished=finished)
 
     # ------------------------------------------------ Image selection actions
     def _resolve_raw_folder_for_selection(self) -> Tuple[Optional[Path], List[Path], Optional[Path]]:

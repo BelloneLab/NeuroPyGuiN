@@ -38,6 +38,10 @@ dependencies:
   # pin is gone. The ceiling comes from numba (< 2.5) and cupy (< 2.6), and from
   # bundled code that still uses numpy-1 aliases (np.trapz, np.in1d) which are
   # deprecated but present up to 2.4.
+  # BLAS: conda-forge's newest MKL (2026.x) lacks entry points that the numpy/scipy
+  # builds call, so ANY LAPACK call (np.linalg.lstsq, svd...) hard-crashes the
+  # interpreter on Windows (0xc06d007f). OpenBLAS is stable and needs no MKL.
+  - libblas=*=*openblas
   - numpy>=1.26,<2.5
   - scipy
   - pandas

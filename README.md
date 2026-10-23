@@ -301,9 +301,12 @@ python main.py doctor --json      # same check, machine-readable
 ### Light up the Histology tab
 
 The atlas matching and tracing need the Allen Mouse Brain CCF 10um volumes.
-Download them once from **https://osf.io/fv7ed/overview**, then point the
-*Atlas folder* on the Histology > Setup page at that directory (or set
-`NPG_ATLAS_PATH`). The channel map and the optional IBL GUI use the IBL stack
+If they are missing, click **Download atlas** on the Histology > Setup page (or accept
+the prompt when a histology step needs them). It fetches the three required files
+(about 4.8 GB, resumable, size-checked) from **https://osf.io/fv7ed/** into the *Atlas
+folder*, falling back to `~/.neuropyguin/allen_atlas_path`. Already have the files? Point
+*Atlas folder* at that directory (or set `NPG_ATLAS_PATH`). Headless:
+`python -c "from neuropyguin.histology.atlas import download_atlas; download_atlas()"`. The channel map and the optional IBL GUI use the IBL stack
 (`ibllib`, `iblatlas`, `SimpleITK`), which the environment files already install.
 
 ### Preprocessing tools

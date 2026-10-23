@@ -18,15 +18,19 @@ IBL scripts keep working):
 * ``annotation_volume_..._by_index`` stores, per voxel, the 1-based MATLAB row
   number of the structure-tree table. In Python that is ``structure_tree.iloc[v - 1]``.
 
-Download the atlas (if missing) from https://osf.io/fv7ed/overview and point the
-``histology/atlas_path`` setting (or ``NPG_ATLAS_PATH`` env var) at the folder.
+If the files are missing, :func:`download_atlas` fetches them (about 4.8 GB, resumable,
+size-checked) from the public OSF project https://osf.io/fv7ed/ ; the Histology > Setup page
+exposes it as the "Download atlas" button. Otherwise point the ``histology/atlas_path``
+setting (or ``NPG_ATLAS_PATH`` env var) at an existing folder.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
+import json
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -44,6 +48,13 @@ CCF_VOXEL_UM = 10.0
 #: Bregma in CCF 10um voxel coordinates [AP, DV, ML] (allenCCFbregma.m).
 BREGMA_CCF = np.array([540.0, 0.0, 570.0])
 
+#: Public OSF project that hosts the AP_histology atlas files.
+OSF_PROJECT_ID = "fv7ed"
+OSF_FILES_API = f"https://api.osf.io/v2/nodes/{OSF_PROJECT_ID}/files/osfstorage/"
+
+#: Per-user fallback download folder (used when the legacy default is not writable).
+USER_ATLAS_PATH = str(Path.home() / ".neuropyguin" / "allen_atlas_path")
+
 _TEMPLATE_FN = "template_volume_10um.npy"
 _ANNOTATION_FN = "annotation_volume_10um_by_index.npy"
 _STRUCTURE_FN = "structure_tree_safe_2017.csv"
@@ -53,6 +64,97 @@ def resolve_atlas_path(atlas_path: Optional[str] = None) -> Path:
     """Resolve the atlas folder from an explicit arg, env var, or default."""
     candidate = atlas_path or os.environ.get("NPG_ATLAS_PATH") or DEFAULT_ATLAS_PATH
     return Path(candidate)
+
+
+def default_download_folder() -> Path:
+    """Where to download to when the user has not chosen a folder."""
+    return Path(os.environ.get("NPG_ATLAS_PATH") or USER_ATLAS_PATH)
+
+
+def required_atlas_files() -> Tuple[str, ...]:
+    """File names that must exist in an atlas folder."""
+    return (_TEMPLATE_FN, _ANNOTATION_FN, _STRUCTURE_FN)
+
+
+def _osf_listing() -> Dict[str, Dict[str, object]]:
+    """Map file name -> {url, size} from the OSF storage listing (follows pagination)."""
+    out: Dict[str, Dict[str, object]] = {}
+    url: Optional[str] = OSF_FILES_API
+    while url:
+        req = urllib.request.Request(url, headers={"User-Agent": "NeuroPyGuiN-atlas/1"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        for item in payload.get("data", []):
+            attrs = item.get("attributes", {})
+            if attrs.get("kind") == "file":
+                out[attrs["name"]] = {
+                    "url": item["links"]["download"],
+                    "size": int(attrs.get("size") or 0),
+                }
+        url = (payload.get("links") or {}).get("next")
+    return out
+
+
+def download_atlas(
+    dest: Optional[str] = None,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+    cancelled: Optional[Callable[[], bool]] = None,
+) -> Path:
+    """Download the three required atlas files from OSF into ``dest``.
+
+    Resumable: a partial ``<name>.part`` file is continued with an HTTP Range request,
+    and each finished file is size-checked against the OSF listing before being moved
+    into place, so a half-downloaded volume can never be mistaken for a valid atlas.
+    ``progress(file_name, bytes_done, bytes_total)`` is called as data arrives;
+    ``cancelled()`` returning True aborts and keeps the partial file for a later resume.
+    Returns the atlas folder.
+    """
+    folder = Path(dest) if dest else default_download_folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    listing = _osf_listing()
+    missing = [fn for fn in required_atlas_files() if fn not in listing]
+    if missing:
+        raise RuntimeError(f"OSF project {OSF_PROJECT_ID} no longer lists: {missing}")
+
+    for fn in required_atlas_files():
+        target = folder / fn
+        size = int(listing[fn]["size"])
+        if target.exists() and (size == 0 or target.stat().st_size == size):
+            if progress:
+                progress(fn, size, size)
+            continue
+        part = folder / (fn + ".part")
+        done = part.stat().st_size if part.exists() else 0
+        if size and done > size:
+            part.unlink()
+            done = 0
+        while size == 0 or done < size:
+            headers = {"User-Agent": "NeuroPyGuiN-atlas/1"}
+            if done:
+                headers["Range"] = f"bytes={done}-"
+            req = urllib.request.Request(str(listing[fn]["url"]), headers=headers)
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                # A server that ignores Range answers 200: restart the file from zero.
+                mode = "ab" if (done and resp.status == 206) else "wb"
+                if mode == "wb":
+                    done = 0
+                with open(part, mode) as out:
+                    while True:
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        done += len(chunk)
+                        if progress:
+                            progress(fn, done, size)
+                        if cancelled is not None and cancelled():
+                            raise InterruptedError("Atlas download cancelled (partial file kept).")
+            if size == 0:
+                break
+        if size and part.stat().st_size != size:
+            raise RuntimeError(f"{fn}: downloaded {part.stat().st_size} bytes, expected {size}.")
+        part.replace(target)
+    return folder
 
 
 def atlas_files_present(atlas_path: Optional[str] = None) -> bool:
@@ -118,7 +220,7 @@ class AllenCCFAtlas:
             raise FileNotFoundError(
                 "Allen CCF atlas files missing from "
                 f"{self.atlas_path}: {missing}. Download them from "
-                "https://osf.io/fv7ed/overview and set the atlas path."
+                "https://osf.io/fv7ed/overview (or use the Download atlas button) and set the atlas path."
             )
         mode = "r" if self._mmap else None
         self.tv = np.load(self.atlas_path / _TEMPLATE_FN, mmap_mode=mode)

@@ -591,8 +591,8 @@ def _check_atlas(read: Callable[[str, str], str]) -> CheckResult:
         "atlas", "Histology", "Allen CCF atlas volumes", WARN,
         f"Atlas volumes not found in {path}. Atlas matching and probe tracing stay disabled.",
         RECOMMENDED,
-        fix="Download the 10um CCF volumes from https://osf.io/fv7ed/overview, then set "
-            "Histology > Setup > Atlas folder (or NPG_ATLAS_PATH).",
+        fix="Click Histology > Setup > Download atlas (fetches the 10um CCF volumes, ~4.8 GB, "
+            "from https://osf.io/fv7ed/), or point Atlas folder / NPG_ATLAS_PATH at an existing copy.",
     )
 
 
