@@ -49,3 +49,8 @@ tools/_pytest_tmp/
 
 # Optional in-checkout one-click runtime
 /.neuropyguin/
+
+# Local audit agent session notes
+/.postprocessing_memory.md
+/.population_memory.md
+/.workflow_memory.md

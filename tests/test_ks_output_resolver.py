@@ -98,3 +98,27 @@ def test_archive_output_dir_versions_existing_kilosort_folders(tmp_path: Path) -
     archived1 = archive_output_dir(root / "ks4")
     assert archived1 == root / "ks4_1"
     assert archived1.exists()
+
+
+def test_resolver_stops_after_nearest_matching_root(tmp_path, monkeypatch):
+    import neuropyguin.ks_output_resolver as resolver
+    root = tmp_path / 'sessionA'
+    actual = _make_ks_folder(root / 'imec0_ks4')
+    visited = []
+    original = resolver._walk_dirs
+    def record(path, max_depth):
+        visited.append(path)
+        yield from original(path, max_depth)
+    monkeypatch.setattr(resolver, '_walk_dirs', record)
+    assert resolver.find_kilosort_output_dir(root) == actual
+    assert visited == [root]
+
+
+def test_unreadable_candidate_does_not_crash(tmp_path, monkeypatch):
+    original = Path.is_dir
+    def denied(path):
+        if path == tmp_path:
+            raise PermissionError('unreadable recording')
+        return original(path)
+    monkeypatch.setattr(Path, 'is_dir', denied)
+    assert not has_kilosort_output(tmp_path)

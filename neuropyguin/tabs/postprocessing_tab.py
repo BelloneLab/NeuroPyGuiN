@@ -1,4 +1,4 @@
-﻿"""Post-processing tab for the NeuroPyGuiN GUI.
+"""Post-processing tab for the NeuroPyGuiN GUI.
 
 Provides the "Post Processing" page where a curated Kilosort/SpikeGLX dataset is
 loaded and explored: unit basics (raster, ACG, ISI, waveform), a raw-signal
@@ -45,78 +45,75 @@ def _is_bombcell_good_label(value: object) -> bool:
 
 
 def _export_good_unit_figures(dataset, good_units, out_dir, dark=False, progress_cb=None) -> dict:
-    """Export per-unit waveform + ACG figures for every good unit (PNG + one PDF).
+    """Export a white-paper unit atlas and report every failed unit in a CSV.
 
-    For each unit in ``good_units`` this builds the npyx-style two-panel card via
-    :func:`neuropyguin.unit_figures.unit_waveform_acg_figure`, writes it as
-    ``out_dir/unit_<id>_waveform_acg.png`` (dpi 150) and appends the same figure
-    as a page of a single multi-page PDF ``out_dir/good_units_waveform_acg.pdf``.
-    Each figure is closed immediately after use so memory stays bounded across
-    the (potentially ~77-unit) batch.
-
-    Designed to run off the GUI thread (it reads the AP binary per unit for the
-    +/-SEM waveform, so it takes minutes). ``progress_cb(i, n)`` is invoked
-    periodically with the number of units processed so far and the total.
-
-    Returns a dict ``{"n", "pdf", "png_dir", "error"}``. Per-unit render/save
-    errors are caught and logged into the result's ``error`` only when they are
-    fatal (e.g. the figure module is missing); individual failing units are
-    skipped so the batch keeps going.
+    Per-unit PDF, SVG and 600 dpi PNG files retain editable vector text. A
+    combined PDF enables rapid review. Each figure is released before the next
+    unit so memory usage stays bounded. Existing atlases receive a new suffix.
     """
-    # Lazy imports so a momentarily-missing dependency yields a clean error dict
-    # rather than crashing the worker / import of this module.
-    try:
-        import matplotlib
-        matplotlib.use("Agg", force=False)
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
-        from .. import unit_figures
-    except Exception as exc:  # noqa: BLE001
-        return {"n": 0, "pdf": None, "png_dir": str(out_dir), "error": f"export dependencies unavailable: {exc}"}
+    from matplotlib.backends.backend_pdf import PdfPages
+    import matplotlib.pyplot as plt
+    from .. import unit_figures
+    from ..publication import export_figure_bundle, publication_canvas
 
-    out_path = Path(out_dir)
-    units = [int(u) for u in good_units]
-    n = len(units)
-    if n == 0:
-        return {"n": 0, "pdf": None, "png_dir": str(out_path), "error": "No good units to export."}
-
-    try:
-        out_path.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:  # noqa: BLE001
-        return {"n": 0, "pdf": None, "png_dir": str(out_path), "error": f"Cannot create output folder: {exc}"}
-
-    pdf_path = out_path / "good_units_waveform_acg.pdf"
+    root = Path(out_dir)
+    units = list(map(int, good_units))
+    if not units:
+        return {"n": 0, "pdf": None, "png_dir": str(root), "error": "No good units to export."}
+    root.mkdir(parents=True, exist_ok=True)
+    pdf_path = root / "good_units_waveform_acg.pdf"
+    version = 1
+    while pdf_path.exists():
+        version += 1
+        pdf_path = root / f"good_units_waveform_acg_{version}.pdf"
+    records = []
     written = 0
-    try:
-        with PdfPages(str(pdf_path)) as pdf:
-            for i, unit in enumerate(units):
-                try:
-                    fig = unit_figures.unit_waveform_acg_figure(dataset, unit, dark=bool(dark))
-                except Exception:
-                    # A single bad unit must not abort the whole batch.
-                    if progress_cb is not None:
-                        try:
-                            progress_cb(i + 1, n)
-                        except Exception:
-                            pass
-                    continue
-                try:
-                    fig.savefig(str(out_path / f"unit_{int(unit)}_waveform_acg.png"), dpi=150)
-                    pdf.savefig(fig)
-                    written += 1
-                except Exception:
-                    pass
-                finally:
-                    plt.close(fig)
-                if progress_cb is not None:
-                    try:
-                        progress_cb(i + 1, n)
-                    except Exception:
-                        pass
-    except Exception as exc:  # noqa: BLE001
-        return {"n": written, "pdf": str(pdf_path), "png_dir": str(out_path), "error": f"{type(exc).__name__}: {exc}"}
+    with PdfPages(pdf_path) as pdf:
+        for index, unit in enumerate(units):
+            figure = None
+            try:
+                figure = unit_figures.unit_waveform_acg_figure(dataset, unit, dark=False)
+                export_figure_bundle(figure, root, f"unit_{unit}_waveform_acg",
+                                     metadata={"unit": unit, "recording": str(dataset.ks_folder),
+                                               "waveform": "sampled mean +/- SEM when raw voltage is available; otherwise template in arbitrary units"})
+                with publication_canvas(figure):
+                    pdf.savefig(figure, bbox_inches="tight")
+                written += 1
+                records.append({"unit_id": unit, "status": "exported", "error": ""})
+            except Exception as exc:
+                records.append({"unit_id": unit, "status": "failed", "error": str(exc)})
+            finally:
+                if figure is not None:
+                    plt.close(figure)
+            if progress_cb is not None:
+                progress_cb(index + 1, len(units))
+    pd.DataFrame(records).to_csv(pdf_path.with_suffix(".csv"), index=False)
+    failed = len(units) - written
+    return {"n": written, "pdf": str(pdf_path), "png_dir": str(root),
+            "error": f"{failed} units failed; see {pdf_path.with_suffix('.csv').name}" if failed else None}
 
-    return {"n": written, "pdf": str(pdf_path), "png_dir": str(out_path), "error": None}
+
+def _compute_condition_payload(dataset, units, conditions, pre_s, post_s, bin_ms):
+    """Compute PSTH arrays in a worker from immutable snapshots of UI inputs."""
+    entries = []
+    time_ms = np.array([], dtype=float)
+    for condition in conditions:
+        events = condition["events"]
+        matrices = []
+        unit_ids = []
+        for unit in units:
+            current_time, matrix = dataset.psth_trials(int(unit), events, pre_s, post_s, bin_ms)
+            if current_time.size and matrix.size:
+                time_ms = np.asarray(current_time, dtype=float)
+                matrices.append(np.asarray(matrix, dtype=float))
+                unit_ids.append(int(unit))
+        if matrices:
+            entries.append({key: value for key, value in condition.items() if key != "events"})
+            entries[-1].update(unit_ids=unit_ids, unit_trial_mats=matrices, trial_count=int(events.size))
+    if not entries:
+        raise ValueError("No valid conditions or event windows were found.")
+    return {"t_ms": time_ms, "conditions": entries, "units": list(units),
+            "pre_s": pre_s, "post_s": post_s, "bin_ms": bin_ms}
 
 
 class PostProcessingTab(QtWidgets.QWidget):
@@ -153,6 +150,11 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._right_panel: Optional[QtWidgets.QWidget] = None
         self._settings_visible: bool = True
         self._body_sizes_before_detach: list[int] = []
+        # Coalesce rapid selection/parameter edits into a single render.
+        self._refresh_timer = QtCore.QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(160)
+        self._refresh_timer.timeout.connect(self._refresh_current_page)
         self._build_ui()
         self._restore_settings()
 
@@ -174,9 +176,39 @@ class PostProcessingTab(QtWidgets.QWidget):
             host.setLayout(row)
             return host
 
+        header = QtWidgets.QHBoxLayout()
+        title_block = QtWidgets.QVBoxLayout()
+        title_block.setSpacing(2)
+        title = QtWidgets.QLabel("Explore your recording")
+        title.setObjectName("analysisWorkspaceTitle")
+        title_font = title.font()
+        title_font.setPointSize(20)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setStyleSheet("font-size: 22px; font-weight: 700;")
+        self.lbl_session = QtWidgets.QLabel("From single units to neural populations and behavior")
+        self.lbl_session.setObjectName("analysisWorkspaceSubtitle")
+        self.lbl_session.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        title_block.addWidget(title)
+        title_block.addWidget(self.lbl_session)
+        header.addLayout(title_block, 1)
+        self.btn_publication = QtWidgets.QPushButton("Export figure bundle")
+        self.btn_publication.setProperty("role", "primary")
+        self.btn_publication.setToolTip("PDF, editable SVG, 600 dpi PNG, plotted CSVs and analysis provenance")
+        self.cb_paper_width = QtWidgets.QComboBox()
+        self.cb_paper_width.addItem("Paper: 183 mm", 183.0)
+        self.cb_paper_width.addItem("Paper: 89 mm", 89.0)
+        self.cb_paper_width.addItem("Canvas size", None)
+        self.cb_paper_width.setToolTip("Paper presets use 7 pt editable text and a maximum height of 170 mm. Inspect your final layout before submission.")
+        header.addWidget(self.cb_paper_width)
+        header.addWidget(self.btn_publication)
+        main.addLayout(header)
+
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(8)
         self.ed_folder = QtWidgets.QLineEdit()
+        self.ed_folder.setPlaceholderText("Choose a curated Kilosort / Phy folder")
+        self.ed_folder.setClearButtonEnabled(True)
         self.btn_browse = QtWidgets.QPushButton("Browse curated folder")
         self.btn_load = QtWidgets.QPushButton("Load dataset")
         self.btn_export = QtWidgets.QPushButton("Export plotted data")
@@ -197,10 +229,23 @@ class PostProcessingTab(QtWidgets.QWidget):
         top.addWidget(self.ed_folder, 1)
         top.addWidget(self.btn_browse)
         top.addWidget(self.btn_load)
-        top.addWidget(self.btn_export)
-        top.addWidget(self.btn_export_units)
-        top.addWidget(self.btn_export_waveforms)
+        # Secondary exports stay reachable without crowding the dataset bar.
+        self.btn_more = QtWidgets.QToolButton()
+        self.btn_more.setText("More actions")
+        self.btn_more.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        more_menu = QtWidgets.QMenu(self.btn_more)
+        for label, button in (("Export plotted tables (CSV)", self.btn_export),
+                              ("Export units (HDF5)", self.btn_export_units),
+                              ("Export good-unit waveform atlas", self.btn_export_waveforms)):
+            action = more_menu.addAction(label)
+            action.triggered.connect(button.click)
+            button.hide()
+        more_menu.addSeparator()
+        self.action_log = more_menu.addAction("Show analysis log")
+        self.action_log.setCheckable(True)
         top.addWidget(self.btn_detach_plots)
+        self.btn_more.setMenu(more_menu)
+        top.addWidget(self.btn_more)
 
         body = QtWidgets.QSplitter()
         self._body_splitter = body
@@ -209,22 +254,25 @@ class PostProcessingTab(QtWidgets.QWidget):
         # child (no longer stacked above the controls), so the unit list keeps
         # the full sidebar height and many units stay visible at once.
         grp_units = QtWidgets.QGroupBox("Units")
+        self._unit_inspector = grp_units
         u_l = QtWidgets.QVBoxLayout(grp_units)
         u_l.setSpacing(8)
+        u_l.setContentsMargins(12, 20, 12, 12)
         unit_filter_row = QtWidgets.QHBoxLayout()
         unit_filter_row.setSpacing(6)
         self.ed_unit_filter = QtWidgets.QLineEdit()
-        self.ed_unit_filter.setPlaceholderText("Filter unit id")
-        self.btn_good_only = QtWidgets.QPushButton("Good only")
+        self.ed_unit_filter.setPlaceholderText("Find unit ID...")
+        self.ed_unit_filter.setClearButtonEnabled(True)
+        self.btn_good_only = QtWidgets.QPushButton("Good")
         self.btn_good_only.setToolTip("Show only units labelled good by the selected source.")
         self.btn_good_only.setCheckable(True)
+        self.btn_good_only.setStyleSheet("padding-left: 10px; padding-right: 10px;")
         self.cb_good_source = QtWidgets.QComboBox()
         self.cb_good_source.addItems(["Auto", "Bombcell", "Phy", "KSLabel"])
         unit_filter_row.addWidget(self.ed_unit_filter, 1)
-        unit_filter_row.addWidget(self.btn_good_only)
         good_source_row = QtWidgets.QHBoxLayout()
         good_source_row.setSpacing(6)
-        good_source_row.addWidget(QtWidgets.QLabel("Good source"))
+        good_source_row.addWidget(self.btn_good_only)
         good_source_row.addWidget(self.cb_good_source, 1)
 
         self.list_units = QtWidgets.QListWidget()
@@ -232,7 +280,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.list_units.setUniformItemSizes(True)
         # A tall list is the whole point of the redesign: let it claim the
         # sidebar height and never collapse below a generous minimum.
-        self.list_units.setMinimumHeight(360)
+        self.list_units.setMinimumHeight(160)
         self.list_units.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         # Compact rows so many units are visible at once (the app-wide list style
         # pads rows heavily for nav lists; the unit list wants density instead).
@@ -244,21 +292,31 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.lbl_units_count.setObjectName("psthMetaLabel")
 
         self.tbl_unit_quality = QtWidgets.QTableWidget(0, 2)
+        self.tbl_unit_quality.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.tbl_unit_quality.setAlternatingRowColors(True)
         self.tbl_unit_quality.setHorizontalHeaderLabels(["Metric", "Value"])
-        self.tbl_unit_quality.horizontalHeader().setStretchLastSection(True)
+        self.tbl_unit_quality.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         self.tbl_unit_quality.verticalHeader().setVisible(False)
         self.tbl_unit_quality.setMaximumHeight(180)
 
         u_l.addLayout(unit_filter_row)
         u_l.addLayout(good_source_row)
+        selection_row = QtWidgets.QHBoxLayout()
+        self.btn_select_all = QtWidgets.QPushButton("All visible")
+        self.btn_select_all.setToolTip("Select every unit currently visible in the list")
+        self.btn_clear_selection = QtWidgets.QPushButton("Clear")
+        self.btn_select_all.setProperty("role", "ghost")
+        self.btn_clear_selection.setProperty("role", "ghost")
+        selection_row.addWidget(self.btn_select_all)
+        selection_row.addWidget(self.btn_clear_selection)
+        u_l.addLayout(selection_row)
         u_l.addWidget(self.lbl_units_count, 0)
         u_l.addWidget(self.list_units, 1)
         u_l.addWidget(QtWidgets.QLabel("Selected unit metrics"), 0)
         u_l.addWidget(self.tbl_unit_quality, 0)
         # Keep the Units sidebar narrow so the figures stay dominant.
-        grp_units.setMinimumWidth(280)
-        grp_units.setMaximumWidth(440)
+        grp_units.setMinimumWidth(270)
+        grp_units.setMaximumWidth(340)
 
         # RIGHT: the analysis area separates NAVIGATION from SETTINGS.
         #   analysis_tabs : slim, always-visible nav tab bar (empty pages). It is
@@ -274,6 +332,9 @@ class PostProcessingTab(QtWidgets.QWidget):
 
         self.analysis_tabs = QtWidgets.QTabWidget()
         self.analysis_tabs.setDocumentMode(True)
+        self.analysis_tabs.tabBar().setExpanding(False)
+        self.analysis_tabs.tabBar().setUsesScrollButtons(True)
+        self.analysis_tabs.tabBar().setElideMode(QtCore.Qt.ElideNone)
         # Nav only: pages are empty, the bar just selects the analysis. Cap the
         # height so the empty pane never steals room from the figures.
         self.analysis_tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
@@ -288,7 +349,8 @@ class PostProcessingTab(QtWidgets.QWidget):
             form.setContentsMargins(6, 6, 6, 6)
             form.setVerticalSpacing(6)
             form.setHorizontalSpacing(8)
-            form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
             return form
 
@@ -327,7 +389,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.sp_basic_acg_win.setRange(10.0, 1000.0)
         self.sp_basic_acg_win.setValue(100.0)
         self.sp_basic_acg_win.setSuffix(" ms")
-        self.ck_ifr = QtWidgets.QCheckBox("Overlay instantaneous firing rate")
+        self.ck_ifr = QtWidgets.QCheckBox("Show smoothed rate")
         self.ck_ifr.setChecked(True)
         self.sp_ifr_smooth_ms = QtWidgets.QDoubleSpinBox()
         self.sp_ifr_smooth_ms.setRange(1.0, 500.0)
@@ -338,7 +400,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         f_basic.addRow("ISI max", with_help(self.sp_isi_max, "Maximum ISI bin range for histogram (ms)."))
         f_basic.addRow("ACG bin", with_help(self.sp_basic_acg_bin, "Auto-correlogram bin size (ms) for Unit Basics."))
         f_basic.addRow("ACG window", with_help(self.sp_basic_acg_win, "Auto-correlogram half-window (ms) for Unit Basics."))
-        f_basic.addRow("IFR smooth", with_help(self.sp_ifr_smooth_ms, "Bin/smoothing window for instantaneous firing rate (ms)."))
+        f_basic.addRow("IFR smooth", with_help(self.sp_ifr_smooth_ms, "Gaussian sigma for the selected unit rate in the time-window raster (ms)."))
         f_basic.addRow(self.ck_ifr)
         _add_settings_page(t_basic, "Unit Basics")
 
@@ -523,7 +585,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         net_btn_row.addWidget(self.btn_net_compute)
         net_btn_row.addWidget(self.btn_net_show)
         f_net.addRow("Correlation bin", with_help(self.sp_net_bin, "Bin size (ms) for the pairwise spike-count (noise) correlation matrix."))
-        f_net.addRow("Connection z-threshold", with_help(self.sp_net_z, "Z-score threshold for flagging putative short-latency CCG connections."))
+        f_net.addRow("CCG z-threshold", with_help(self.sp_net_z, "Exploratory short-latency CCG deviation threshold. Crossings are not corrected hypothesis tests or evidence of synaptic connectivity."))
         f_net.addRow(net_btn_row)
         _add_settings_page(t_net, "Network")
 
@@ -596,6 +658,8 @@ class PostProcessingTab(QtWidgets.QWidget):
 
         self.view_tabs = QtWidgets.QTabWidget()
         self.view_tabs.setDocumentMode(True)
+        # Hidden complex pages must not impose their minimum width on all analyses.
+        self.view_tabs.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Expanding)
         # The view tabs are now a pure stacked page container: hide their tab bar
         # so the user sees only ONE navigation strip (analysis_tabs). Index sync
         # is preserved in _on_analysis_page_changed.
@@ -677,6 +741,31 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.view_tabs.addTab(net_view, "Network")
         self.view_tabs.addTab(npyx_view, "Advanced")
         self.view_tabs.addTab(c4_view, "Cell Types")
+        from .population_widget import PopulationWidget
+        self.population_widget = PopulationWidget(self)
+        self.view_tabs.addTab(self.population_widget, "Population + behavior")
+        population_help = QtWidgets.QLabel(
+            "Explore population activity, continuous behavior, neural embeddings and held-out decoding. "
+            "Controls are integrated into this workspace.")
+        population_help.setWordWrap(True)
+        _add_settings_page(population_help, "Population + behavior")
+        page_hints = [
+            "Waveforms, spike timing, amplitude stability and firing rate",
+            "Inspect recorded voltage around your selected units",
+            "Compare autocorrelograms and cross-correlograms",
+            "Align neural activity to events and behavioral bouts",
+            "Explore population correlation and CCG threshold crossings",
+            "Specialized NeuroPyxels methods with explicit parameters",
+            "Region-aware, model-dependent cell-type predictions",
+            "Population dynamics, behavior, embeddings and decoding",
+        ]
+        concise_titles = ["Units", "Voltage", "Timing", "Events", "Network", "Methods", "Cell types", "Population"]
+        for index, hint in enumerate(page_hints):
+            self.analysis_tabs.setTabText(index, concise_titles[index])
+            self.analysis_tabs.setTabToolTip(index, hint)
+        self.lbl_analysis_hint = QtWidgets.QLabel(page_hints[0])
+        self.lbl_analysis_hint.setWordWrap(True)
+        self._page_hints = page_hints
 
         # The settings panel: the per-analysis form stack with a small header,
         # docked on the right of the figure and collapsible via a chevron.
@@ -690,8 +779,8 @@ class PostProcessingTab(QtWidgets.QWidget):
         settings_panel_l.addWidget(self.lbl_settings_title, 0)
         settings_panel_l.addWidget(self.settings_stack, 1)
         self.settings_panel.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
-        self.settings_panel.setMinimumWidth(300)
-        self.settings_panel.setMaximumWidth(340)
+        self.settings_panel.setMinimumWidth(260)
+        self.settings_panel.setMaximumWidth(300)
 
         # The discrete chevron toggle, on the boundary between figure and panel.
         self.btn_settings_toggle = QtWidgets.QToolButton()
@@ -716,6 +805,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         # Assemble the right (analysis) panel: slim nav tab bar on top, the
         # figure+settings row below, then the per-page progress bar.
         analysis_area_l.addWidget(self.analysis_tabs, 0)
+        analysis_area_l.addWidget(self.lbl_analysis_hint, 0)
         analysis_area_l.addWidget(figure_row, 1)
         analysis_area_l.addWidget(self.page_progress, 0)
         self._analysis_area_layout = analysis_area_l
@@ -735,10 +825,11 @@ class PostProcessingTab(QtWidgets.QWidget):
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 1)
         body.setCollapsible(0, False)
-        body.setSizes([330, 1370])
+        body.setSizes([285, 1370])
 
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.document().setMaximumBlockCount(2000)
         self.log.setProperty("logView", True)
         self.log.setPlaceholderText("Dataset load and analysis output will appear here.")
         # Keep the log a thin strip so the figures own the vertical space.
@@ -754,6 +845,16 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.vertical_split.setCollapsible(1, True)
         self.vertical_split.setSizes([900, 120])
         main.addWidget(self.vertical_split, 1)
+        self.log.hide()
+        self.lbl_status = QtWidgets.QLabel("Ready. Load a recording to start exploring.")
+        self.lbl_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.lbl_status.setWordWrap(True)
+        main.addWidget(self.lbl_status)
+        self.action_log.toggled.connect(self.log.setVisible)
+        self.btn_publication.clicked.connect(self._export_publication_bundle)
+        self.btn_select_all.clicked.connect(self.list_units.selectAll)
+        self.btn_clear_selection.clicked.connect(self.list_units.clearSelection)
+        self.ed_folder.returnPressed.connect(self._load_dataset)
 
         self.btn_browse.clicked.connect(self._pick)
         self.btn_load.clicked.connect(self._load_dataset)
@@ -767,9 +868,9 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_good_only.toggled.connect(self._refresh_units_list)
         self.cb_good_source.currentTextChanged.connect(self._on_good_source_changed)
         self.analysis_tabs.currentChanged.connect(self._on_analysis_page_changed)
-        self.cb_corr_mode.currentTextChanged.connect(self._refresh_current_page)
-        self.cb_corr_norm.currentTextChanged.connect(self._refresh_current_page)
-        self.cb_corr_style.currentTextChanged.connect(self._refresh_current_page)
+        self.cb_corr_mode.currentTextChanged.connect(self._schedule_refresh)
+        self.cb_corr_norm.currentTextChanged.connect(self._schedule_refresh)
+        self.cb_corr_style.currentTextChanged.connect(self._schedule_refresh)
         self.btn_cond_add.clicked.connect(self._add_condition_row)
         self.btn_cond_remove.clicked.connect(self._remove_condition_row)
         self.btn_cond_browse.clicked.connect(self._browse_condition_csv)
@@ -789,7 +890,7 @@ class PostProcessingTab(QtWidgets.QWidget):
         self.btn_net_show.clicked.connect(self._show_network)
         self.btn_c4_run.clicked.connect(self._run_celltypes)
         self.cb_celltype_method.currentIndexChanged.connect(self._update_celltype_method_ui)
-        self.cb_npyx_method.currentTextChanged.connect(self._refresh_current_page)
+        self.cb_npyx_method.currentTextChanged.connect(self._schedule_refresh)
         self.cb_npyx_method.currentIndexChanged.connect(self._update_npyx_method_ui)
         self.tbl_npyx_params.itemChanged.connect(self._on_npyx_params_changed)
 
@@ -804,11 +905,11 @@ class PostProcessingTab(QtWidgets.QWidget):
         ]
         for w in auto_widgets:
             if hasattr(w, "valueChanged"):
-                w.valueChanged.connect(self._refresh_current_page)
+                w.valueChanged.connect(self._schedule_refresh)
             elif hasattr(w, "currentTextChanged"):
-                w.currentTextChanged.connect(self._refresh_current_page)
+                w.currentTextChanged.connect(self._schedule_refresh)
             elif hasattr(w, "toggled"):
-                w.toggled.connect(self._refresh_current_page)
+                w.toggled.connect(self._schedule_refresh)
 
         self.tbl_conditions.itemChanged.connect(self._on_conditions_changed)
         self._apply_plot_style()
@@ -823,17 +924,26 @@ class PostProcessingTab(QtWidgets.QWidget):
             show_settings = show_settings.lower() not in {"false", "0", "no"}
         self._set_settings_visible(bool(show_settings))
 
+    def _schedule_refresh(self, *args) -> None:
+        """Render after the user finishes a burst of edits, preventing redraw storms."""
+        self._refresh_timer.start()
+
     def _sync_settings_page(self, idx: int) -> None:
         """Keep the right-docked settings stack and its title aligned to the nav."""
         if 0 <= idx < self.settings_stack.count():
             self.settings_stack.setCurrentIndex(idx)
         title = self.analysis_tabs.tabText(idx) if 0 <= idx < self.analysis_tabs.count() else "Settings"
         self.lbl_settings_title.setText(f"{title} settings")
+        if hasattr(self, "_page_hints") and 0 <= idx < len(self._page_hints):
+            self.lbl_analysis_hint.setText(self._page_hints[idx])
+        # Population analysis carries its own compact controls.
+        self.settings_panel.setVisible(self._settings_visible and idx != 7)
+        self.btn_settings_toggle.setVisible(idx != 7)
 
     def _set_settings_visible(self, visible: bool) -> None:
         """Show/hide the right settings panel; the chevron always stays reachable."""
         self._settings_visible = bool(visible)
-        self.settings_panel.setVisible(self._settings_visible)
+        self.settings_panel.setVisible(self._settings_visible and self.analysis_tabs.currentIndex() != 7)
         # Chevron points toward the action: '›' hides (panel open), '‹' reveals.
         self.btn_settings_toggle.setText("›" if self._settings_visible else "‹")
         self.btn_settings_toggle.setToolTip("Hide settings" if self._settings_visible else "Show settings")
@@ -1280,7 +1390,14 @@ class PostProcessingTab(QtWidgets.QWidget):
         return None
 
     def _load_dataset(self) -> None:
-        folder = Path(self.ed_folder.text().strip())
+        if self.is_busy():
+            self._log("An analysis is running. Finish or cancel it before loading another recording.")
+            return
+        folder_text = self.ed_folder.text().strip()
+        if not folder_text:
+            self._log("Choose a curated Kilosort / Phy folder first.")
+            return
+        folder = Path(folder_text)
         self.settings.setValue("post/last_folder", str(folder))
         if not folder.exists():
             self._log("Invalid folder")
@@ -1291,6 +1408,13 @@ class PostProcessingTab(QtWidgets.QWidget):
             self._log(f"Failed loading dataset: {exc}")
             return
 
+        # Cached analyses belong to a recording; never display them for another.
+        self.results.clear()
+        self._export_payloads.clear()
+        for view in (self.basics_view, self.raw_view, self.corr_npyx, self.psth_view, self.net_view, self.c4_view):
+            view.show_message("Select units and choose an analysis to begin.")
+        self.gl_npyx.clear()
+        self.population_widget.set_dataset(self.dataset)
         self.metrics_df = pd.DataFrame()
         mp = folder / "metrics.csv"
         if mp.exists():
@@ -1309,6 +1433,9 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._all_units = [int(u) for u in self.dataset.units.tolist()]
         self._update_basic_time_bounds()
         self._refresh_units_list()
+        duration = self._recording_duration_s()
+        self.lbl_session.setText(f"{folder.name}  ·  {len(self._all_units):,} units  ·  {duration / 60:.1f} min  ·  {self.dataset.sample_rate / 1000:g} kHz")
+        self.lbl_session.setToolTip(str(folder.resolve()))
         self._log(f"Loaded dataset with {len(self._all_units)} units")
         self._set_progress(0)
         self._refresh_current_page()
@@ -1360,34 +1487,40 @@ class PostProcessingTab(QtWidgets.QWidget):
         self._update_unit_quality_table()
 
     def _refresh_units_list(self) -> None:
+        """Filter once, restore selection once, and schedule only one redraw."""
         prev = {int(i.text()) for i in self.list_units.selectedItems()}
         filt = self.ed_unit_filter.text().strip().lower()
         good_only = self.btn_good_only.isChecked()
-        self.list_units.clear()
-        shown = 0
-        for u in self._all_units:
-            if filt and filt not in str(u):
-                continue
-            if good_only and not self._unit_is_good(u):
-                continue
-            self.list_units.addItem(str(u))
-            shown += 1
-            if u in prev:
-                self.list_units.item(self.list_units.count() - 1).setSelected(True)
-        total = len(self._all_units)
-        if total == 0:
-            self.lbl_units_count.setText("No dataset loaded.")
-        elif shown == total:
-            self.lbl_units_count.setText(f"{total} units")
-        else:
-            self.lbl_units_count.setText(f"{shown} of {total} units shown")
+        blocker = QtCore.QSignalBlocker(self.list_units)
+        self.list_units.setUpdatesEnabled(False)
+        try:
+            self.list_units.clear()
+            for unit in self._all_units:
+                if filt and filt not in str(unit):
+                    continue
+                if good_only and not self._unit_is_good(unit):
+                    continue
+                item = QtWidgets.QListWidgetItem(str(unit))
+                item.setToolTip(f"Unit {unit}. Ctrl-click to compare; Shift-click to select a range.")
+                self.list_units.addItem(item)
+                if unit in prev:
+                    item.setSelected(True)
+            if self.list_units.count() and not self.list_units.selectedItems():
+                self.list_units.item(0).setSelected(True)
+        finally:
+            self.list_units.setUpdatesEnabled(True)
+            del blocker
+        self._on_units_selection_changed()
 
     def _selected_units(self) -> list[int]:
         return [int(i.text()) for i in self.list_units.selectedItems()]
 
     def _on_units_selection_changed(self) -> None:
         self._update_unit_quality_table()
-        self._refresh_current_page()
+        selected = self._selected_units()
+        self.lbl_units_count.setText(f"{self.list_units.count()} / {len(self._all_units)} units · {len(selected)} selected")
+        self.population_widget.set_units(selected)
+        self._schedule_refresh()
 
     def _update_unit_quality_table(self) -> None:
         self.tbl_unit_quality.setRowCount(0)
@@ -1438,11 +1571,11 @@ class PostProcessingTab(QtWidgets.QWidget):
         for r, (k, v) in enumerate(entries):
             self.tbl_unit_quality.setItem(r, 0, QtWidgets.QTableWidgetItem(k))
             self.tbl_unit_quality.setItem(r, 1, QtWidgets.QTableWidgetItem(v))
-        self.tbl_unit_quality.resizeColumnsToContents()
+        # Stretch both columns to the inspector width; avoid horizontal scrolling.
     def _on_analysis_page_changed(self, idx: int) -> None:
         self.view_tabs.setCurrentIndex(idx)
         self._sync_settings_page(idx)
-        self._refresh_current_page()
+        self._schedule_refresh()
 
     def _refresh_current_page(self) -> None:
         """Re-render whichever analysis page is currently selected.
@@ -1453,6 +1586,8 @@ class PostProcessingTab(QtWidgets.QWidget):
         if self.dataset is None:
             return
         idx = self.analysis_tabs.currentIndex()
+        if self._busy and idx == 5:
+            return
         try:
             if idx == 0:
                 self._visualize_basic()
@@ -1475,7 +1610,7 @@ class PostProcessingTab(QtWidgets.QWidget):
 
     def _set_progress(self, value: int) -> None:
         self.page_progress.setValue(int(max(0, min(100, value))))
-        QtWidgets.QApplication.processEvents()
+        # Never process events here: reentrant loads could invalidate an active analysis.
 
     def _corr_items_from_selection(self) -> list[dict]:
         if self.dataset is None:
@@ -1560,111 +1695,104 @@ class PostProcessingTab(QtWidgets.QWidget):
         return [("correlogram.csv", pd.DataFrame(flat))]
 
     def _compute_psth(self) -> None:
+        """Snapshot conditions on the GUI thread, compute spike counts off-thread."""
+        if self.dataset is None or self._busy:
+            self._log("Load a dataset and wait for any current analysis to finish.")
+            return
         units = self._selected_units()
         if not units:
             self._log("PSTH compute: select one or more units first.")
             return
-        self._busy = True
-        self._log("Computing condition PSTH...")
-        self._set_progress(10)
+        conditions = []
         try:
-            condition_entries: List[dict] = []
-            t_ref = np.array([], dtype=float)
-            for r in range(self.tbl_conditions.rowCount()):
-                name = self._condition_name_for_row(r)
-                fpath = self._condition_path_for_row(r)
-                selected_label = self._condition_selected_label(r)
-                if not fpath:
+            for row in range(self.tbl_conditions.rowCount()):
+                path = self._condition_path_for_row(row)
+                if not path:
                     continue
-                p = Path(fpath)
-                if not p.exists():
-                    self._log(f"PSTH compute: missing CSV for row {r + 1}: {fpath}")
-                    continue
-                ev = self._load_event_csv(fpath, selected_label=selected_label)
-                if ev.size == 0:
-                    label_desc = f" [{selected_label}]" if selected_label else ""
-                    self._log(f"PSTH compute: no valid events in {p.name}{label_desc}.")
-                    continue
-                condition_unit_ids: List[int] = []
-                condition_trial_mats: List[np.ndarray] = []
-                for unit in units:
-                    t_ms, trial_mat = self.dataset.psth_trials(
-                        int(unit),
-                        ev,
-                        float(self.sp_psth_pre.value()),
-                        float(self.sp_psth_post.value()),
-                        float(self.sp_psth_bin.value()),
-                    )
-                    if t_ms.size == 0 or trial_mat.size == 0:
-                        continue
-                    if t_ref.size == 0:
-                        t_ref = np.asarray(t_ms, dtype=float)
-                    condition_unit_ids.append(int(unit))
-                    condition_trial_mats.append(np.asarray(trial_mat, dtype=float))
-                if t_ref.size == 0 or not condition_trial_mats:
-                    label_desc = f" [{selected_label}]" if selected_label else ""
-                    self._log(f"PSTH compute: unable to build PSTH for {name}{label_desc}.")
-                    continue
-                condition_entries.append(
-                    {
-                        "condition": str(name),
-                        "selected_label": str(selected_label),
-                        "source_csv": str(p),
-                        "unit_ids": list(condition_unit_ids),
-                        "unit_trial_mats": list(condition_trial_mats),
-                        "trial_count": int(ev.size),
-                    }
-                )
-            if not condition_entries or t_ref.size == 0:
-                self._log("PSTH compute: no valid conditions.")
-                self._set_progress(0)
+                label = self._condition_selected_label(row)
+                events = self._load_event_csv(path, selected_label=label)
+                if events.size:
+                    conditions.append({"condition": self._condition_name_for_row(row),
+                                       "source_csv": path, "selected_label": label, "events": events})
+            if not conditions:
+                self._log("Add an event CSV with valid timestamps before computing a PSTH.")
                 return
-            self.results["psth"] = {
-                "t_ms": np.asarray(t_ref, dtype=float),
-                "conditions": list(condition_entries),
-                "units": [int(u) for u in units],
-                "pre_s": float(self.sp_psth_pre.value()),
-                "post_s": float(self.sp_psth_post.value()),
-                "bin_ms": float(self.sp_psth_bin.value()),
-            }
-            self._set_progress(100)
-            self._log("Condition PSTH computed.")
+            self._start_analysis("psth", _compute_condition_payload, self.dataset, units, conditions,
+                                 float(self.sp_psth_pre.value()), float(self.sp_psth_post.value()),
+                                 float(self.sp_psth_bin.value()))
+        except Exception as exc:
+            self._log(f"PSTH input error: {exc}")
+
+    def _start_analysis(self, key, function, *args, **kwargs) -> None:
+        """Run numerical work through Qt's pool without nested event processing."""
+        from ..workers import FunctionWorker
+        self._busy = True
+        self._refresh_timer.stop()
+        # Numerical inputs are snapshotted for the worker. Freeze their visible
+        # controls too, so the completed figure cannot describe different inputs.
+        self._unit_inspector.setEnabled(False)
+        self.settings_stack.setEnabled(False)
+        self.btn_publication.setEnabled(False)
+        target_view = self.psth_view if key == "psth" else self.net_view
+        target_view.show_message("Computing analysis...\nYou can explore other pages while this finishes.")
+        self._analysis_worker_key = key
+        self.results.pop(key, None)
+        self._export_payloads.pop(key, None)
+        self.btn_psth_compute.setEnabled(False)
+        self.btn_net_compute.setEnabled(False)
+        self.btn_load.setEnabled(False)
+        self.page_progress.setRange(0, 0)
+        self._log(f"Computing {key} analysis in the background...")
+        worker = FunctionWorker(function, *args, **kwargs)
+        worker.signals.error.connect(self._log)
+        worker.signals.finished.connect(self._on_analysis_finished)
+        self._analysis_worker = worker
+        self.pool.start(worker)
+
+    @QtCore.Slot(dict)
+    def _on_analysis_finished(self, payload) -> None:
+        """Install a worker result and render only on the main GUI thread."""
+        key = self._analysis_worker_key
+        self._busy = False
+        self._analysis_worker = None
+        self._unit_inspector.setEnabled(True)
+        self.settings_stack.setEnabled(True)
+        self.btn_publication.setEnabled(True)
+        self.btn_psth_compute.setEnabled(True)
+        self.btn_net_compute.setEnabled(True)
+        self.btn_load.setEnabled(True)
+        self.page_progress.setRange(0, 100)
+        if not payload.get("ok"):
+            self._set_progress(0)
+            self._log(f"{key} analysis failed. See the analysis log for details.")
+            return
+        self.results[key] = payload["result"]
+        self._set_progress(100)
+        self._log(f"{key} analysis ready.")
+        if key == "psth" and self.analysis_tabs.currentIndex() == 3:
             self._show_psth()
-        finally:
-            self._busy = False
+        elif key == "network" and self.analysis_tabs.currentIndex() == 4:
+            self._show_network()
 
     def _show_psth(self) -> None:
         r = self.results.get("psth")
         if not r:
+            self.psth_view.show_message("Align spikes to behavior\n\nSelect units, add an event CSV in settings, and choose Compute.\nEvent timestamps must share the recording clock.")
             return
         self._visualize_condition_psth(r)
 
     def _compute_network(self) -> None:
+        """Compute population summaries off-thread; CCG crossings are exploratory."""
+        if self.dataset is None or self._busy:
+            self._log("Load a dataset and wait for any current analysis to finish.")
+            return
         units = self._selected_units()
         if len(units) < 2:
-            self._log("Network compute: select at least 2 units.")
+            self._log("Network compute: select at least two units.")
             self.net_view.show_message("Select at least two units to compute network metrics.")
             return
-        self._busy = True
-        self._log("Computing network analysis...")
-        self._set_progress(10)
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            self.results["network"] = self.dataset.network_analysis(
-                units,
-                bin_ms=float(self.sp_net_bin.value()),
-                conn_z=float(self.sp_net_z.value()),
-            )
-            self._set_progress(100)
-            n_sig = int(self.results["network"].get("n_significant", 0))
-            self._log(f"Network analysis computed ({len(units)} units, {n_sig} significant connections).")
-            self._show_network()
-        except Exception as exc:  # noqa: BLE001
-            self.net_view.show_message(f"Network analysis failed: {exc}")
-            self._log(f"Network compute error: {exc}")
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
-            self._busy = False
+        self._start_analysis("network", self.dataset.network_analysis, units,
+                             bin_ms=float(self.sp_net_bin.value()), conn_z=float(self.sp_net_z.value()))
 
     def _show_network(self) -> None:
         r = self.results.get("network")
@@ -2040,6 +2168,7 @@ class PostProcessingTab(QtWidgets.QWidget):
                 center_channel=focus_center,
                 overlay_units=overlay_units,
                 y_mode=y_mode,
+                downsample=int(self.sp_raw_ds.value()),
                 dark=(self._plot_theme == "Dark"),
             )
             self.raw_view.show_figure(fig)
@@ -2663,6 +2792,37 @@ class PostProcessingTab(QtWidgets.QWidget):
 
     def _log(self, msg: str) -> None:
         self.log.appendPlainText(str(msg))
+        self.lbl_status.setText(str(msg).splitlines()[0])
+        self.lbl_status.setToolTip(str(msg))
+
+    def _export_publication_bundle(self) -> None:
+        """Save the displayed figure together with available tables and provenance."""
+        index = self.analysis_tabs.currentIndex()
+        views = [self.basics_view, self.raw_view, self.corr_npyx, self.psth_view,
+                 self.net_view, None, self.c4_view]
+        if index == 7:
+            self._log("Use the population workspace's export button for its complete analysis bundle.")
+            return
+        view = views[index] if 0 <= index < len(views) else None
+        if view is None or view.figure is None:
+            self._log("Render a figure first. Advanced analyses provide their numerical tables in More actions.")
+            return
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Export publication figure and data")
+        if not folder:
+            return
+        keys = ["basic", "raw", "corr", "psth", "network", "npyx", "c4"]
+        key = keys[index]
+        from ..publication import export_figure_bundle
+        metadata = {"analysis": key, "recording": str(self.dataset.ks_folder) if self.dataset else None,
+                    "selected_units": self._selected_units(), "label_source": self.cb_good_source.currentText(),
+                    "screen_theme": self._plot_theme}
+        try:
+            paths = export_figure_bundle(view.figure, folder, key,
+                                         tables=self._export_payloads.get(key, []), metadata=metadata,
+                                         width_mm=self.cb_paper_width.currentData())
+            self._log(f"Exported {len(paths)} publication files to {folder}")
+        except Exception as exc:
+            self._log(f"Publication export failed: {exc}")
 
     def _export_plotted_data(self) -> None:
         """Write the current page's recorded plot data to CSV files in a folder."""
@@ -2706,6 +2866,9 @@ class PostProcessingTab(QtWidgets.QWidget):
         return {int(u) for u in self._all_units if self._unit_is_good(int(u))}
 
     def _export_units_file(self) -> None:
+        if self.is_busy():
+            self._log("Wait for the current analysis before exporting units.")
+            return
         if self.dataset is None:
             self._log("Unit export: load a dataset first.")
             return
@@ -2862,6 +3025,6 @@ class PostProcessingTab(QtWidgets.QWidget):
 
     def is_busy(self) -> bool:
         """Return True while a compute/export task is running on this tab."""
-        return bool(self._busy or self._c4_running or self._exporting_waveforms)
+        return bool(self._busy or self._c4_running or self._exporting_waveforms or self.population_widget.busy)
 
 

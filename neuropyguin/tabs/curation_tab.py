@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ast
 import json
@@ -11,13 +11,13 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from scipy import signal as sps
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from ..bombcell_core import sync_phy_cluster_group
 from ..ecephys_runtime import ecephys_subprocess_env
 from ..ks_output_resolver import find_kilosort_output_dir, find_metrics_file
+from ..flow_layout import FlowLayout
 from ..phy_integration import ensure_phy_short_isi_plugin
 from ..phy_launch import (
     PHY_ENV_OVERRIDES,
@@ -45,7 +45,6 @@ from ..pybombcell_integration import (
     save_pybombcell_labels,
     summarize_saved_pybombcell_results,
 )
-from ..side_nav import SideNavStack
 from ..workers import FunctionWorker
 
 
@@ -407,8 +406,8 @@ class CurationTab(QtWidgets.QWidget):
         self._max_line: Optional[pg.InfiniteLine] = None
         self._selected_unit_id: Optional[int] = None
         self._busy_count = 0
+        self._metrics_folder: Optional[Path] = None
         self._plots_detached = False
-        self._psd_metrics_cache: Dict[str, pd.DataFrame] = {}
         self._plots_dialog: Optional[QtWidgets.QDialog] = None
         self._body_split: Optional[QtWidgets.QSplitter] = None
         self._unit_split: Optional[QtWidgets.QSplitter] = None
@@ -424,6 +423,7 @@ class CurationTab(QtWidgets.QWidget):
         self.phy_process.readyReadStandardOutput.connect(self._on_phy_output)
         self.phy_process.errorOccurred.connect(self._on_phy_error)
         self.phy_process.started.connect(lambda: self._log("Phy process started."))
+        self.phy_process.stateChanged.connect(lambda _state: self._update_action_state())
         self.phy_process.finished.connect(self._on_phy_finished)
 
         self.watcher = QtCore.QFileSystemWatcher(self)
@@ -432,11 +432,30 @@ class CurationTab(QtWidgets.QWidget):
         self._build_ui()
         self._populate_threshold_table_from_pybombcell_settings(self._pybombcell_settings)
         self._restore_settings()
+        self.set_plot_preferences("Light", True)
+        self._refresh_report_plot({})
+        self._update_action_state()
 
     def _build_ui(self) -> None:
         main = QtWidgets.QVBoxLayout(self)
         main.setContentsMargins(18, 16, 18, 18)
         main.setSpacing(14)
+
+        # Keep dataset context available while the user reviews any QC page.
+        context_row = QtWidgets.QHBoxLayout()
+        self.lbl_context = QtWidgets.QLabel("Choose a sorted recording to begin")
+        self.lbl_context.setObjectName("FieldTitle")
+        self.lbl_context.setWordWrap(True)
+        self.btn_choose_dataset = QtWidgets.QPushButton("Add recording")
+        self.btn_choose_dataset.setProperty("role", "primary")
+        self.btn_choose_dataset.clicked.connect(self._add_ks_folder)
+        context_row.addWidget(self.lbl_context, 1)
+        context_row.addWidget(self.btn_choose_dataset)
+        main.addLayout(context_row)
+        self.lbl_qc_state = QtWidgets.QLabel("1. Add recording   2. Review quality   3. Save labels or refine in Phy")
+        self.lbl_qc_state.setObjectName("SectionHint")
+        self.lbl_qc_state.setWordWrap(True)
+        main.addWidget(self.lbl_qc_state)
 
         def _wrap_page(widget: QtWidgets.QWidget, *, stretch: bool = True) -> QtWidgets.QWidget:
             page = QtWidgets.QWidget()
@@ -446,9 +465,14 @@ class CurationTab(QtWidgets.QWidget):
             page_l.addWidget(widget, 1 if stretch else 0)
             if not stretch:
                 page_l.addStretch(1)
+                scroll = QtWidgets.QScrollArea()
+                scroll.setWidgetResizable(True)
+                scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+                scroll.setWidget(page)
+                return scroll
             return page
 
-        grp_phy = QtWidgets.QGroupBox("Phy")
+        grp_phy = QtWidgets.QGroupBox("Sorted recordings")
         grp_phy.setProperty("settingsSection", True)
         phy_layout = QtWidgets.QVBoxLayout(grp_phy)
         phy_layout.setSpacing(10)
@@ -465,19 +489,20 @@ class CurationTab(QtWidgets.QWidget):
         self.list_ks_folders = QtWidgets.QListWidget()
         self.list_ks_folders.setAlternatingRowColors(True)
         self.list_ks_folders.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.list_ks_folders.setMinimumHeight(420)
+        self.list_ks_folders.setMinimumHeight(180)
         self.list_ks_folders.setSpacing(6)
         self.list_ks_folders.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.list_ks_folders.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         phy_layout.addWidget(self.list_ks_folders, 1)
 
-        folder_actions = QtWidgets.QHBoxLayout()
+        folder_actions_host = QtWidgets.QWidget()
+        folder_actions = FlowLayout(folder_actions_host, h_spacing=8, v_spacing=6)
         self.btn_add_ks_folder = QtWidgets.QPushButton("Add folder")
         self.btn_remove_ks_folder = QtWidgets.QPushButton("Remove selected")
         self.btn_clear_ks_folders = QtWidgets.QPushButton("Clear list")
-        self.btn_run_selected_pybomb = QtWidgets.QPushButton("Run py_bombcell on selected runs")
+        self.btn_run_selected_pybomb = QtWidgets.QPushButton("Run Bombcell on selection")
         self.btn_split_sessions = QtWidgets.QPushButton("Split concat → sessions")
-        self.btn_open_selected_folder = QtWidgets.QPushButton("Open in Explorer")
+        self.btn_open_selected_folder = QtWidgets.QPushButton("Open folder")
         self.btn_open_figures = QtWidgets.QPushButton("Open py_bombcell figures")
         self.btn_open_bombcell_gui = QtWidgets.QPushButton("Open BombCell GUI")
         self.btn_add_ks_folder.setProperty("role", "secondary")
@@ -500,8 +525,7 @@ class CurationTab(QtWidgets.QWidget):
         folder_actions.addWidget(self.btn_clear_ks_folders)
         folder_actions.addWidget(self.btn_run_selected_pybomb)
         folder_actions.addWidget(self.btn_split_sessions)
-        folder_actions.addStretch(1)
-        phy_layout.addLayout(folder_actions)
+        phy_layout.addWidget(folder_actions_host)
 
         phy_row = QtWidgets.QHBoxLayout()
         phy_row.setSpacing(10)
@@ -511,21 +535,23 @@ class CurationTab(QtWidgets.QWidget):
         self.btn_stop_phy.setProperty("role", "ghost")
         phy_row.addWidget(QtWidgets.QLabel("Current folder"))
         phy_row.addWidget(self.ed_phy_folder, 1)
-        phy_row.addWidget(self.btn_open_selected_folder)
-        phy_row.addWidget(self.btn_open_figures)
-        phy_row.addWidget(self.btn_open_bombcell_gui)
-        phy_row.addWidget(self.btn_launch_phy)
-        phy_row.addWidget(self.btn_stop_phy)
         phy_layout.addLayout(phy_row)
+        phy_actions_host = QtWidgets.QWidget()
+        phy_actions = FlowLayout(phy_actions_host, h_spacing=8, v_spacing=6)
+        for button in (self.btn_launch_phy, self.btn_stop_phy, self.btn_open_selected_folder,
+                       self.btn_open_figures, self.btn_open_bombcell_gui):
+            phy_actions.addWidget(button)
+        phy_layout.addWidget(phy_actions_host)
 
         grp_bomb = QtWidgets.QGroupBox("Bombcell: live QC")
         grp_bomb.setProperty("settingsSection", True)
         bomb_layout = QtWidgets.QVBoxLayout(grp_bomb)
         bomb_layout.setSpacing(10)
 
-        bomb_top = QtWidgets.QHBoxLayout()
-        self.btn_load_metrics = QtWidgets.QPushButton("Load py_bombcell results")
-        self.btn_run_pybomb = QtWidgets.QPushButton("Run py_bombcell on active folder")
+        bomb_actions_host = QtWidgets.QWidget()
+        bomb_top = FlowLayout(bomb_actions_host, h_spacing=8, v_spacing=6)
+        self.btn_load_metrics = QtWidgets.QPushButton("Load saved results")
+        self.btn_run_pybomb = QtWidgets.QPushButton("Run Bombcell")
         self.btn_load_metrics.setProperty("role", "secondary")
         self.btn_run_pybomb.setProperty("role", "primary")
         self.ck_extract_raw = QtWidgets.QCheckBox("Extract raw waveforms (SNR)")
@@ -555,7 +581,7 @@ class CurationTab(QtWidgets.QWidget):
         self.tbl_thresh.setHorizontalHeaderLabels(["Category", "Metric", "Min", "Max", "Parameter"])
         self.tbl_thresh.horizontalHeader().setStretchLastSection(True)
         self.tbl_thresh.verticalHeader().setVisible(False)
-        self.tbl_thresh.setMinimumWidth(460)
+        self.tbl_thresh.setMinimumWidth(300)
 
         metric_row = QtWidgets.QHBoxLayout()
         list_col = QtWidgets.QWidget()
@@ -616,15 +642,23 @@ class CurationTab(QtWidgets.QWidget):
         metric_box_l.addWidget(list_col, 1)
 
         self.metrics_grid = pg.GraphicsLayoutWidget()
-        self.metrics_grid.setMinimumHeight(420)
+        self.metrics_grid.setMinimumHeight(240)
         plots_panel = QtWidgets.QWidget()
         plots_panel_l = QtWidgets.QVBoxLayout(plots_panel)
         plots_panel_l.setContentsMargins(0, 0, 0, 0)
         plots_panel_l.setSpacing(0)
+        self.lbl_metric_empty = QtWidgets.QLabel(
+            "Quality, at a glance\n\nLoad saved results, then select metrics to inspect their distributions.\n"
+            "Choose a unit to see how it compares with the population."
+        )
+        self.lbl_metric_empty.setObjectName("SectionHint")
+        self.lbl_metric_empty.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_metric_empty.setWordWrap(True)
+        plots_panel_l.addWidget(self.lbl_metric_empty, 1)
         plots_panel_l.addWidget(self.metrics_grid, 1)
 
-        self.btn_save_labels = QtWidgets.QPushButton("Save displayed labels")
-        self.btn_export = QtWidgets.QPushButton("Export plotted data")
+        self.btn_save_labels = QtWidgets.QPushButton("Save labels")
+        self.btn_export = QtWidgets.QPushButton("Export data")
         self.btn_detach_plots = QtWidgets.QPushButton("Detach plots")
         self.btn_detach_plots.setCheckable(True)
         self.btn_save_labels.setProperty("role", "primary")
@@ -635,7 +669,7 @@ class CurationTab(QtWidgets.QWidget):
         self.lbl_mua = QtWidgets.QLabel("mua: 0")
         self.lbl_non_soma = QtWidgets.QLabel("non_soma: 0")
         self.report_plot = pg.PlotWidget()
-        self.report_plot.setMinimumHeight(180)
+        self.report_plot.setMinimumHeight(120)
         self.report_plot.hideAxis("left")
         self.report_plot.showGrid(x=False, y=False)
         self.report_plot.setMouseEnabled(x=False, y=False)
@@ -645,8 +679,8 @@ class CurationTab(QtWidgets.QWidget):
             status_row.addWidget(w)
         status_row.addStretch(1)
 
-        action_row = QtWidgets.QHBoxLayout()
-        action_row.addStretch(1)
+        action_host = QtWidgets.QWidget()
+        action_row = FlowLayout(action_host, h_spacing=8, v_spacing=6)
         action_row.addWidget(self.btn_detach_plots)
         action_row.addWidget(self.btn_export)
         action_row.addWidget(self.btn_save_labels)
@@ -700,10 +734,10 @@ class CurationTab(QtWidgets.QWidget):
         review_hint.setWordWrap(True)
         review_box_l.addWidget(review_hint)
         review_box_l.addLayout(review_folder_row)
-        review_box_l.addLayout(bomb_top)
+        review_box_l.addWidget(bomb_actions_host)
         review_box_l.addLayout(status_row)
         review_box_l.addWidget(self.report_plot)
-        review_box_l.addLayout(action_row)
+        review_box_l.addWidget(action_host)
 
         units_box = QtWidgets.QGroupBox("Units")
         units_box.setProperty("settingsSection", True)
@@ -715,20 +749,20 @@ class CurationTab(QtWidgets.QWidget):
         units_box_l.addWidget(units_hint)
         units_box_l.addWidget(unit_split, 1)
 
-        bomb_subsections = SideNavStack(
-            vertical_labels=True,
-            compact_rail=True,
-        )
+        bomb_subsections = QtWidgets.QTabWidget()
+        bomb_subsections.setDocumentMode(True)
+        bomb_subsections.setUsesScrollButtons(True)
+        bomb_subsections.setStyleSheet("QTabBar::tab { min-width: 0px; padding: 8px 10px; }")
         self._bomb_subsections = bomb_subsections
-        bomb_subsections.add_page("Review", _wrap_page(review_box, stretch=False))
-        bomb_subsections.add_page("Units", _wrap_page(units_box, stretch=True))
-        bomb_subsections.add_page("Thresholds", _wrap_page(threshold_box, stretch=True))
-        bomb_subsections.add_page("Defaults", _wrap_page(defaults_box, stretch=True))
-        bomb_subsections.add_page("Metrics", _wrap_page(metric_box, stretch=True))
+        bomb_subsections.addTab(_wrap_page(review_box, stretch=False), "Review")
+        bomb_subsections.addTab(_wrap_page(units_box, stretch=True), "Units")
+        bomb_subsections.addTab(_wrap_page(threshold_box, stretch=True), "Limits")
+        bomb_subsections.addTab(_wrap_page(defaults_box, stretch=True), "Setup")
+        bomb_subsections.addTab(_wrap_page(metric_box, stretch=True), "Metrics")
         bomb_subsections.setCurrentIndex(0)
 
         left_panel = QtWidgets.QWidget()
-        left_panel.setMinimumWidth(380)
+        left_panel.setMinimumWidth(360)
         left_panel_l = QtWidgets.QVBoxLayout(left_panel)
         left_panel_l.setContentsMargins(0, 0, 0, 0)
         left_panel_l.setSpacing(0)
@@ -742,7 +776,7 @@ class CurationTab(QtWidgets.QWidget):
         plots_hint.setObjectName("SectionHint")
         plots_hint.setWordWrap(True)
         plots_box_l.addWidget(plots_hint)
-        plots_panel.setMinimumWidth(720)
+        plots_panel.setMinimumWidth(280)
         plots_box_l.addWidget(plots_panel, 1)
 
         self._right_metrics = plots_box
@@ -755,7 +789,7 @@ class CurationTab(QtWidgets.QWidget):
         body_split.addWidget(plots_box)
         body_split.setStretchFactor(0, 1)
         body_split.setStretchFactor(1, 1)
-        body_split.setSizes([860, 980])
+        body_split.setSizes([480, 720])
         bomb_layout.addWidget(body_split, 1)
 
         self.btn_copy_log = QtWidgets.QPushButton("Copy log")
@@ -772,6 +806,7 @@ class CurationTab(QtWidgets.QWidget):
         log_header.addWidget(self.btn_copy_log, 0)
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(10000)
         self.log.setProperty("logView", True)
         self.log.setPlaceholderText("Curation and Phy output will appear here.")
         self.log.setMinimumHeight(260)
@@ -779,16 +814,12 @@ class CurationTab(QtWidgets.QWidget):
         log_layout.addLayout(log_header)
         log_layout.addWidget(self.log, 1)
 
-        main_sections = SideNavStack(
-            "Sections",
-            "Switch between Phy launch, Bombcell review, and the curation log.",
-            vertical_labels=True,
-            compact_rail=True,
-        )
-        main_sections.add_page("Phy", _wrap_page(grp_phy, stretch=True))
-        main_sections.add_page("Bombcell", _wrap_page(grp_bomb, stretch=True))
-        main_sections.add_page("Log", _wrap_page(log_box, stretch=True))
-        main_sections.setCurrentIndex(1)
+        main_sections = QtWidgets.QTabWidget()
+        main_sections.setDocumentMode(True)
+        main_sections.addTab(_wrap_page(grp_phy, stretch=True), "Recordings + Phy")
+        main_sections.addTab(_wrap_page(grp_bomb, stretch=True), "Quality review")
+        main_sections.addTab(_wrap_page(log_box, stretch=True), "Activity")
+        main_sections.setCurrentIndex(0)
         self._main_sections = main_sections
         main.addWidget(main_sections, 1)
 
@@ -804,7 +835,7 @@ class CurationTab(QtWidgets.QWidget):
         self.btn_launch_phy.clicked.connect(self._launch_phy)
         self.btn_stop_phy.clicked.connect(self._stop_phy)
 
-        self.btn_load_metrics.clicked.connect(self._load_metrics)
+        self.btn_load_metrics.clicked.connect(lambda: self._load_metrics(allow_compute=False))
         self.btn_run_pybomb.clicked.connect(self._run_pybombcell)
         self.btn_reset_pybomb_defaults.clicked.connect(self._reset_pybombcell_defaults_table)
         self.btn_apply_pybomb_defaults.clicked.connect(self._apply_pybombcell_defaults)
@@ -965,7 +996,12 @@ class CurationTab(QtWidgets.QWidget):
             if folder == current:
                 target_row = row
         if self.list_ks_folders.count():
-            self.list_ks_folders.setCurrentRow(target_row if target_row >= 0 else 0)
+            self.list_ks_folders.setCurrentRow(
+                target_row if target_row >= 0 else 0,
+                QtCore.QItemSelectionModel.NoUpdate,
+            )
+            if not self.list_ks_folders.selectedItems():
+                self.list_ks_folders.currentItem().setSelected(True)
         else:
             self.ed_phy_folder.clear()
             self.ed_bomb_folder.clear()
@@ -984,8 +1020,12 @@ class CurationTab(QtWidgets.QWidget):
         candidate = Path(raw).expanduser()
         if candidate.is_file():
             candidate = candidate.parent
-        resolved = find_kilosort_output_dir(candidate, max_depth=4) or candidate
-        if not resolved.exists():
+        try:
+            resolved = find_kilosort_output_dir(candidate, max_depth=4) or candidate
+        except OSError as exc:
+            self._log(f"Cannot inspect recording folder: {exc}")
+            return None
+        if not resolved.is_dir():
             return None
         return str(resolved.resolve())
 
@@ -996,6 +1036,9 @@ class CurationTab(QtWidgets.QWidget):
         are skipped. With preserve_existing the current list is kept and new folders
         are appended. The list view is then refreshed and a folder is selected.
         """
+        if self._busy_count:
+            self._log("Wait for the active curation task before switching recordings.")
+            return
         base = list(self.ks_folders) if preserve_existing else []
         seen = {folder.lower() for folder in base}
         selected_folder: Optional[str] = None
@@ -1058,8 +1101,9 @@ class CurationTab(QtWidgets.QWidget):
             self._log("Select a Kilosort folder first.")
             return
         summary = self._folder_summary(folder)
-        plots_dir = Path(str(summary.get("plots_dir") or ""))
-        if not plots_dir.exists():
+        plots_text = str(summary.get("plots_dir") or "").strip()
+        plots_dir = Path(plots_text)
+        if not plots_text or not plots_dir.is_dir():
             self._log(f"No py_bombcell figures found for {folder}")
             return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(plots_dir)))
@@ -1151,6 +1195,7 @@ class CurationTab(QtWidgets.QWidget):
             self._main_sections.setCurrentIndex(0)
         self._busy_count += 1
         self.btn_split_sessions.setEnabled(False)
+        self._update_action_state()
         self._log(f"Splitting {len(concat_folders)} concatenated sort(s) into sessions...")
         event_roots: List[str] = []
         processed_root = str(self.settings.value("preproc/output_root", "") or "").strip()
@@ -1164,6 +1209,7 @@ class CurationTab(QtWidgets.QWidget):
     def _on_split_sessions_finished(self, result: Dict) -> None:
         self._busy_count = max(0, self._busy_count - 1)
         self.btn_split_sessions.setEnabled(True)
+        self._update_action_state()
         if not result.get("ok"):
             self._log("Session split failed.")
             return
@@ -1198,11 +1244,46 @@ class CurationTab(QtWidgets.QWidget):
 
     def _sync_selected_folder_fields(self, *, clear_metrics: bool) -> None:
         folder = self._selected_ks_folder()
+        previous = self.ed_bomb_folder.text().strip()
         self.ed_phy_folder.setText(folder or "")
         self.ed_bomb_folder.setText(folder or "")
         self._persist_folder_list()
-        if clear_metrics:
+        if previous != (folder or ""):
             self._clear_metrics_state()
+        self._update_action_state()
+
+    def _update_action_state(self) -> None:
+        """Make the next useful action explicit and prevent writes to stale datasets."""
+        if not hasattr(self, "btn_save_labels"):
+            return
+        folder = self.ed_bomb_folder.text().strip()
+        has_folder = bool(folder) and Path(folder).is_dir()
+        idle = self._busy_count == 0
+        loaded = has_folder and self._metrics_folder == Path(folder).resolve() and not self.metrics_df.empty
+        phy_running = self.phy_process.state() != QtCore.QProcess.NotRunning
+        self.lbl_context.setText(self._folder_run_name(folder) if has_folder else "Choose a sorted recording to begin")
+        self.lbl_context.setToolTip(folder)
+        if not has_folder:
+            message = "1. Add recording   2. Review quality   3. Save labels or refine in Phy"
+        elif not idle:
+            message = "Working on this recording. Progress and details are available in Activity."
+        elif loaded:
+            message = f"{len(self.metrics_df):,} units loaded | {self._preview_label_source or 'Review metric distributions'}"
+        else:
+            message = "Load saved results for a quick review, or run Bombcell to compute quality metrics."
+        self.lbl_qc_state.setText(message)
+        for button in (self.btn_load_metrics, self.btn_run_pybomb, self.btn_run_selected_pybomb,
+                       self.btn_open_selected_folder, self.btn_open_figures, self.btn_open_bombcell_gui,
+                       self.btn_split_sessions, self.btn_remove_ks_folder):
+            button.setEnabled(has_folder and idle)
+        for button in (self.btn_choose_dataset, self.btn_add_ks_folder, self.btn_clear_ks_folders):
+            button.setEnabled(idle)
+        self.list_ks_folders.setEnabled(idle)
+        self.btn_launch_phy.setEnabled(has_folder and idle and not phy_running)
+        self.btn_stop_phy.setEnabled(phy_running)
+        self.btn_save_labels.setEnabled(loaded and idle and not self.preview_labels.empty)
+        self.btn_export.setEnabled(loaded and idle)
+        self.btn_apply.setEnabled(loaded and idle)
 
     def _on_folder_selection_changed(self) -> None:
         self._sync_selected_folder_fields(clear_metrics=True)
@@ -1218,6 +1299,7 @@ class CurationTab(QtWidgets.QWidget):
 
     def _refresh_report_plot(self, counts: Dict[str, int]) -> None:
         self.report_plot.clear()
+        self.report_plot.setVisible(bool(counts))
         labels = ["good", "noise", "mua", "non_soma"]
         values = [int(counts.get(label, 0)) for label in labels]
         x = np.arange(len(labels), dtype=float)
@@ -1238,7 +1320,10 @@ class CurationTab(QtWidgets.QWidget):
     def _clear_metrics_state(self) -> None:
         self.metrics_df = pd.DataFrame()
         self.preview_labels = pd.DataFrame()
+        self._metrics_folder = None
         self._preview_label_source = ""
+        if self.watcher.files():
+            self.watcher.removePaths(self.watcher.files())
         self._selected_unit_id = None
         self.metrics_grid.clear()
         self._plot_lines.clear()
@@ -1255,6 +1340,7 @@ class CurationTab(QtWidgets.QWidget):
         self.lbl_selected_unit.setText("Selected unit: -")
         self.lbl_selected_label.setText("Label: -")
         self._refresh_report_plot({})
+        self._refresh_metric_plot()
 
     def _launch_phy(self) -> None:
         folder_text = self.ed_phy_folder.text().strip()
@@ -1500,8 +1586,12 @@ class CurationTab(QtWidgets.QWidget):
     def _load_metrics(self, allow_compute: bool = True) -> None:
         if hasattr(self, "_main_sections"):
             self._main_sections.setCurrentIndex(1)
-        folder = Path(self.ed_bomb_folder.text().strip())
-        if not folder.exists():
+        folder_text = self.ed_bomb_folder.text().strip()
+        if not folder_text:
+            self._log("Add a sorted recording first.")
+            return
+        folder = Path(folder_text)
+        if not folder.is_dir():
             self._log(f"Invalid folder: {folder}")
             return
         folder = self._resolve_folder(self.ed_bomb_folder)
@@ -1511,6 +1601,7 @@ class CurationTab(QtWidgets.QWidget):
                 self._log(f"metrics.csv not found in {folder}; computing quality metrics...")
                 self.btn_load_metrics.setEnabled(False)
                 self._busy_count += 1
+                self._update_action_state()
                 json_root = str(self.settings.value("preproc/json_root", str(Path.cwd() / "NeuroPyGuiN_json")))
                 worker = FunctionWorker(_recompute_quality_metrics, str(folder), json_root)
                 worker.signals.error.connect(self._log)
@@ -1520,22 +1611,24 @@ class CurationTab(QtWidgets.QWidget):
                 self._log(f"No metrics file found in {folder}")
             return
 
-        df = pd.read_csv(metrics_path)
+        try:
+            df = pd.read_csv(metrics_path)
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            self._log(f"Cannot read metrics: {exc}")
+            return
         if "cluster_id" in df.columns:
             df = df.set_index("cluster_id", drop=True)
         elif "unit_id" in df.columns:
             df = df.set_index("unit_id", drop=True)
         elif df.columns.size > 0 and str(df.columns[0]).lower().startswith("unnamed"):
             df = df.set_index(df.columns[0], drop=True)
-        try:
-            idx = pd.to_numeric(df.index, errors="coerce")
-            ok = ~pd.isna(idx)
-            if ok.any():
-                ok_mask = np.asarray(ok, dtype=bool)
-                df = df.iloc[ok_mask]
-                df.index = np.asarray(idx)[ok_mask].astype(int)
-        except Exception:
-            pass
+        # IDs must be whole, finite and unique; truncating fractional IDs can
+        # silently attach quality labels to a different neuron.
+        idx = np.asarray(pd.to_numeric(df.index, errors="coerce"), dtype=float)
+        if not np.all(np.isfinite(idx)) or not np.all(idx == np.floor(idx)):
+            self._log("Cannot load metrics: unit IDs must be finite integers.")
+            return
+        df.index = idx.astype(np.int64)
 
         manifest = load_pybombcell_manifest(folder)
         manifest_settings = manifest.get("settings") if isinstance(manifest, dict) else {}
@@ -1544,8 +1637,13 @@ class CurationTab(QtWidgets.QWidget):
             self._populate_pybomb_defaults_table(self._pybombcell_settings)
             self._populate_threshold_table_from_pybombcell_settings(self._pybombcell_settings)
 
-        df = self._augment_with_psd_metrics(df, folder)
+        # Quality review loads saved measurements only. Spike spectra belong in
+        # postprocessing with the recording's actual sample rate and bandwidth.
+        if not df.index.is_unique:
+            self._log("Cannot load metrics: duplicate unit IDs would make labels ambiguous.")
+            return
         self.metrics_df = df
+        self._metrics_folder = folder.resolve()
         if self._selected_unit_id is not None and self._selected_unit_id not in self.metrics_df.index:
             self._selected_unit_id = None
         source_name = "py_bombcell metrics" if "templates._bc_qMetrics.csv" in str(metrics_path) else "metrics.csv"
@@ -1572,109 +1670,6 @@ class CurationTab(QtWidgets.QWidget):
         else:
             self._recompute_preview()
 
-    def _augment_with_psd_metrics(self, df: pd.DataFrame, folder: Path) -> pd.DataFrame:
-        """Add per-unit PSD-derived metrics to loaded quality metrics."""
-        needed = {
-            "psd_peak_hz",
-            "psd_peak_power",
-            "psd_band_0_4",
-            "psd_band_4_12",
-            "psd_band_12_30",
-            "psd_band_30_80",
-        }
-        if needed.issubset(set(map(str, df.columns))):
-            return df
-
-        key = str(folder.resolve()).lower()
-        cached = self._psd_metrics_cache.get(key)
-        if cached is None:
-            cached = self._compute_psd_metrics(folder, list(map(int, df.index.tolist())))
-            self._psd_metrics_cache[key] = cached
-        if cached.empty:
-            return df
-        out = df.copy()
-        for col in cached.columns:
-            out[col] = cached[col]
-        return out
-
-    def _compute_psd_metrics(self, folder: Path, unit_ids: List[int]) -> pd.DataFrame:
-        """
-        Compute simple per-unit PSD descriptors from binned spike trains.
-        These columns are then available in metric histograms and unit inspector.
-        """
-        st_path = folder / "spike_times.npy"
-        sc_path = folder / "spike_clusters.npy"
-        if not st_path.exists() or not sc_path.exists():
-            return pd.DataFrame(index=pd.Index(unit_ids, name="cluster_id"))
-        try:
-            spike_times = np.load(st_path).ravel().astype(np.int64)
-            spike_clusters = np.load(sc_path).ravel().astype(np.int64)
-        except Exception as exc:
-            self._log(f"PSD metrics: failed to load spike arrays ({exc})")
-            return pd.DataFrame(index=pd.Index(unit_ids, name="cluster_id"))
-        if spike_times.size == 0 or spike_clusters.size == 0:
-            return pd.DataFrame(index=pd.Index(unit_ids, name="cluster_id"))
-
-        fs_raw = 30000.0
-        bin_s = 0.01  # 10 ms bins
-        fs_bin = 1.0 / bin_s
-        bin_samples = max(1, int(round(fs_raw * bin_s)))
-        n_bins = int(np.ceil((float(np.max(spike_times)) + 1.0) / float(bin_samples)))
-        n_bins = max(n_bins, 2)
-        nperseg = min(1024, n_bins)
-
-        def empty_psd_row() -> Dict[str, float]:
-            # Fresh all-NaN row used whenever a unit has too few spikes or the PSD
-            # cannot be computed. Returns a new dict each call (matches the inline
-            # literals it replaces), so callers can safely store it without sharing.
-            return {
-                "psd_peak_hz": np.nan,
-                "psd_peak_power": np.nan,
-                "psd_band_0_4": np.nan,
-                "psd_band_4_12": np.nan,
-                "psd_band_12_30": np.nan,
-                "psd_band_30_80": np.nan,
-            }
-
-        rows: Dict[int, Dict[str, float]] = {}
-        for u in unit_ids:
-            st_u = spike_times[spike_clusters == int(u)]
-            if st_u.size < 5:
-                rows[int(u)] = empty_psd_row()
-                continue
-            b = (st_u // bin_samples).astype(np.int64)
-            b = b[(b >= 0) & (b < n_bins)]
-            x = np.bincount(b, minlength=n_bins).astype(float)
-            try:
-                f, pxx = sps.welch(x, fs=fs_bin, nperseg=nperseg, detrend="constant", scaling="density")
-            except Exception:
-                rows[int(u)] = empty_psd_row()
-                continue
-            mpos = f > 0
-            if not np.any(mpos):
-                rows[int(u)] = empty_psd_row()
-                continue
-            fp = f[mpos]
-            pp = pxx[mpos]
-            ip = int(np.argmax(pp))
-            def band_power(lo: float, hi: float) -> float:
-                m = (fp >= lo) & (fp < hi)
-                if not np.any(m):
-                    return float("nan")
-                return float(np.trapz(pp[m], fp[m]))
-            rows[int(u)] = {
-                "psd_peak_hz": float(fp[ip]),
-                "psd_peak_power": float(pp[ip]),
-                "psd_band_0_4": band_power(0.0, 4.0),
-                "psd_band_4_12": band_power(4.0, 12.0),
-                "psd_band_12_30": band_power(12.0, 30.0),
-                "psd_band_30_80": band_power(30.0, 80.0),
-            }
-
-        psd_df = pd.DataFrame.from_dict(rows, orient="index")
-        psd_df.index.name = "cluster_id"
-        return psd_df
-
     def _set_pybombcell_buttons_enabled(self, enabled: bool) -> None:
         self.btn_load_metrics.setEnabled(enabled)
         self.btn_run_pybomb.setEnabled(enabled)
@@ -1682,12 +1677,17 @@ class CurationTab(QtWidgets.QWidget):
         self.btn_apply_pybomb_defaults.setEnabled(enabled)
         self.btn_reset_pybomb_defaults.setEnabled(enabled)
         self.btn_open_bombcell_gui.setEnabled(enabled)
+        self._update_action_state()
 
     def _run_pybombcell(self) -> None:
         if hasattr(self, "_main_sections"):
             self._main_sections.setCurrentIndex(1)
-        folder = Path(self.ed_bomb_folder.text().strip())
-        if not folder.exists():
+        folder_text = self.ed_bomb_folder.text().strip()
+        if not folder_text:
+            self._log("Add a sorted recording first.")
+            return
+        folder = Path(folder_text)
+        if not folder.is_dir():
             self._log(f"Invalid folder: {folder}")
             return
         if not self._apply_pybombcell_defaults(announce=False):
@@ -1781,6 +1781,7 @@ class CurationTab(QtWidgets.QWidget):
     def _on_compute_metrics_finished(self, result: Dict, folder: Path) -> None:
         self._busy_count = max(0, self._busy_count - 1)
         self.btn_load_metrics.setEnabled(True)
+        self._update_action_state()
         if result.get("ok"):
             msg = result.get("result", "")
             if msg:
@@ -1866,8 +1867,11 @@ class CurationTab(QtWidgets.QWidget):
         return [it.text().strip() for it in self.list_metrics.selectedItems() if it.text().strip()]
 
     def _select_all_metrics(self) -> None:
+        # Selecting N rows used to trigger N complete grid redraws.
+        blocker = QtCore.QSignalBlocker(self.list_metrics)
         for i in range(self.list_metrics.count()):
             self.list_metrics.item(i).setSelected(True)
+        del blocker
         self._refresh_metric_plot()
 
     def _clear_metrics_selection(self) -> None:
@@ -1894,10 +1898,11 @@ class CurationTab(QtWidgets.QWidget):
         self._metric_plots.clear()
         self._min_line = None
         self._max_line = None
-        if self.metrics_df.empty:
-            return
         metrics = [m for m in self._selected_metrics() if m in self.metrics_df.columns]
-        if not metrics:
+        has_metrics = not self.metrics_df.empty and bool(metrics)
+        self.lbl_metric_empty.setVisible(not has_metrics)
+        self.metrics_grid.setVisible(has_metrics)
+        if not has_metrics:
             return
         n = len(metrics)
         cols = int(math.ceil(math.sqrt(n)))
@@ -1916,7 +1921,8 @@ class CurationTab(QtWidgets.QWidget):
             plot.setLabel("left", "units")
             plot.setLabel("bottom", "value")
             conf = self._metric_threshold_conf(metric)
-            vals = pd.to_numeric(self.metrics_df[metric], errors="coerce").dropna().to_numpy(dtype=float)
+            vals = pd.to_numeric(self.metrics_df[metric], errors="coerce").to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
             if conf.get("abs", False):
                 vals = np.abs(vals)
             if vals.size == 0:
@@ -1924,7 +1930,7 @@ class CurationTab(QtWidgets.QWidget):
             n_bins = min(80, max(15, int(np.sqrt(vals.size))))
             hist, edges = np.histogram(vals, bins=n_bins)
             curve = pg.BarGraphItem(
-                x=edges[:-1],
+                x=(edges[:-1] + edges[1:]) / 2,
                 height=hist,
                 width=np.diff(edges),
                 brush=pg.intColor(i, hues=max(len(metrics), 6), alpha=90),
@@ -2060,6 +2066,7 @@ class CurationTab(QtWidgets.QWidget):
         self._fill_list(self.list_non_soma, self.preview_labels, "non_soma")
         self._refresh_unit_inspector()
         self._refresh_metric_plot()
+        self._update_action_state()
 
     def _recompute_preview(self) -> None:
         if self.metrics_df.empty:
@@ -2153,8 +2160,12 @@ class CurationTab(QtWidgets.QWidget):
         except Exception as exc:
             self._log(f"Invalid py_bombcell threshold setting: {exc}")
             return
+        if self._metrics_folder != Path(folder).resolve():
+            self._log("Load metrics for the active recording before saving labels.")
+            return
         self.btn_save_labels.setEnabled(False)
         self._busy_count += 1
+        self._update_action_state()
         worker = FunctionWorker(
             save_pybombcell_labels,
             folder,
@@ -2169,6 +2180,7 @@ class CurationTab(QtWidgets.QWidget):
     def _on_save_finished(self, result: Dict) -> None:
         self._busy_count = max(0, self._busy_count - 1)
         self.btn_save_labels.setEnabled(True)
+        self._update_action_state()
         if not result.get("ok"):
             self._log("Bombcell save failed.")
             return

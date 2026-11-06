@@ -1,4 +1,4 @@
-﻿"""Preprocessing tab for the NeuroPyGuiN GUI.
+"""Preprocessing tab for the NeuroPyGuiN GUI.
 
 Builds the queue-based SpikeGLX/Kilosort preprocessing UI: a drop-and-scan run
 queue, the per-step configuration form, optional multi-session concatenation,
@@ -739,6 +739,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self.completed_runs: List[Dict[str, object]] = []
         self._queue: List[Dict[str, str]] = []
         self._running = False
+        self._queue_cfg: EcephysPipelineConfig | None = None
         self._concatenating = False
         self._pending_concat_ni_extract: List[str] = []
         self._ks4_adv_params: Dict[str, object] = {}
@@ -1431,6 +1432,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         queue_hint.setWordWrap(True)
         self.lbl_queue_summary = QtWidgets.QLabel()
         self.lbl_queue_summary.setObjectName("QueueSummary")
+        self.lbl_queue_summary.setWordWrap(True)
         queue_layout.addWidget(queue_hint)
         queue_layout.addWidget(toolbar)
         queue_layout.addWidget(self.list_jobs, 1)
@@ -1492,6 +1494,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         log_header.addWidget(self.btn_copy_log, 0)
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(10000)
         self.log.setProperty("logView", True)
         self.log.setPlaceholderText("Pipeline output will appear here.")
         self.log.setMinimumHeight(220)
@@ -2357,7 +2360,7 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._refresh_output_preview()
         self._refresh_catgt_summary()
         self._update_concat_button_state()
-        self.act_clear_queue.setEnabled(bool(self.jobs or self._raw_run_catalog))
+        self.act_clear_queue.setEnabled(bool(self.jobs or self._raw_run_catalog) and not (self._running or self._concatenating))
         self.btn_run.setEnabled(bool(self.jobs) and not (self._running or self._concatenating))
         if not hasattr(self, "lbl_queue_summary"):
             return
@@ -2393,6 +2396,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._refresh_queue_summary()
 
     def _remove_selected(self) -> None:
+        if self._running or self._concatenating:
+            self._append_log("Wait for the active task before removing queued recordings.")
+            return
         selected_items = list(self.list_jobs.selectedItems())
         if not selected_items:
             return
@@ -2415,6 +2421,9 @@ class PreprocessingTab(QtWidgets.QWidget):
         self._refresh_queue_summary()
 
     def _clear(self) -> None:
+        if self._running or self._concatenating:
+            self._append_log("Wait for the active task before clearing the queue.")
+            return
         self.list_jobs.clear()
         self.jobs.clear()
         self._raw_run_catalog.clear()
@@ -3246,17 +3255,34 @@ class PreprocessingTab(QtWidgets.QWidget):
                 widget.set_failed()
 
     def _run_queue(self) -> None:
-        if self._running:
+        if self._running or self._concatenating:
             return
         if not self.jobs:
             self._append_log("No jobs in queue.")
             return
         if not self._confirm_shared_output_folder():
             return
+        # Snapshot the configuration once, so editing settings while a queue is
+        # running cannot silently change the methods used on later recordings.
+        try:
+            cfg = self._collect_cfg()
+        except (TypeError, ValueError) as exc:
+            self._append_log(f"Invalid pipeline settings: {exc}")
+            return
+        if not self._planned_step_definitions(cfg):
+            self._append_log("Select at least one pipeline step in Settings before running.")
+            self.work_sections.setCurrentIndex(self.settings_section_index)
+            return
+        if not cfg.output_root:
+            self._append_log("Choose an output folder in Settings before running.")
+            self.work_sections.setCurrentIndex(self.settings_section_index)
+            return
         self._persist_settings()
         self.settings.sync()
+        self._queue_cfg = cfg
+        self._append_log("Pipeline settings captured for this queue. Later edits apply to the next queue.")
 
-        self._queue = list(self.jobs)
+        self._queue = [dict(job) for job in self.jobs]
         self._running = True
         self.btn_run.setEnabled(False)
         self.progress.setValue(0)
@@ -3286,6 +3312,7 @@ class PreprocessingTab(QtWidgets.QWidget):
     def _run_next(self) -> None:
         if not self._queue:
             self._running = False
+            self._queue_cfg = None
             self.btn_run.setEnabled(True)
             self.progress.setValue(100)
             self._append_log("All jobs completed.")
@@ -3295,7 +3322,7 @@ class PreprocessingTab(QtWidgets.QWidget):
 
         job = self._queue.pop(0)
         self._refresh_queue_summary()
-        cfg = self._collect_cfg()
+        cfg = replace(self._queue_cfg) if self._queue_cfg is not None else self._collect_cfg()
         overrides = job.get("cfg_overrides")
         if isinstance(overrides, dict) and overrides:
             cfg = replace(cfg, **{k: v for k, v in overrides.items() if hasattr(cfg, k)})
@@ -3363,6 +3390,10 @@ class PreprocessingTab(QtWidgets.QWidget):
             target_row = self._upsert_completed_entry(entry)
             self.list_completed.setCurrentRow(target_row)
             self._persist_completed_history()
+            # A successful recording leaves the pending queue. Failed recordings
+            # remain available for correction and retry, without rerunning success.
+            completed_bin = self._normalized_path(str((active_context.get("job_snapshot") or {}).get("bin_file") or ""))
+            self.jobs = [job for job in self.jobs if self._normalized_path(str(job.get("bin_file") or "")) != completed_bin]
             self._refresh_job_list_view()
         self._active_run_context = None
         self._refresh_queue_summary()

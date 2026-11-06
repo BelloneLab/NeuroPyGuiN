@@ -29,6 +29,25 @@ project:
 
 > ### Preprocess and sort  ➜  Curate  ➜  Explore  ➜  Localize
 
+## Analysis workspace update
+
+Post Processing now includes a **Population** workspace for PCA, factor analysis,
+NEMBA representations, and continuous behavior decoding with held-out time
+blocks. Open a curated recording, choose units and an interval, then analyze.
+A behavior CSV can provide speed, position or another continuous variable on the
+same recording clock. [Setup, assumptions and exports](docs/POPULATION_ANALYSIS.md).
+
+Use **Ctrl+K** to find actions and analysis pages. The refreshed unit inspector,
+compact analysis navigation, collapsible settings and background PSTH/network
+jobs keep the figures central. **Export figure bundle** writes PDF, editable SVG,
+600 dpi PNG, available plotted data and settings, with 89/183 mm paper presets.
+Exported figures use white backgrounds independently of the application theme.
+
+Curation now separates **Recordings + Phy**, **Quality review** and **Activity**.
+It preserves batch selections and prevents old labels from following a recording
+switch. Preprocessing protects active queues and retains failed recordings for
+retry. [Audit findings, benchmarks and validation](docs/WORKSPACE_AUDIT.md).
+
 ## ✨ Take the tour
 
 ### 1. Preprocessing: build a queue, press go

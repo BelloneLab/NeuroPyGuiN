@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from tempfile import gettempdir
 
 from neuropyguin.preprocessing import (
     build_concat_run_name,
@@ -36,15 +37,27 @@ from neuropyguin.preprocessing import (
 )
 
 
+def _native_fixture_path(windows_path: str) -> str:
+    """Place synthetic layout examples under a native absolute fixture root.
+
+    The folder-layout helpers operate on local filesystem paths. The examples
+    originally used Windows drive letters even on Linux, where backslashes are
+    ordinary filename characters. Keep the original folder hierarchy and distinct
+    drives while exercising the host platform's real pathlib implementation.
+    """
+    source = PureWindowsPath(windows_path)
+    return str(Path(gettempdir(), "neuropyguin-layout-tests", source.drive.rstrip(":").lower(), *source.parts[1:]))
+
+
 def test_is_catgt_processed_bin_matches_tcat_and_catgt_names() -> None:
-    assert is_catgt_processed_bin(r"D:\data\run_tcat.imec0.ap.bin")
-    assert is_catgt_processed_bin(r"D:\data\catgt_run.imec1.ap.bin")
-    assert not is_catgt_processed_bin(r"D:\data\plain_run.imec0.ap.bin")
+    assert is_catgt_processed_bin(_native_fixture_path(r"D:\data\run_tcat.imec0.ap.bin"))
+    assert is_catgt_processed_bin(_native_fixture_path(r"D:\data\catgt_run.imec1.ap.bin"))
+    assert not is_catgt_processed_bin(_native_fixture_path(r"D:\data\plain_run.imec0.ap.bin"))
 
 
 def test_default_local_ks_output_dir_uses_bin_parent_and_probe() -> None:
-    bin_file = Path(r"B:\NPX\processedData\VTA_NPX\29538\2\spike_sorting\catgt_29538_2_trial1_g0\29538_2_trial1_g0_imec0\29538_2_trial1_g0_tcat.imec0.ap.bin")
-    expected = Path(r"B:\NPX\processedData\VTA_NPX\29538\2\spike_sorting\catgt_29538_2_trial1_g0\29538_2_trial1_g0_imec0\imec0_ks4")
+    bin_file = Path(_native_fixture_path(r"B:\NPX\processedData\VTA_NPX\29538\2\spike_sorting\catgt_29538_2_trial1_g0\29538_2_trial1_g0_imec0\29538_2_trial1_g0_tcat.imec0.ap.bin"))
+    expected = Path(_native_fixture_path(r"B:\NPX\processedData\VTA_NPX\29538\2\spike_sorting\catgt_29538_2_trial1_g0\29538_2_trial1_g0_imec0\imec0_ks4"))
     assert default_local_ks_output_dir(str(bin_file), "ks4", "0") == expected
 
 
@@ -54,66 +67,66 @@ def test_default_kilosort_output_name_uses_probe_when_available() -> None:
 
 
 def test_mirror_output_dir_mirrors_raw_input() -> None:
-    out = "B:/NPX/processedData"
+    out = _native_fixture_path("B:/NPX/processedData")
     run = "51543_object_mPFC_NAc_week1"
-    raw = f"B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/{run}_g0/{run}_g0_imec0/{run}_g0_t0.imec0.ap.bin"
+    raw = _native_fixture_path(f"B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/{run}_g0/{run}_g0_imec0/{run}_g0_t0.imec0.ap.bin")
     got = default_pipeline_output_dir(raw, out, run_name=run, mirror_raw_hierarchy=True)
-    assert got == Path(r"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\object\spike_sorting")
+    assert got == Path(_native_fixture_path(r"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\object\spike_sorting"))
 
 
 def test_mirror_output_dir_without_experiment_level() -> None:
     # The experiment folder is optional for some projects; the mirror keeps whatever
     # levels sit between rawData and the session, then appends spike_sorting.
-    out = "B:/NPX/processedData"
+    out = _native_fixture_path("B:/NPX/processedData")
     run = "subj_sessA"
-    raw = f"B:/NPX/rawData/ProjX/subj/sessA/{run}_g0/{run}_g0_imec0/{run}_g0_t0.imec0.ap.bin"
+    raw = _native_fixture_path(f"B:/NPX/rawData/ProjX/subj/sessA/{run}_g0/{run}_g0_imec0/{run}_g0_t0.imec0.ap.bin")
     got = default_pipeline_output_dir(raw, out, run_name=run, mirror_raw_hierarchy=True)
-    assert got == Path(r"B:\NPX\processedData\ProjX\subj\sessA\spike_sorting")
+    assert got == Path(_native_fixture_path(r"B:\NPX\processedData\ProjX\subj\sessA\spike_sorting"))
 
 
 def test_mirror_output_dir_handles_bin_already_under_output_root() -> None:
     # A concatenated bin we wrote into processedData has no 'rawData' token; it must
     # still mirror relative to the output root, not collapse to <output_root>/<run>.
-    out = "B:/NPX/processedData"
+    out = _native_fixture_path("B:/NPX/processedData")
     concat = (
-        "B:/NPX/processedData/mPFC-NAc/51543/mPFC_NAc_week1/object/"
-        "object_healthy_sick_g0/object_healthy_sick_g0_imec0/object_healthy_sick_g0_t0.imec0.ap.bin"
+        _native_fixture_path("B:/NPX/processedData/mPFC-NAc/51543/mPFC_NAc_week1/object/"
+        "object_healthy_sick_g0/object_healthy_sick_g0_imec0/object_healthy_sick_g0_t0.imec0.ap.bin")
     )
     got = default_pipeline_output_dir(concat, out, run_name="object_healthy_sick", mirror_raw_hierarchy=True)
-    assert got == Path(r"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\object\spike_sorting")
+    assert got == Path(_native_fixture_path(r"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\object\spike_sorting"))
 
 
 def test_mirror_output_dir_flat_fallback_when_unmappable() -> None:
-    out = "B:/NPX/processedData"
-    stray = "C:/somewhere/else/run_g0/run_g0_imec0/run_g0_t0.imec0.ap.bin"
+    out = _native_fixture_path("B:/NPX/processedData")
+    stray = _native_fixture_path("C:/somewhere/else/run_g0/run_g0_imec0/run_g0_t0.imec0.ap.bin")
     got = default_pipeline_output_dir(stray, out, run_name="run", mirror_raw_hierarchy=True)
-    assert got == Path(r"B:\NPX\processedData\run")
+    assert got == Path(_native_fixture_path(r"B:\NPX\processedData\run"))
 
 
 def test_mirrored_concat_base_dir_places_new_session_under_output_root() -> None:
-    out = "B:/NPX/processedData"
+    out = _native_fixture_path("B:/NPX/processedData")
     combined = "51543_object_healthy_sick_mPFC_NAc_week1"
-    first = "B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin"
+    first = _native_fixture_path("B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin")
     got = mirrored_concat_base_dir(first, out, combined, mirror_raw_hierarchy=True)
-    assert got == Path(rf"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\{combined}")
+    assert got == Path(_native_fixture_path(rf"B:\NPX\processedData\mPFC-NAc\51543\mPFC_NAc_week1\{combined}"))
 
 
 def test_concat_in_spike_sorting_round_trips_without_double_nesting() -> None:
     # The fused run lives inside <session>/spike_sorting/; sorting that bin later
     # must mirror back to the SAME spike_sorting folder, not spike_sorting/spike_sorting.
-    out = "B:/NPX/processedData"
+    out = _native_fixture_path("B:/NPX/processedData")
     combined = "object_healthy_sick"
-    first = "B:/NPX/rawData/mPFC-NAc/51556/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin"
+    first = _native_fixture_path("B:/NPX/rawData/mPFC-NAc/51556/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin")
     dest = mirrored_concat_base_dir(first, out, combined, mirror_raw_hierarchy=True) / "spike_sorting"
     fused = default_concat_run_layout(str(dest), combined, "0")["bin"]
     sort_dir = default_pipeline_output_dir(str(fused), out, run_name=combined, mirror_raw_hierarchy=True)
-    assert dest == Path(r"B:\NPX\processedData\mPFC-NAc\51556\mPFC_NAc_week1\object_healthy_sick\spike_sorting")
+    assert dest == Path(_native_fixture_path(r"B:\NPX\processedData\mPFC-NAc\51556\mPFC_NAc_week1\object_healthy_sick\spike_sorting"))
     assert sort_dir == dest
 
 
 def test_mirrored_concat_base_dir_legacy_when_mirror_off() -> None:
-    out = "B:/NPX/processedData"
-    first = Path("B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin")
+    out = _native_fixture_path("B:/NPX/processedData")
+    first = Path(_native_fixture_path("B:/NPX/rawData/mPFC-NAc/51543/mPFC_NAc_week1/object/a_g0/a_g0_imec0/a_g0_t0.imec0.ap.bin"))
     got = mirrored_concat_base_dir(first, out, "combined", mirror_raw_hierarchy=False)
     assert got == first.parents[2]
 
@@ -137,13 +150,13 @@ def test_discover_completed_runs_finds_mirrored_run_and_ignores_pipeline_json(tm
 
 def test_default_pipeline_output_dir_can_mirror_raw_hierarchy_into_spike_sorting() -> None:
     bin_file = Path(
-        r"B:\NPX\rawData\VTA_NPX\31096\test\31096_test_sync_test_1_g0\31096_test_sync_test_1_g0_imec0\31096_test_sync_test_1_g0_t0.imec0.ap.bin"
+        _native_fixture_path(r"B:\NPX\rawData\VTA_NPX\31096\test\31096_test_sync_test_1_g0\31096_test_sync_test_1_g0_imec0\31096_test_sync_test_1_g0_t0.imec0.ap.bin")
     )
-    expected = Path(r"B:\NPX\processedData\VTA_NPX\31096\test\spike_sorting")
+    expected = Path(_native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31096\test\spike_sorting"))
     assert (
         default_pipeline_output_dir(
             str(bin_file),
-            r"B:\NPX\processedData",
+            _native_fixture_path(r"B:\NPX\processedData"),
             run_name="31096_test_sync_test_1",
             mirror_raw_hierarchy=True,
         )
@@ -153,13 +166,13 @@ def test_default_pipeline_output_dir_can_mirror_raw_hierarchy_into_spike_sorting
 
 def test_default_pipeline_output_dir_can_mirror_numeric_session_hierarchy_into_spike_sorting() -> None:
     bin_file = Path(
-        r"B:\NPX\rawData\VTA_NPX\31098\1\31098_1_NPX_basal_g0\31098_1_NPX_basal_g0_imec0\31098_1_NPX_basal_g0_t0.imec0.ap.bin"
+        _native_fixture_path(r"B:\NPX\rawData\VTA_NPX\31098\1\31098_1_NPX_basal_g0\31098_1_NPX_basal_g0_imec0\31098_1_NPX_basal_g0_t0.imec0.ap.bin")
     )
-    expected = Path(r"B:\NPX\processedData\VTA_NPX\31098\1\spike_sorting")
+    expected = Path(_native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31098\1\spike_sorting"))
     assert (
         default_pipeline_output_dir(
             str(bin_file),
-            r"B:\NPX\processedData",
+            _native_fixture_path(r"B:\NPX\processedData"),
             run_name="31098_1_NPX_basal",
             mirror_raw_hierarchy=True,
         )
@@ -168,14 +181,14 @@ def test_default_pipeline_output_dir_can_mirror_numeric_session_hierarchy_into_s
 
 
 def test_default_pipeline_ks_output_dir_uses_root_for_raw_inputs() -> None:
-    bin_file = Path(r"B:\NPX\rawData\pups_NAc_NPX\vocal01\vocal01_g0_t0.imec0.ap.bin")
-    expected = Path(r"D:\sorting\vocal01\imec0_ks4")
+    bin_file = Path(_native_fixture_path(r"B:\NPX\rawData\pups_NAc_NPX\vocal01\vocal01_g0_t0.imec0.ap.bin"))
+    expected = Path(_native_fixture_path(r"D:\sorting\vocal01\imec0_ks4"))
     assert (
         default_pipeline_ks_output_dir(
             str(bin_file),
             "ks4",
             "0",
-            output_root=r"D:\sorting",
+            output_root=_native_fixture_path(r"D:\sorting"),
             run_name="vocal01",
         )
         == expected
@@ -184,17 +197,17 @@ def test_default_pipeline_ks_output_dir_uses_root_for_raw_inputs() -> None:
 
 def test_default_pipeline_ks_output_dir_can_mirror_raw_inputs_into_spike_sorting() -> None:
     bin_file = Path(
-        r"B:\NPX\rawData\VTA_NPX\31101\1\31101_1_NPX_basal_g0\31101_1_NPX_basal_g0_imec0\31101_1_NPX_basal_g0_t0.imec0.ap.bin"
+        _native_fixture_path(r"B:\NPX\rawData\VTA_NPX\31101\1\31101_1_NPX_basal_g0\31101_1_NPX_basal_g0_imec0\31101_1_NPX_basal_g0_t0.imec0.ap.bin")
     )
     expected = Path(
-        r"B:\NPX\processedData\VTA_NPX\31101\1\spike_sorting\imec0_ks4"
+        _native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31101\1\spike_sorting\imec0_ks4")
     )
     assert (
         default_pipeline_ks_output_dir(
             str(bin_file),
             "ks4",
             "0",
-            output_root=r"B:\NPX\processedData",
+            output_root=_native_fixture_path(r"B:\NPX\processedData"),
             run_name="31101_1_NPX_basal",
             mirror_raw_hierarchy=True,
         )
@@ -204,29 +217,29 @@ def test_default_pipeline_ks_output_dir_can_mirror_raw_inputs_into_spike_sorting
 
 def test_default_pipeline_raw_output_layout_keeps_root_and_ks_folder_in_same_mirrored_tree() -> None:
     bin_file = Path(
-        r"B:\NPX\rawData\VTA_NPX\31102\7\31102_7_NPX_omaze_g0\31102_7_NPX_omaze_g0_imec0\31102_7_NPX_omaze_g0_t0.imec0.ap.bin"
+        _native_fixture_path(r"B:\NPX\rawData\VTA_NPX\31102\7\31102_7_NPX_omaze_g0\31102_7_NPX_omaze_g0_imec0\31102_7_NPX_omaze_g0_t0.imec0.ap.bin")
     )
     extracted_root, ks_folder = default_pipeline_raw_output_layout(
         str(bin_file),
-        r"B:\NPX\processedData",
+        _native_fixture_path(r"B:\NPX\processedData"),
         "ks4",
         "0",
         run_name="31102_7_NPX_omaze",
         mirror_raw_hierarchy=True,
     )
-    assert extracted_root == Path(r"B:\NPX\processedData\VTA_NPX\31102\7\spike_sorting")
-    assert ks_folder == Path(r"B:\NPX\processedData\VTA_NPX\31102\7\spike_sorting\imec0_ks4")
+    assert extracted_root == Path(_native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31102\7\spike_sorting"))
+    assert ks_folder == Path(_native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31102\7\spike_sorting\imec0_ks4"))
 
 
 def test_default_pipeline_ks_output_dir_uses_processed_bin_parent_after_catgt() -> None:
-    bin_file = Path(r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0\vocal01_g0_imec0\vocal01_g0_tcat.imec0.ap.bin")
-    expected = Path(r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0\vocal01_g0_imec0\imec0_ks4")
+    bin_file = Path(_native_fixture_path(r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0\vocal01_g0_imec0\vocal01_g0_tcat.imec0.ap.bin"))
+    expected = Path(_native_fixture_path(r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0\vocal01_g0_imec0\imec0_ks4"))
     assert (
         default_pipeline_ks_output_dir(
             str(bin_file),
             "ks4",
             "0",
-            output_root=r"D:\sorting",
+            output_root=_native_fixture_path(r"D:\sorting"),
             run_name="vocal01",
             store_next_to_bin=True,
         )
@@ -236,7 +249,7 @@ def test_default_pipeline_ks_output_dir_uses_processed_bin_parent_after_catgt() 
 
 def test_parse_spikeglx_bin_name_supports_tcat_processed_files() -> None:
     parsed = parse_spikeglx_bin_name(
-        r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0\vocal01_g0_imec0\vocal01_g0_tcat.imec0.ap.bin"
+        _native_fixture_path(r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0\vocal01_g0_imec0\vocal01_g0_tcat.imec0.ap.bin")
     )
     assert parsed == {
         "run_name": "vocal01",
@@ -361,11 +374,11 @@ def test_merge_extractors_into_catgt_command_replaces_existing_extractor_tokens(
 
 def test_parse_catgt_processed_bin_context_returns_run_root_details() -> None:
     parsed = parse_catgt_processed_bin_context(
-        r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0\vocal01_g0_imec0\vocal01_g0_tcat.imec0.ap.bin"
+        _native_fixture_path(r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0\vocal01_g0_imec0\vocal01_g0_tcat.imec0.ap.bin")
     )
     assert parsed == {
-        "catgt_dest": r"B:\NPX\processedData\pups_NAc_NPX\vocal01",
-        "catgt_run_dir": r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0",
+        "catgt_dest": _native_fixture_path(r"B:\NPX\processedData\pups_NAc_NPX\vocal01"),
+        "catgt_run_dir": _native_fixture_path(r"B:\NPX\processedData\pups_NAc_NPX\vocal01\catgt_vocal01_g0"),
         "catgt_run_name": "catgt_vocal01",
         "source_run_name": "vocal01",
         "gate_string": "0",
@@ -376,13 +389,14 @@ def test_parse_catgt_processed_bin_context_returns_run_root_details() -> None:
 
 def test_parse_kilosort_params_dat_path_reads_dat_path_line(tmp_path: Path) -> None:
     params = tmp_path / "params.py"
-    params.write_text("sample_rate = 30000\ndat_path = 'B:/NPX/rawData/VTA_NPX/31098/2/run_g0/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n", encoding="utf-8")
-    assert parse_kilosort_params_dat_path(params) == r"B:\NPX\rawData\VTA_NPX\31098\2\run_g0\run_g0_imec0\run_g0_t0.imec0.ap.bin"
+    binary = _native_fixture_path("B:/NPX/rawData/VTA_NPX/31098/2/run_g0/run_g0_imec0/run_g0_t0.imec0.ap.bin")
+    params.write_text(f"sample_rate = 30000\ndat_path = {binary!r}\n", encoding="utf-8")
+    assert parse_kilosort_params_dat_path(params) == _native_fixture_path(r"B:\NPX\rawData\VTA_NPX\31098\2\run_g0\run_g0_imec0\run_g0_t0.imec0.ap.bin")
 
 
 def test_infer_completed_run_name_prefers_catgt_ancestor() -> None:
     ks_folder = Path(
-        r"B:\NPX\processedData\VTA_NPX\31098\2\spike_sorting\catgt_31098_2_NPX_object_social_food_g0\31098_2_NPX_object_social_food_g0_imec0\imec0_ks4"
+        _native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31098\2\spike_sorting\catgt_31098_2_NPX_object_social_food_g0\31098_2_NPX_object_social_food_g0_imec0\imec0_ks4")
     )
     assert infer_completed_run_name(ks_folder) == "31098_2_NPX_object_social_food"
 
@@ -401,12 +415,11 @@ def test_discover_completed_runs_finds_kilosort_outputs_under_processed_root(tmp
     )
     ks_folder.mkdir(parents=True)
     params_file = ks_folder / "params.py"
-    params_file.write_text(
-        "sample_rate = 30000\n"
-        "dat_path = 'B:/NPX/rawData/VTA_NPX/31098/2/31098_2_NPX_object_social_food_g0/"
-        "31098_2_NPX_object_social_food_g0_imec0/31098_2_NPX_object_social_food_g0_t0.imec0.ap.bin'\n",
-        encoding="utf-8",
+    binary = _native_fixture_path(
+        "B:/NPX/rawData/VTA_NPX/31098/2/31098_2_NPX_object_social_food_g0/"
+        "31098_2_NPX_object_social_food_g0_imec0/31098_2_NPX_object_social_food_g0_t0.imec0.ap.bin"
     )
+    params_file.write_text(f"sample_rate = 30000\ndat_path = {binary!r}\n", encoding="utf-8")
 
     entries = discover_completed_runs(processed_root)
 
@@ -414,8 +427,8 @@ def test_discover_completed_runs_finds_kilosort_outputs_under_processed_root(tmp
     assert entries[0]["run_name"] == "31098_2_NPX_object_social_food"
     assert entries[0]["ks_folder"] == str(ks_folder.resolve())
     assert entries[0]["bin_file"] == (
-        r"B:\NPX\rawData\VTA_NPX\31098\2\31098_2_NPX_object_social_food_g0"
-        r"\31098_2_NPX_object_social_food_g0_imec0\31098_2_NPX_object_social_food_g0_t0.imec0.ap.bin"
+        _native_fixture_path(r"B:\NPX\rawData\VTA_NPX\31098\2\31098_2_NPX_object_social_food_g0"
+        r"\31098_2_NPX_object_social_food_g0_imec0\31098_2_NPX_object_social_food_g0_t0.imec0.ap.bin")
     )
     assert entries[0]["params_file"] == str(params_file.resolve())
     assert entries[0]["source_root"] == str(processed_root.resolve())
@@ -424,19 +437,19 @@ def test_discover_completed_runs_finds_kilosort_outputs_under_processed_root(tmp
 def test_completed_run_target_folders_dedupes_and_skips_empty_entries() -> None:
     folders = completed_run_target_folders(
         [
-            {"ks_folder": r"D:\runs\imec0_ks4"},
+            {"ks_folder": _native_fixture_path(r"D:\runs\imec0_ks4")},
             {"ks_folder": ""},
-            {"ks_folder": r"d:\runs\imec0_ks4"},
-            {"ks_folder": r"D:\runs\imec1_ks4"},
+            {"ks_folder": _native_fixture_path(r"d:\runs\imec0_ks4")},
+            {"ks_folder": _native_fixture_path(r"D:\runs\imec1_ks4")},
         ]
     )
-    assert folders == [r"D:\runs\imec0_ks4", r"D:\runs\imec1_ks4"]
+    assert folders == [_native_fixture_path(r"D:\runs\imec0_ks4"), _native_fixture_path(r"D:\runs\imec1_ks4")]
 
 
 def test_resolve_labelled_output_context_falls_back_to_existing_catgt_context_for_raw_input() -> None:
     fallback = {
-        "catgt_dest": r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting",
-        "catgt_run_dir": r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0",
+        "catgt_dest": _native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting"),
+        "catgt_run_dir": _native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0"),
         "catgt_run_name": "catgt_31096_1_NPX_basal",
         "source_run_name": "31096_1_NPX_basal",
         "gate_string": "0",
@@ -444,8 +457,8 @@ def test_resolve_labelled_output_context_falls_back_to_existing_catgt_context_fo
         "probe_string": "0",
     }
     raw_bin = (
-        r"B:\NPX\rawData\VTA_NPX\31096\1\31096_1_NPX_basal_g0"
-        r"\31096_1_NPX_basal_g0_imec0\31096_1_NPX_basal_g0_t0.imec0.ap.bin"
+        _native_fixture_path(r"B:\NPX\rawData\VTA_NPX\31096\1\31096_1_NPX_basal_g0"
+        r"\31096_1_NPX_basal_g0_imec0\31096_1_NPX_basal_g0_t0.imec0.ap.bin")
     )
 
     assert resolve_labelled_output_context(raw_bin, fallback) == fallback
@@ -461,11 +474,11 @@ def test_resolve_labelled_output_context_prefers_parsed_catgt_bin_context() -> N
         "trigger_string": "cat",
         "probe_string": "9",
     }
-    catgt_bin = r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0\31096_1_NPX_basal_g0_imec0\31096_1_NPX_basal_g0_tcat.imec0.ap.bin"
+    catgt_bin = _native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0\31096_1_NPX_basal_g0_imec0\31096_1_NPX_basal_g0_tcat.imec0.ap.bin")
 
     assert resolve_labelled_output_context(catgt_bin, fallback) == {
-        "catgt_dest": r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting",
-        "catgt_run_dir": r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0",
+        "catgt_dest": _native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting"),
+        "catgt_run_dir": _native_fixture_path(r"B:\NPX\processedData\VTA_NPX\31096\1\spike_sorting\catgt_31096_1_NPX_basal_g0"),
         "catgt_run_name": "catgt_31096_1_NPX_basal",
         "source_run_name": "31096_1_NPX_basal",
         "gate_string": "0",
@@ -486,9 +499,9 @@ def test_build_concat_run_name_joins_runs_and_collapses_large_sets() -> None:
 
 
 def test_default_concat_run_layout_builds_spikeglx_standard_paths() -> None:
-    layout = default_concat_run_layout(r"D:\out", "concat_a__b", "0")
-    assert layout["bin"] == Path(r"D:\out\concat_a__b_g0\concat_a__b_g0_imec0\concat_a__b_g0_t0.imec0.ap.bin")
-    assert layout["meta"] == Path(r"D:\out\concat_a__b_g0\concat_a__b_g0_imec0\concat_a__b_g0_t0.imec0.ap.meta")
+    layout = default_concat_run_layout(_native_fixture_path(r"D:\out"), "concat_a__b", "0")
+    assert layout["bin"] == Path(_native_fixture_path(r"D:\out\concat_a__b_g0\concat_a__b_g0_imec0\concat_a__b_g0_t0.imec0.ap.bin"))
+    assert layout["meta"] == Path(_native_fixture_path(r"D:\out\concat_a__b_g0\concat_a__b_g0_imec0\concat_a__b_g0_t0.imec0.ap.meta"))
     # The fused file parses back to the combined run name like a normal recording.
     assert parse_spikeglx_bin_name(str(layout["bin"]))["run_name"] == "concat_a__b"
 

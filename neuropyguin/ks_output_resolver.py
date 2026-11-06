@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 import re
+import os
 from typing import Iterable
 
 
@@ -33,7 +34,10 @@ METRICS_RELATIVE_PATHS = ("metrics.csv", "bombcell/templates._bc_qMetrics.csv")
 
 def has_kilosort_output(path: Path) -> bool:
     """Return True if ``path`` is a directory holding every required Kilosort file."""
-    return path.exists() and path.is_dir() and all((path / name).exists() for name in KILOSORT_REQUIRED_FILES)
+    try:
+        return path.is_dir() and all((path / name).is_file() for name in KILOSORT_REQUIRED_FILES)
+    except OSError:
+        return False
 
 
 def _as_dir_candidate(path: str | Path) -> Path:
@@ -54,7 +58,7 @@ def _dedupe_paths(paths: Iterable[Path]) -> list[Path]:
     out: list[Path] = []
     seen: set[str] = set()
     for path in paths:
-        key = str(path).lower()
+        key = os.path.normcase(str(path))
         if key in seen:
             continue
         seen.add(key)
@@ -91,15 +95,18 @@ def _walk_dirs(root: Path, max_depth: int) -> Iterable[tuple[Path, int]]:
     seen: set[str] = set()
     while queue:
         node, depth = queue.popleft()
-        key = str(node).lower()
+        key = os.path.normcase(str(node))
         if key in seen:
             continue
         seen.add(key)
         yield node, depth
-        if depth >= max_depth or not node.exists() or not node.is_dir():
+        if depth >= max_depth:
             continue
         try:
-            children = sorted((child for child in node.iterdir() if child.is_dir()), key=lambda p: p.name.lower())
+            if not node.is_dir():
+                continue
+            # Do not follow directory symlinks into other recordings or cycles.
+            children = sorted((child for child in node.iterdir() if not child.is_symlink() and child.is_dir()), key=lambda p: p.name.lower())
         except OSError:
             continue
         for child in children:
@@ -180,7 +187,10 @@ def find_kilosort_output_dir(
     requested_tokens = _tokenize_path(requested)
     candidates: list[tuple[tuple[int, int, int, int, int], Path]] = []
     for root_index, root in enumerate(_iter_search_roots(requested, extra_roots)):
-        if not root.exists() or not root.is_dir():
+        try:
+            if not root.is_dir():
+                continue
+        except OSError:
             continue
         for node, depth in _walk_dirs(root, max_depth):
             if not has_kilosort_output(node):
@@ -196,6 +206,10 @@ def find_kilosort_output_dir(
                 len(str(node)),
             )
             candidates.append((score, node))
+        # Root index outranks all other scores: later ancestors cannot win.
+        # Stop here instead of scanning unrelated sessions after a valid match.
+        if candidates:
+            break
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0])

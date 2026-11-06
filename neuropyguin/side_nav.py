@@ -119,7 +119,15 @@ class SideNavStack(QtWidgets.QWidget):
         self.stack = QtWidgets.QStackedWidget()
         self.stack.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
-        root.addWidget(self.nav_frame, 0)
+        # A scrollable rail keeps every destination reachable on laptop screens.
+        rail_scroll = QtWidgets.QScrollArea()
+        rail_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        rail_scroll.setWidgetResizable(True)
+        rail_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        rail_scroll.setWidget(self.nav_frame)
+        rail_scroll.setMinimumWidth((58 if compact_rail else 72) if vertical_labels else 226)
+        rail_scroll.setMaximumWidth((76 if compact_rail else 90) if vertical_labels else 250)
+        root.addWidget(rail_scroll, 0)
         root.addWidget(self.stack, 1)
 
         self._buttons: list[QtWidgets.QPushButton] = []
@@ -165,12 +173,14 @@ class SideNavStack(QtWidgets.QWidget):
         """
         if index < 0 or index >= self.stack.count():
             return
+        changed = self.stack.currentIndex() != index
         self.stack.setCurrentIndex(index)
         for idx, button in enumerate(self._buttons):
             button.blockSignals(True)
             button.setChecked(idx == index)
             button.blockSignals(False)
-        self.currentChanged.emit(index)
+        if changed:
+            self.currentChanged.emit(index)
 
     def setCurrentWidget(self, widget: QtWidgets.QWidget) -> None:
         """Show the page matching ``widget`` (by its stack index)."""

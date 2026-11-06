@@ -27,7 +27,7 @@ import matplotlib
 matplotlib.use("Agg")  # figure creation only; we reparent into a Qt canvas
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT  # noqa: E402
+from .plot_toolbar import PaperNavigationToolbar  # noqa: E402
 
 from PySide6 import QtCore, QtWidgets  # noqa: E402
 
@@ -85,15 +85,17 @@ class NpyxFigureView(QtWidgets.QWidget):
         super().__init__(parent)
         self._layout = QtWidgets.QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(0)
+        self._layout.setSpacing(4)
         self._canvas: Optional[FigureCanvasQTAgg] = None
-        self._toolbar: Optional[NavigationToolbar2QT] = None
+        self._toolbar: Optional[PaperNavigationToolbar] = None
         self._placeholder = QtWidgets.QLabel(
-            "Select unit(s) to render the NeuroPyxels figure."
+            "Your analysis canvas\n\nLoad a curated recording and select a unit to begin.\nUse the analysis tabs to explore timing, behavior and population structure."
         )
         self._placeholder.setAlignment(QtCore.Qt.AlignCenter)
         self._placeholder.setWordWrap(True)
         self._placeholder.setObjectName("npyxPlaceholder")
+        self._placeholder.setMargin(28)
+        self._placeholder.setMinimumSize(240, 180)
         self._layout.addWidget(self._placeholder)
 
     def show_message(self, text: str) -> None:
@@ -105,10 +107,34 @@ class NpyxFigureView(QtWidgets.QWidget):
         self._clear()
         self._placeholder.setVisible(False)
         self._canvas = FigureCanvasQTAgg(fig)
-        self._toolbar = NavigationToolbar2QT(self._canvas, self)
+        self._toolbar = PaperNavigationToolbar(self._canvas, self)
+        self._toolbar.addSeparator()
+        export_action = self._toolbar.addAction("Publication bundle")
+        export_action.setToolTip("Export PDF, 600 dpi PNG, editable SVG and provenance on white paper")
+        export_action.triggered.connect(self.export_bundle)
         self._layout.addWidget(self._toolbar)
         self._layout.addWidget(self._canvas, 1)
         self._canvas.draw_idle()
+
+    @property
+    def figure(self):
+        """Expose the displayed Figure for reproducible exports."""
+        return self._canvas.figure if self._canvas is not None else None
+
+    def export_bundle(self) -> None:
+        """Export the current canvas in all publication formats at once."""
+        if self.figure is None:
+            return
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Export publication bundle")
+        if not folder:
+            return
+        from .publication import export_figure_bundle
+        try:
+            paths = export_figure_bundle(self.figure, folder)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Figure export failed", str(exc))
+            return
+        QtWidgets.QMessageBox.information(self, "Figure exported", f"Saved {len(paths)} files to {folder}")
 
     def _clear(self) -> None:
         if self._toolbar is not None:

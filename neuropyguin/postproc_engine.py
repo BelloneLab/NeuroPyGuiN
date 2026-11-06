@@ -8,11 +8,17 @@ threads. Per-dataset results are cached on disk under ``NeuroPyGuiN_cache``.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import numbers
 import re
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
+import os
+import tempfile
+import uuid
+from threading import RLock
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -154,11 +160,26 @@ def _parse_params_py(params_path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not params_path.exists():
         return out
-    txt = params_path.read_text(encoding="utf-8", errors="ignore")
-    for key in ["dat_path", "sample_rate", "n_channels_dat"]:
-        m = re.search(rf"^{key}\s*=\s*(.+)$", txt, flags=re.MULTILINE)
-        if m:
-            out[key] = m.group(1).strip().strip("'").strip('"')
+    # Parse only literal assignments: never execute a dataset's params.py.
+    try:
+        tree = ast.parse(params_path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return out
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if not isinstance(target, ast.Name) or target.id not in {"dat_path", "sample_rate", "n_channels_dat"}:
+                continue
+            try:
+                value = ast.literal_eval(statement.value)
+            except (ValueError, TypeError, SyntaxError):
+                continue
+            if target.id == "dat_path" and isinstance(value, (list, tuple)):
+                # A multi-file recording needs explicit concatenation metadata.
+                value = value[0] if len(value) == 1 else ""
+            out[target.id] = str(value)
+
     return out
 
 
@@ -166,6 +187,20 @@ def _hash_payload(payload: Dict) -> str:
     """Return a short, deterministic hash of a JSON-serializable cache key."""
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _psth_bin_edges(pre_s: float, post_s: float, bin_ms: float) -> np.ndarray:
+    """Cover the requested window exactly, including its shorter terminal bin."""
+    if not np.isfinite([pre_s, post_s, bin_ms]).all() or pre_s < 0 or post_s < 0 or pre_s + post_s <= 0 or bin_ms <= 0:
+        raise ValueError("PSTH needs non-negative pre/post windows and a positive finite bin size.")
+    width = max(float(bin_ms), 0.5) / 1000.0
+    count = int(np.ceil((pre_s + post_s) / width - 1e-10))
+    count = max(1, count)
+    if count > 1_000_000:
+        raise ValueError("PSTH exceeds one million bins. Increase bin size or reduce the window.")
+    edges = -float(pre_s) + np.arange(count + 1) * width
+    edges[-1] = float(post_s)
+    return edges
 
 
 @dataclass
@@ -189,25 +224,60 @@ class NeuropixelsDataset:
     templates: Optional[np.ndarray]
     spike_templates: Optional[np.ndarray]
 
+    _unit_cache: OrderedDict = field(default_factory=OrderedDict, init=False, repr=False)
+    _cache_lock: RLock = field(default_factory=RLock, init=False, repr=False)
+    _source_token: str = field(default_factory=lambda: uuid.uuid4().hex, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Normalize singleton arrays and reject incompatible spike vectors early."""
+        self.ks_folder = Path(self.ks_folder)
+        self.spike_times = np.asarray(self.spike_times).reshape(-1)
+        self.spike_clusters = np.asarray(self.spike_clusters).reshape(-1)
+        if self.spike_times.size != self.spike_clusters.size:
+            raise ValueError("Spike times and cluster assignments must have the same length.")
+        if not np.isfinite(self.sample_rate) or self.sample_rate <= 0:
+            raise ValueError("Sample rate must be positive and finite.")
+
     @property
     def cache_dir(self) -> Path:
-        """Return (creating if needed) the per-dataset on-disk cache directory."""
-        p = self.ks_folder / "NeuroPyGuiN_cache"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        """Return the cache path without writing into the recording during reads."""
+        return self.ks_folder / "NeuroPyGuiN_cache"
+
+    def _cache_path(self, name: str, payload: Dict) -> Path:
+        """Namespace caches by source snapshot, calibration and algorithm version."""
+        key = _hash_payload({"parameters": payload, "source": self._source_token,
+                             "version": 2, "fs": self.sample_rate,
+                             "channels": self.n_channels, "uV": self.bit_uV})
+        return self.cache_dir / f"{name}_{key}.npz"
 
     def _cache_get(self, name: str, payload: Dict) -> Optional[Dict[str, np.ndarray]]:
-        key = _hash_payload(payload)
-        fp = self.cache_dir / f"{name}_{key}.npz"
-        if not fp.exists():
+        """Treat unavailable or interrupted cache files as misses, closing handles."""
+        try:
+            with np.load(self._cache_path(name, payload), allow_pickle=False) as data:
+                return {k: data[k] for k in data.files}
+        except (OSError, ValueError, EOFError):
             return None
-        data = np.load(fp, allow_pickle=False)
-        return {k: data[k] for k in data.files}
+        except Exception as exc:
+            # zipfile.BadZipFile is not an OSError on all Python versions.
+            import zipfile
+            if isinstance(exc, zipfile.BadZipFile):
+                return None
+            raise
 
     def _cache_set(self, name: str, payload: Dict, arrays: Dict[str, np.ndarray]) -> None:
-        key = _hash_payload(payload)
-        fp = self.cache_dir / f"{name}_{key}.npz"
-        np.savez_compressed(fp, **arrays)
+        """Atomically publish optional caches; read-only recordings remain usable."""
+        temporary = None
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=self.cache_dir, suffix=".npz", delete=False) as handle:
+                temporary = Path(handle.name)
+                np.savez_compressed(handle, **arrays)
+            os.replace(temporary, self._cache_path(name, payload))
+        except OSError:
+            pass
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     @classmethod
     def load(cls, ks_folder: str) -> "NeuropixelsDataset":
@@ -220,19 +290,22 @@ class NeuropixelsDataset:
         if not root.exists():
             raise RuntimeError(f"Folder does not exist: {root}")
 
-        spk_t = np.load(root / "spike_times.npy", mmap_mode="r").squeeze()
-        spk_c = np.load(root / "spike_clusters.npy", mmap_mode="r").squeeze()
+        spk_t = np.load(root / "spike_times.npy", mmap_mode="r").reshape(-1)
+        spk_c = np.load(root / "spike_clusters.npy", mmap_mode="r").reshape(-1)
         units = np.unique(spk_c).astype(int)
 
         params = _parse_params_py(root / "params.py")
         dat_path = params.get("dat_path", "")
         ap_bin = Path(dat_path) if dat_path else None
+        if ap_bin is not None and not ap_bin.is_absolute():
+            ap_bin = root / ap_bin
         if ap_bin is not None and not ap_bin.exists():
             ap_bin = None
         if ap_bin is None:
             # Fallback: walk up and try to find matching ap.bin.
-            candidates = list(root.parent.rglob("*.ap.bin"))
-            ap_bin = candidates[0] if candidates else None
+            candidates = sorted(root.parent.glob("*.ap.bin"))
+            # Multiple sibling streams are ambiguous; never silently attach another probe.
+            ap_bin = candidates[0] if len(candidates) == 1 else None
 
         sample_rate = float(params.get("sample_rate", "30000")) if "sample_rate" in params else 30000.0
         n_channels = int(float(params.get("n_channels_dat", "385"))) if "n_channels_dat" in params else 385
@@ -252,7 +325,7 @@ class NeuropixelsDataset:
 
         channel_map = None
         if (root / "channel_map.npy").exists():
-            channel_map = np.load(root / "channel_map.npy").squeeze()
+            channel_map = np.load(root / "channel_map.npy").reshape(-1)
 
         channel_positions = None
         if (root / "channel_positions.npy").exists():
@@ -263,9 +336,9 @@ class NeuropixelsDataset:
         if (root / "templates.npy").exists():
             templates = np.load(root / "templates.npy", mmap_mode="r")
         if (root / "spike_templates.npy").exists():
-            spike_templates = np.load(root / "spike_templates.npy", mmap_mode="r").squeeze()
+            spike_templates = np.load(root / "spike_templates.npy", mmap_mode="r").reshape(-1)
 
-        return cls(
+        dataset = cls(
             ks_folder=root,
             sample_rate=sample_rate,
             n_channels=n_channels,
@@ -279,11 +352,39 @@ class NeuropixelsDataset:
             templates=np.asarray(templates) if templates is not None else None,
             spike_templates=np.asarray(spike_templates) if spike_templates is not None else None,
         )
+        # Capture identity at load time: reloading after Phy edits cannot reuse stale results.
+        sources = [root / name for name in (
+            "spike_times.npy", "spike_clusters.npy", "spike_templates.npy", "templates.npy",
+            "channel_map.npy", "channel_positions.npy", "params.py")]
+        if ap_bin is not None:
+            sources.extend([ap_bin, ap_bin.with_suffix(".meta")])
+        stamps = []
+        for source in sources:
+            if source.exists():
+                stat = source.stat()
+                stamps.append((str(source.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        dataset._source_token = _hash_payload({"files": stamps})
+        return dataset
 
     def unit_spike_times_s(self, unit: int) -> np.ndarray:
-        """Return the spike times of one unit, in seconds."""
-        m = self.spike_clusters == int(unit)
-        return self.spike_times[m].astype(float) / float(self.sample_rate)
+        """Return sorted seconds, with a bounded 32-unit/64 MiB read-only cache."""
+        unit = int(unit)
+        with self._cache_lock:
+            if unit in self._unit_cache:
+                self._unit_cache.move_to_end(unit)
+                return self._unit_cache[unit]
+        values = self.spike_times[self.spike_clusters == unit].astype(float) / float(self.sample_rate)
+        if not np.all(np.isfinite(values)) or np.any(values < 0):
+            raise ValueError("Spike times must be finite and non-negative.")
+        if np.any(np.diff(values) < 0):
+            values.sort()
+        values.setflags(write=False)
+        with self._cache_lock:
+            if values.nbytes <= 64 * 1024**2:
+                self._unit_cache[unit] = values
+                while len(self._unit_cache) > 32 or sum(v.nbytes for v in self._unit_cache.values()) > 64 * 1024**2:
+                    self._unit_cache.popitem(last=False)
+        return values
 
     def isi_hist(self, unit: int, max_ms: float, bins: int = 80) -> Tuple[np.ndarray, np.ndarray]:
         """Return (bin edges, counts) for a unit's inter-spike-interval histogram."""
@@ -327,19 +428,28 @@ class NeuropixelsDataset:
         bin_s = max(bin_ms, 0.1) / 1000.0
         win_s = max(win_ms, 1.0) / 1000.0
         edges = np.arange(-win_s, win_s + bin_s, bin_s)
-        all_dt: List[np.ndarray] = []
-        for t in t1:
-            dt = t2 - t
-            m = (dt >= -win_s) & (dt <= win_s)
-            if np.any(m):
-                all_dt.append(dt[m])
+        # Locate only spikes within the lag window. Memory is bounded by a
+        # small pair batch instead of constructing the full N_ref x N_target set.
         centers = 0.5 * (edges[:-1] + edges[1:]) * 1000.0
-        if not all_dt:
-            return centers, np.zeros_like(centers)
-        vals = np.concatenate(all_dt)
-        if remove_zero:
-            vals = vals[np.abs(vals) > 1e-12]
-        counts, _ = np.histogram(vals, bins=edges)
+        counts = np.zeros(centers.size, dtype=np.int64)
+        left = np.searchsorted(t2, t1 - win_s, side="left")
+        right = np.searchsorted(t2, t1 + win_s, side="right")
+        batch: List[np.ndarray] = []
+        n_pairs = 0
+        for t, lo, hi in zip(t1, left, right):
+            delta = t2[lo:hi] - t
+            # Retain exact old boundary semantics despite floating-point cancellation.
+            delta = delta[(delta >= -win_s) & (delta <= win_s)]
+            if remove_zero:
+                delta = delta[np.abs(delta) > 1e-12]
+            if delta.size:
+                batch.append(delta)
+                n_pairs += delta.size
+            if n_pairs >= 100_000:
+                counts += np.histogram(np.concatenate(batch), bins=edges)[0]
+                batch, n_pairs = [], 0
+        if batch:
+            counts += np.histogram(np.concatenate(batch), bins=edges)[0]
         out = counts.astype(float)
         if str(normalize).lower().startswith("hert"):
             n_ref = float(t1.size)
@@ -349,10 +459,11 @@ class NeuropixelsDataset:
         return centers, out
 
     def mean_template_waveform(self, unit: int) -> Optional[np.ndarray]:
-        """Return the unit's dominant Kilosort template (in microvolts), or None.
+        """Return the dominant template in legacy scaled template units, or None.
 
-        The template most frequently assigned to the unit's spikes is selected and
-        scaled by ``bit_uV``. Returns None when templates are unavailable.
+        Multiplication by ``bit_uV`` alone does not undo whitening or sorter
+        normalization; these values must not be labeled calibrated microvolts.
+        Use extracted raw waveforms when physical amplitudes are required.
         """
         if self.templates is None or self.spike_templates is None:
             return None
@@ -403,19 +514,21 @@ class NeuropixelsDataset:
             return np.array([]), np.zeros((0, 0), dtype=float)
 
         bin_s = max(bin_ms, 0.5) / 1000.0
-        edges = np.arange(-pre_s, post_s + bin_s, bin_s)
+        edges = _psth_bin_edges(pre_s, post_s, bin_ms)
         centers_ms = 1000.0 * (0.5 * (edges[:-1] + edges[1:]))
         trial_mat = np.zeros((ev.size, edges.size - 1), dtype=float)
         st = self.unit_spike_times_s(int(unit))
         if st.size == 0:
             return centers_ms, trial_mat
 
-        for row, e in enumerate(ev):
-            rel = st - e
-            m = (rel >= -pre_s) & (rel <= post_s)
-            if np.any(m):
-                h, _ = np.histogram(rel[m], bins=edges)
-                trial_mat[row] = h.astype(float) / bin_s
+        left = np.searchsorted(st, ev - pre_s, side="left")
+        right = np.searchsorted(st, ev + post_s, side="right")
+        for row, (e, lo, hi) in enumerate(zip(ev, left, right)):
+            rel = st[lo:hi] - e
+            rel = rel[(rel >= -pre_s) & (rel <= post_s)]
+            if rel.size:
+                h, _ = np.histogram(rel, bins=edges)
+                trial_mat[row] = h.astype(float) / np.diff(edges)
         return centers_ms, trial_mat
 
     def psth(self, units: Iterable[int], event_times_s: np.ndarray, pre_s: float, post_s: float, bin_ms: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -427,20 +540,21 @@ class NeuropixelsDataset:
             return np.array([]), np.array([])
 
         bin_s = max(bin_ms, 0.5) / 1000.0
-        edges = np.arange(-pre_s, post_s + bin_s, bin_s)
+        edges = _psth_bin_edges(pre_s, post_s, bin_ms)
         total = np.zeros(edges.size - 1, dtype=float)
         n_trials = int(len(units) * ev.size)
         for u in units:
             st = self.unit_spike_times_s(int(u))
-            for e in ev:
-                rel = st - e
-                m = (rel >= -pre_s) & (rel <= post_s)
-                if np.any(m):
-                    h, _ = np.histogram(rel[m], bins=edges)
-                    total += h
+            left = np.searchsorted(st, ev - pre_s, side="left")
+            right = np.searchsorted(st, ev + post_s, side="right")
+            for e, lo, hi in zip(ev, left, right):
+                rel = st[lo:hi] - e
+                rel = rel[(rel >= -pre_s) & (rel <= post_s)]
+                if rel.size:
+                    total += np.histogram(rel, bins=edges)[0]
         if n_trials == 0:
             return np.array([]), np.array([])
-        rate = total / (n_trials * bin_s)
+        rate = total / (n_trials * np.diff(edges))
         centers_ms = 1000.0 * (0.5 * (edges[:-1] + edges[1:]))
         return centers_ms, rate
 
@@ -710,6 +824,8 @@ class NeuropixelsDataset:
         bin_s = max(float(bin_ms), 1.0) / 1000.0
         edges = np.arange(0.0, t_end + bin_s, bin_s)
         nb = max(edges.size - 1, 1)
+        if n * nb > 20_000_000:
+            raise ValueError("Network matrix exceeds 20 million cells. Increase the bin width or select fewer units.")
         counts = np.zeros((n, nb), dtype=float)
         for i, uu in enumerate(u):
             st = self.unit_spike_times_s(uu)
@@ -786,7 +902,9 @@ class NeuropixelsDataset:
             "population_coupling": coupling[order],
             "depths_um": depths_sorted if np.any(np.isfinite(depths_sorted)) else None,
             "connections": connections,
-            "n_significant": n_sig,
+            "n_significant": n_sig,  # Legacy key; these are uncorrected heuristic crossings.
+            "n_threshold_crossings": n_sig,
+            "connection_method": "Exploratory CCG flank z-score; no inferential p-values or multiplicity correction",
         }
 
 

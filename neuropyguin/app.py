@@ -335,7 +335,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         app_icon = _load_app_icon()
         if not app_icon.isNull():
             self.setWindowIcon(app_icon)
-        self.setMinimumSize(1180, 760)
+        self.setMinimumSize(1000, 640)
         self._set_startup_geometry()
 
         thread_pool = QtCore.QThreadPool.globalInstance()
@@ -372,6 +372,7 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
 
         self._build_actions()
         self._build_menu_bar()
+        self._build_workspace_toolbar()
 
         self.pre_tab.openCurationRequested.connect(self._open_curation)
         self.pre_tab.openPostProcessingRequested.connect(self._open_postprocessing)
@@ -503,6 +504,52 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
         self.act_about = QtGui.QAction("About NeuroPyGuiN", self)
         self.act_about.triggered.connect(self._show_about)
 
+    def _build_workspace_toolbar(self) -> None:
+        """Expose global search and workflow context above the analytical workspace."""
+        bar = QtWidgets.QToolBar("Workspace", self)
+        bar.setObjectName("WorkspaceToolbar")
+        bar.setMovable(False)
+        brand = QtWidgets.QLabel("  NeuroPyGuiN")
+        brand.setObjectName("WorkspaceBrand")
+        bar.addWidget(brand)
+        context = QtWidgets.QLabel("   NEURAL DATA WORKSPACE")
+        context.setObjectName("WorkspaceEyebrow")
+        bar.addWidget(context)
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        bar.addWidget(spacer)
+        search = QtWidgets.QPushButton("Find an action   Ctrl+K")
+        search.setProperty("role", "secondary")
+        search.clicked.connect(self._open_command_palette)
+        bar.addWidget(search)
+        self.addToolBar(QtCore.Qt.TopToolBarArea, bar)
+        self.act_find_action = QtGui.QAction("Find an action...", self)
+        self.act_find_action.setShortcut("Ctrl+K")
+        self.act_find_action.triggered.connect(self._open_command_palette)
+        self.addAction(self.act_find_action)
+
+    def _open_command_palette(self) -> None:
+        """Build fresh entries so unavailable actions never appear actionable."""
+        from neuropyguin.command_palette import CommandPalette
+        entries = []
+        seen = set()
+        for action in self.findChildren(QtGui.QAction):
+            label = action.text().replace("&", "").strip()
+            if not label or label in seen or action.isSeparator() or action.menu() is not None:
+                continue
+            if action is self.act_find_action or not action.isEnabled() or not action.isVisible():
+                continue
+            seen.add(label)
+            entries.append((label, action.shortcut().toString() or "Command", action.trigger))
+        pages = self.post_tab.analysis_tabs
+        if isinstance(pages, QtWidgets.QTabWidget):
+            for index in range(pages.count()):
+                def open_page(i=index):
+                    self.tabs.setCurrentWidget(self.post_tab)
+                    pages.setCurrentIndex(i)
+                entries.append((pages.tabToolTip(index) or pages.tabText(index), "Postprocessing analysis", open_page))
+        CommandPalette(self, entries).exec()
+
     def _build_menu_bar(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         queue_menu = file_menu.addMenu("&Queue")
@@ -562,8 +609,8 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
             self.resize(1680, 1020)
             return
         avail = screen.availableGeometry()
-        w = max(1180, min(avail.width(), int(avail.width() * 0.99)))
-        h = max(760, min(avail.height(), int(avail.height() * 0.97)))
+        w = min(avail.width(), max(1000, int(avail.width() * 0.96)))
+        h = min(avail.height(), max(640, int(avail.height() * 0.94)))
         self.resize(w, h)
 
     def _restore_initial_tab(self) -> None:
@@ -1030,6 +1077,9 @@ class NeuroPyGuiNMainWindow(QtWidgets.QMainWindow):
             self.busy_timer.stop()
         except Exception:
             pass
+        population = getattr(self.post_tab, "population_widget", None)
+        if population is not None:
+            population.shutdown()
         self._terminate_qprocess(getattr(self.cur_tab, "phy_process", None))
         for pool in (
             QtCore.QThreadPool.globalInstance(),

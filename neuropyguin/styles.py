@@ -94,9 +94,13 @@ _DARK_THEME = {
 _APP_QSS_TEMPLATE = """
 QWidget {
     color: %(text)s;
-    font-family: "Segoe UI";
+    font-family: "Inter", "Segoe UI", "DejaVu Sans";
     font-size: 14px;
 }
+QLabel#WorkspaceBrand { font-size: 20px; font-weight: 800; color: %(text_heading)s; }
+QLabel#WorkspaceTitle { font-size: 23px; font-weight: 700; color: %(text_heading)s; }
+QLabel#WorkspaceEyebrow { font-size: 11px; font-weight: 600; color: %(text_muted)s; }
+QPushButton:focus { border: 2px solid %(border_focus)s; }
 QMainWindow, QDialog {
     background: %(window_bg)s;
 }
@@ -139,7 +143,7 @@ QToolBar QLabel {
 }
 QTabWidget::pane {
     border: 1px solid %(border)s;
-    border-radius: 18px;
+    border-radius: 8px;
     background: %(window_elevated)s;
     top: -2px;
 }
@@ -165,7 +169,7 @@ QTabBar::tab:selected {
 }
 QGroupBox {
     border: 1px solid %(border)s;
-    border-radius: 18px;
+    border-radius: 8px;
     margin-top: 16px;
     padding: 18px 18px 16px 18px;
     background: %(surface)s;
@@ -199,7 +203,7 @@ QPushButton {
     background: %(surface_alt)s;
     color: %(text_heading)s;
     border: 1px solid %(border)s;
-    border-radius: 12px;
+    border-radius: 8px;
     padding: 9px 15px;
     font-weight: 600;
     min-height: 20px;
@@ -259,7 +263,7 @@ QPushButton[role="ghost"]:hover {
 QFrame[navRail="true"] {
     background: %(surface)s;
     border: 1px solid %(border_soft)s;
-    border-radius: 18px;
+    border-radius: 8px;
 }
 QFrame[navRail="true"][compactRail="true"] {
     border-radius: 16px;
@@ -267,7 +271,7 @@ QFrame[navRail="true"][compactRail="true"] {
 QPushButton[navButton="true"] {
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 12px;
+    border-radius: 8px;
     color: %(text_soft)s;
     font-weight: 600;
     min-height: 34px;
@@ -291,13 +295,13 @@ QPushButton[navButton="true"]:checked {
 }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QListWidget, QTableWidget {
     border: 1px solid %(border_soft)s;
-    border-radius: 12px;
+    border-radius: 8px;
     background: %(surface_raised)s;
     color: %(text)s;
     selection-background-color: %(selection_bg)s;
     selection-color: %(selection_text)s;
-    padding: 7px 11px;
-    min-height: 34px;
+    padding: 5px 9px;
+    min-height: 26px;
 }
 QLineEdit:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover, QPlainTextEdit:hover, QListWidget:hover, QTableWidget:hover {
     border-color: %(border)s;
@@ -311,6 +315,21 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
 }
 QComboBox {
     padding-right: 28px;
+}
+QSpinBox, QDoubleSpinBox { padding-right: 26px; }
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border; subcontrol-position: top right;
+    width: 22px; border: none; background: transparent;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border; subcontrol-position: bottom right;
+    width: 22px; border: none; background: transparent;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url(%(spin_up_arrow)s); width: 10px; height: 10px;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url(%(combo_arrow)s); width: 10px; height: 10px;
 }
 QComboBox::drop-down {
     subcontrol-origin: padding;
@@ -460,7 +479,7 @@ QWidget[compactDialog="true"] QLabel#SectionHint {
 QDialog#CatGTSetupDialog QGroupBox {
     padding: 0px;
     margin-top: 12px;
-    border-radius: 12px;
+    border-radius: 8px;
 }
 QDialog#CatGTSetupDialog QSpinBox,
 QDialog#CatGTSetupDialog QDoubleSpinBox {
@@ -616,7 +635,7 @@ QMenu {
     background: %(window_elevated)s;
     color: %(text)s;
     border: 1px solid %(border)s;
-    border-radius: 12px;
+    border-radius: 8px;
     padding: 6px;
 }
 QMenu::item {
@@ -642,7 +661,7 @@ QPlainTextEdit[logView="true"] {
 QWidget[stepStatusCard="true"] {
     background: %(surface_muted)s;
     border: 1px solid %(border)s;
-    border-radius: 18px;
+    border-radius: 8px;
 }
 QWidget[stepStatusItem="true"] {
     background: %(surface_raised)s;

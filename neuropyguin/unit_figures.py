@@ -142,10 +142,16 @@ def _nice_round(value: float) -> float:
 # --------------------------------------------------------------------------- #
 
 def _session_duration_s(dataset) -> float:
+    # Prefer the acquisition length, including silent tails, when available.
+    ap = getattr(dataset, "ap_bin_path", None)
+    if ap is not None and Path(ap).exists():
+        n_channels = int(dataset.n_channels)
+        if n_channels > 0:
+            return max(Path(ap).stat().st_size / (2 * n_channels * float(dataset.sample_rate)), 1e-6)
     st = np.asarray(dataset.spike_times)
     if st.size == 0:
         return 1.0
-    return float(st.max()) / float(dataset.sample_rate)
+    return max((float(st.max()) + 1) / float(dataset.sample_rate), 1e-6)
 
 
 def _peak_channel(dataset, unit: int) -> Tuple[Optional[int], Optional[int]]:
@@ -171,7 +177,7 @@ def _unit_amplitudes(dataset, unit: int) -> Tuple[np.ndarray, np.ndarray]:
     if not amp_path.exists():
         return t, np.array([])
     try:
-        amp = np.load(amp_path, mmap_mode="r").squeeze()
+        amp = np.load(amp_path, mmap_mode="r").reshape(-1)
     except Exception:
         return t, np.array([])
     if amp.shape[0] != sc.shape[0]:
@@ -190,6 +196,37 @@ def _refractory_violation_pct(t_s: np.ndarray, refractory_ms: float = 2.0) -> fl
 
 def _extract_spike_waveforms(dataset, unit: int, channel_indices: np.ndarray, *,
                              half_ms: float = 1.3, max_spikes: int = 300):
+    """Cache bounded raw waveform summaries across interactive figure redraws.
+
+    The cache is attached to a dataset instance, retains at most 24 summaries,
+    and includes raw file modification time plus acquisition calibration. The
+    returned arrays are treated as immutable by all figure drawers.
+    """
+    path = getattr(dataset, "ap_bin_path", None)
+    if path is None or not Path(path).exists():
+        return None, None, None, 0
+    stat = Path(path).stat()
+    mapping = tuple(np.asarray(getattr(dataset, "channel_map", None)).reshape(-1))
+    key = (int(unit), tuple(map(int, channel_indices)), float(half_ms), int(max_spikes),
+           str(path), stat.st_mtime_ns, stat.st_size, float(dataset.sample_rate),
+           float(dataset.bit_uV), int(dataset.n_channels), mapping)
+    cache = getattr(dataset, "_figure_waveform_cache", None)
+    if cache is None:
+        cache = {}
+        dataset._figure_waveform_cache = cache
+    if key in cache:
+        value = cache.pop(key)
+        cache[key] = value
+        return value
+    value = _read_spike_waveforms(dataset, unit, channel_indices, half_ms=half_ms, max_spikes=max_spikes)
+    if len(cache) >= 24:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+    return value
+
+
+def _read_spike_waveforms(dataset, unit: int, channel_indices: np.ndarray, *,
+                             half_ms: float = 1.3, max_spikes: int = 300):
     """Extract real spike snippets from the AP binary for ``channel_indices``.
 
     Reads a +/- ``half_ms`` window around up to ``max_spikes`` randomly sampled
@@ -199,8 +236,8 @@ def _extract_spike_waveforms(dataset, unit: int, channel_indices: np.ndarray, *,
     ``sem`` have shape ``(n_window_samples, len(channel_indices))``, or
     ``(None, None, None, 0)`` when the binary is unavailable / unreadable.
 
-    ``channel_indices`` are file-channel indices (0..n_channels-1), i.e. the
-    template/channel-map indices used everywhere else in this module.
+    ``channel_indices`` are template columns; ``channel_map`` translates them
+    into raw file channel IDs before reading any voltage samples.
     """
     ap = getattr(dataset, "ap_bin_path", None)
     if ap is None or not Path(ap).exists():
@@ -209,8 +246,17 @@ def _extract_spike_waveforms(dataset, unit: int, channel_indices: np.ndarray, *,
     if ch.size == 0:
         return None, None, None, 0
 
+    # Template columns are not necessarily raw file channel IDs.
+    channel_map = getattr(dataset, "channel_map", None)
+    if channel_map is not None:
+        mapping = np.asarray(channel_map).reshape(-1)
+        if np.any(ch < 0) or np.any(ch >= mapping.size):
+            return None, None, None, 0
+        ch = mapping[ch].astype(np.int64)
     fs = float(dataset.sample_rate)
     n_ch_file = int(dataset.n_channels)
+    if np.any(ch < 0) or np.any(ch >= n_ch_file):
+        return None, None, None, 0
     half = int(round(half_ms * 1e-3 * fs))
     win = 2 * half + 1
 
@@ -325,6 +371,12 @@ def _draw_waveform_geometry(ax, dataset, units, theme: _Theme, *, n_neighbors=11
     for k, u in enumerate(units[1:], start=1):
         wk = dataset.mean_template_waveform(int(u))
         if wk is not None and wk.shape == w0.shape:
+            if have_band:
+                _, raw_mean, _, _ = _extract_spike_waveforms(dataset, int(u), sel)
+                if raw_mean is None:
+                    continue  # Never mix arbitrary template scale with microvolts.
+                wk = np.zeros((raw_mean.shape[0], w0.shape[1]))
+                wk[:, sel] = raw_mean
             overlay_waveforms.append((int(u), wk, overlay_colors[k % len(overlay_colors)]))
     n_tmpl = w0.shape[0]
     t_tmpl_ms = (np.arange(n_tmpl) - n_tmpl // 2) / fs * 1000.0
@@ -357,7 +409,8 @@ def _draw_waveform_geometry(ax, dataset, units, theme: _Theme, *, n_neighbors=11
                     zorder=5 if is_peak else 4)
         # Overlay units (template lines only).
         for (u, wk, col) in overlay_waveforms:
-            ax.plot(cx + t_tmpl_ms * x_scale, cy + wk[:, ci] * y_scale,
+            overlay_time = t_ms if have_band else t_tmpl_ms
+            ax.plot(cx + overlay_time * x_scale, cy + wk[:, ci] * y_scale,
                     color=col, lw=0.9, alpha=0.7, solid_capstyle="round",
                     zorder=3, clip_on=True)
 
@@ -367,7 +420,7 @@ def _draw_waveform_geometry(ax, dataset, units, theme: _Theme, *, n_neighbors=11
     sb_t = _nice_round(0.4 * t_span)
     sb_uv = _nice_round(0.5 * peak_amp)
     _scalebar(ax, theme, x_lo, y_lo, sb_t * x_scale, sb_uv * y_scale,
-              f"{sb_t:g} ms", f"{sb_uv:g} uV")
+              f"{sb_t:g} ms", f"{sb_uv:g} {'uV' if have_band else 'a.u.'}")
 
     ax.set_xlim(cp[sel, 0].min() - dx_pitch * 0.9,
                 cp[sel, 0].max() + dx_pitch * 0.7)
@@ -381,7 +434,7 @@ def _draw_waveform_geometry(ax, dataset, units, theme: _Theme, *, n_neighbors=11
     if have_band:
         sub = f"{n_used} spk, mean+/-SEM"
     else:
-        sub = "template, no SEM"
+        sub = "template (arbitrary units), no SEM"
     title = f"Waveform - ch {peak_ch}"
     ax.set_title(title, color=theme.fg, fontsize=8.5, pad=15, loc="left")
     # Place the SEM/template note as a small left-aligned sub-line under the title.
@@ -463,20 +516,22 @@ def _draw_isi(ax, dataset, unit, theme: _Theme, *, max_ms, refractory_ms=2.0):
         return
     isi_ms = np.diff(np.sort(t)) * 1000.0
     isi_ms = isi_ms[isi_ms > 0]
-    lo = max(0.2, float(np.nanpercentile(isi_ms, 0.1)) if isi_ms.size else 0.2)
-    hi = float(max(max_ms, np.nanpercentile(isi_ms, 99.5))) if isi_ms.size else max_ms
+    hi = max(float(max_ms), 0.001)
+    lo = min(0.2, hi / 1000.0)
     bins = np.logspace(np.log10(lo), np.log10(max(hi, lo * 10)), 60)
     ax.hist(isi_ms, bins=bins, color=theme.accent, edgecolor="none", alpha=0.9, zorder=3)
     ax.set_xscale("log")
+    ax.set_xlim(lo, hi)
+    # Reserve headroom so the refractory summary never covers histogram bars.
+    ax.set_ylim(0, max(1.0, ax.get_ylim()[1] * 1.55))
     ax.axvline(refractory_ms, color=theme.refband, ls="--", lw=0.9, zorder=4)
     rpv = _refractory_violation_pct(t, refractory_ms)
     ax.set_xlabel("inter-spike interval (ms)")
     ax.set_ylabel("count")
-    ax.set_title("ISI distribution", color=theme.fg, fontsize=8.5)
-    ax.text(0.97, 0.94,
-            f"refractory < {refractory_ms:g} ms\n{rpv:.2f}% violations",
-            transform=ax.transAxes, ha="right", va="top", fontsize=6.5,
-            color=theme.refband)
+    # Keep the statistical annotation outside the plotting region: dense ISI
+    # histograms must never hide behind a text box or floating annotation.
+    ax.set_title(f"ISI distribution\nRPV (< {refractory_ms:g} ms): {rpv:.2f}%",
+                 color=theme.fg, fontsize=8.5, linespacing=1.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -520,7 +575,9 @@ def _draw_firing_rate(ax, dataset, units, theme: _Theme, *, bin_s=1.0, show_ifr=
     """Binned firing rate across the whole session, optionally with an IFR trace."""
     _style_axes(ax, theme)
     dur = _session_duration_s(dataset)
-    edges = np.arange(0.0, dur + bin_s, bin_s)
+    edges = np.unique(np.append(np.arange(0.0, dur, bin_s), dur))
+    if edges.size < 2:
+        edges = np.array([0.0, max(dur, 1e-6)])
     centers = 0.5 * (edges[:-1] + edges[1:])
     overlay_colors = _UNIT_COLORS
     any_plotted = False
@@ -529,7 +586,7 @@ def _draw_firing_rate(ax, dataset, units, theme: _Theme, *, bin_s=1.0, show_ifr=
         if t.size == 0:
             continue
         counts, _ = np.histogram(t, bins=edges)
-        rate = counts.astype(float) / bin_s
+        rate = counts.astype(float) / np.diff(edges)
         color = theme.accent if (len(units) == 1) else overlay_colors[k % len(overlay_colors)]
         ax.plot(centers, rate, color=color, lw=0.9, alpha=0.95, zorder=3,
                 label=f"unit {int(u)}")
@@ -565,9 +622,9 @@ def unit_basics_figure(dataset, units, *, window_start_s=0.0, window_s=1.0,
     the additional units' waveforms (where they share geometry) and firing-rate
     traces are overlaid in distinct colors so they stay legible.
 
-    Parameters mirror the GUI controls; ``window_start_s`` / ``window_s`` /
-    ``ifr_bin_ms`` are accepted for API compatibility (the session-wide panels are
-    preferred over a fixed short raster, which is empty for low-rate units).
+    The bottom raster honors ``window_start_s`` and ``window_s``. When enabled,
+    a Gaussian rate estimate for the primary unit uses sigma ``ifr_bin_ms``.
+    Session-wide summaries remain visible above the selected time window.
     """
     theme = _Theme(dark)
     units = [int(u) for u in (units if units is not None else [])]
@@ -588,8 +645,8 @@ def unit_basics_figure(dataset, units, *, window_start_s=0.0, window_s=1.0,
 
     # Layout: left column = waveform (tall); right block = 2x2 of ACG / ISI / amp / FR.
     # constrained_layout keeps panel titles from overlapping neighbouring axes.
-    gs = fig.add_gridspec(2, 3, width_ratios=[1.08, 1.0, 1.0], height_ratios=[1.0, 1.0])
-    ax_wf = fig.add_subplot(gs[:, 0])
+    gs = fig.add_gridspec(3, 3, width_ratios=[1.08, 1.0, 1.0], height_ratios=[1.0, 1.0, 0.65])
+    ax_wf = fig.add_subplot(gs[:2, 0])
     ax_acg = fig.add_subplot(gs[0, 1])
     ax_isi = fig.add_subplot(gs[0, 2])
     ax_amp = fig.add_subplot(gs[1, 1])
@@ -601,6 +658,40 @@ def unit_basics_figure(dataset, units, *, window_start_s=0.0, window_s=1.0,
     _draw_amplitudes(ax_amp, dataset, primary, theme)
     _draw_firing_rate(ax_fr, dataset, units, theme, bin_s=1.0, show_ifr=show_ifr,
                       ifr_bin_ms=ifr_bin_ms)
+
+    # The time-window controls drive an actual raster and optional rate estimate.
+    ax_raster = fig.add_subplot(gs[2, :])
+    _style_axes(ax_raster, theme)
+    start = max(0.0, float(window_start_s))
+    stop = start + max(0.001, float(window_s))
+    for index, unit in enumerate(units):
+        times = dataset.unit_spike_times_s(unit)
+        lo, hi = np.searchsorted(times, [start, stop])
+        ax_raster.vlines(times[lo:hi], index + 0.12, index + 0.88,
+                         color=_UNIT_COLORS[index % len(_UNIT_COLORS)], lw=0.5, rasterized=True)
+    ax_raster.set(xlim=(start, stop), ylim=(0, len(units)), xlabel="time (s)", ylabel="unit")
+    # Readable labels even when many units are selected.
+    tick_indices = np.unique(np.linspace(0, len(units) - 1, min(8, len(units))).astype(int))
+    ax_raster.set_yticks(tick_indices + 0.5, [str(units[i]) for i in tick_indices])
+    ax_raster.set_title("Selected time window", loc="left", fontsize=8.5)
+    if show_ifr:
+        from scipy.ndimage import gaussian_filter1d
+        sigma_s = max(0.001, float(ifr_bin_ms) / 1000.0)
+        # Bound preview resolution while keeping the smoothing width meaningful.
+        step = max(sigma_s / 4, (stop - start) / 20000)
+        edges = np.linspace(start - 4 * sigma_s, stop + 4 * sigma_s,
+                            int(np.ceil((stop - start + 8 * sigma_s) / step)) + 1)
+        counts = np.histogram(dataset.unit_spike_times_s(primary), bins=edges)[0]
+        dt = edges[1] - edges[0]
+        rate = gaussian_filter1d(counts.astype(float) / dt, sigma_s / dt, mode="constant")
+        ax_rate = ax_raster.twinx()
+        _style_axes(ax_rate, theme)
+        ax_rate.spines["right"].set_visible(True)
+        ax_rate.spines["left"].set_visible(False)
+        ax_rate.plot((edges[1:] + edges[:-1]) / 2, rate, color=theme.muted, lw=0.8, alpha=0.65)
+        ax_rate.set_ylabel(f"unit {primary} rate (Hz)", fontsize=7)
+        ax_rate.set_ylim(bottom=0)
+        ax_raster.set_title(f"Selected time window | Gaussian rate, sigma = {ifr_bin_ms:g} ms", loc="left", fontsize=8.5)
 
     # Single concise title with key metrics for the primary unit (no grey subtitle:
     # the panel titles already describe each panel).
@@ -637,7 +728,7 @@ def _no_raw_figure(theme: _Theme, message: str):
 
 def raw_explorer_figure(dataset, *, t0_s=0.0, dur_s=1.0, n_channels=32,
                         hp_hz=300.0, lp_hz=0.0, center_channel=None,
-                        overlay_units=(), y_mode="channel", dark=False):
+                        overlay_units=(), y_mode="channel", dark=False, downsample=1):
     """Return a matplotlib Figure: npyx ``plot_raw_units``-style multichannel traces.
 
     Stacked filtered raw traces for ``n_channels`` around the peak channel of
@@ -669,7 +760,7 @@ def raw_explorer_figure(dataset, *, t0_s=0.0, dur_s=1.0, n_channels=32,
     try:
         t, x, channel_ids, channel_order = dataset.raw_explorer_chunk(
             t0_s=float(t0_s), dur_s=float(dur_s), max_channels=int(n_channels),
-            hp_hz=float(hp_hz), lp_hz=float(lp_hz), downsample=1,
+            hp_hz=float(hp_hz), lp_hz=float(lp_hz), downsample=max(1, int(downsample)),
             center_channel=int(center_idx),
         )
     except Exception as exc:  # pragma: no cover - depends on disk state
@@ -692,7 +783,7 @@ def raw_explorer_figure(dataset, *, t0_s=0.0, dur_s=1.0, n_channels=32,
     spread = max(spread, 1e-3)
     offset = spread * 3.4
     clip = offset * 0.60
-    x_disp = np.clip(x, -clip, clip)
+    x_disp = x
 
     fig = Figure(figsize=(11.6, 8.0), dpi=110)
     fig.patch.set_facecolor(theme.bg)
@@ -801,7 +892,7 @@ def raw_explorer_figure(dataset, *, t0_s=0.0, dur_s=1.0, n_channels=32,
              f"t = {t0_s:.3f}-{t0_s + dur_s:.3f} s  |  {filt_str}",
              color=title_color, fontsize=11, fontweight="bold", ha="left", va="center")
     fig.text(0.075, 0.922,
-             "Filtered AP-band traces, vertically offset by channel; colored markers "
+             "Filtered voltage (unclipped), vertically offset by channel; colored markers "
              "are spike times of the overlaid units on their peak channel.",
              color=theme.muted, fontsize=7.5, ha="left", va="center")
 
@@ -1255,8 +1346,8 @@ def network_figure(results, *, dark=False):
     Composes (left) the sorted spike-count correlation matrix as an RdBu_r heatmap
     centred on 0; (top-right) population coupling either as a coupling-vs-depth
     scatter (when depths are given) or a sorted horizontal bar; and (bottom-right,
-    when ``connections`` is present) a second diverging "putative connections (z)"
-    matrix, annotated with the number of significant pairs. Degrades gracefully for
+    when ``connections`` is present) a second diverging "CCG deviations (z)"
+    matrix, annotated with the number of exploratory threshold crossings. Degrades gracefully for
     fewer than two units / empty input.
     """
     theme = _Theme(dark)
@@ -1322,7 +1413,7 @@ def network_figure(results, *, dark=False):
         order = np.argsort(coupling)
         ypos = np.arange(n)
         colors = [theme.accent if v >= 0 else _UNIT_COLORS[1] for v in coupling[order]]
-        ax_couple.barh(ypos, coupling[order], color=colors, edgecolor="none", zorder=3)
+        ax_couple.barh(ypos, coupling[order], height=0.55, color=colors, edgecolor="none", zorder=3)
         ax_couple.axvline(0.0, color=theme.muted, ls="-", lw=0.7, zorder=2)
         if n <= 40:
             ax_couple.set_yticks(ypos)
@@ -1338,7 +1429,7 @@ def network_figure(results, *, dark=False):
         ax_couple.text(0.5, 0.5, "coupling unavailable", transform=ax_couple.transAxes,
                        ha="center", va="center", color=theme.muted, fontsize=9)
 
-    # (c) Putative connections matrix.
+    # (c) Exploratory CCG deviations, without a significance claim.
     if ax_conn is not None:
         cnorm = _signed_norm(connections[~np.eye(n, dtype=bool)])
         im2 = ax_conn.imshow(connections, cmap="PuOr_r", norm=cnorm,
@@ -1346,14 +1437,14 @@ def network_figure(results, *, dark=False):
         _style_axes(ax_conn, theme)
         ax_conn.spines[["left", "bottom"]].set_visible(True)
         _matrix_ticklabels(ax_conn, labels, theme)
-        ax_conn.set_title(f"Putative connections (z)   |   {n_sig} significant",
+        ax_conn.set_title(f"CCG deviation (z) | {n_sig} threshold crossings",
                           color=theme.fg, fontsize=9.5)
         cb2 = fig.colorbar(im2, ax=ax_conn, fraction=0.046, pad=0.03)
-        _style_colorbar(cb2, "connection (z)", theme)
+        _style_colorbar(cb2, "CCG deviation (z)", theme)
 
     title_color = "#ffffff" if theme.dark else theme.fg
     fig.suptitle(f"Network metrics   |   {n} units"
-                 + (f"   |   {n_sig} significant connections" if has_conn else ""),
+                 + (f"   |   {n_sig} exploratory CCG crossings" if has_conn else ""),
                  color=title_color, fontsize=12, fontweight="bold", x=0.012, ha="left")
     return fig
 
